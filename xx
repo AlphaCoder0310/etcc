@@ -3495,7 +3495,7 @@ def api_rfq_list(_bg: int = 0):
             payload = {"ok": True, "rows": rows,
                        "ms": int((time.time() - _t0) * 1000),
                        "qttl": RFQ_QUOTE_TTL,
-                       "build": "r73",
+                       "build": "r74",
                        "editable": sorted(RFQ_EDITABLE)}
             RFQ_SNAP["data"] = payload
             RFQ_SNAP["ts"] = time.time()
@@ -5111,7 +5111,7 @@ body.amdock-b #rfq_mon.on{transform:none}
 #rfq_mon .rm-meta{color:var(--faint);font-size:10px;
   margin-bottom:8px}
 .rm-it{display:grid;
-  grid-template-columns:34px 48px minmax(86px,118px) 104px
+  grid-template-columns:70px 48px minmax(86px,118px) 104px
     58px 38px 62px 1fr;
   gap:0 7px;align-items:center;padding:2px 6px;border:0;
   border-left:3px solid var(--border2);
@@ -5242,7 +5242,7 @@ body.amdock-b #rm_grip{left:0;right:0;top:0;bottom:auto;
  .btnrow{display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap}
  .btnrow .hint{color:#6e6a63;font-size:12px}
 </style></head><body>
-<header>LAGRANGE <small>CB Runs desk console &middot; build 2026-08-19.r73 &middot; one port (59988)</small>
+<header>LAGRANGE <small>CB Runs desk console &middot; build 2026-08-19.r74 &middot; one port (59988)</small>
   <small id="built"></small></header>
 <div id="tabs">
   <div class="tab active" id="tabbtn-recon" onclick="showTab('recon')">TRADE BOOKING RECONCILIATION</div>
@@ -7131,7 +7131,9 @@ function rfqMonItems(){
         score:100+rmCap(a,180)/2});
     }
   });
-  out.sort((a,b)=>b.score-a.score);
+  const _ts=id=>{const r=rfqRows.find(x=>x.rfq_id===id)||{};
+    return String(r.last_updated||r.created||'');};
+  out.sort((a,b)=>_ts(b.id).localeCompare(_ts(a.id)));
   return out;
 }
 const RM_LAB={hit:'HIT',rf:'RFRSH',pl:'PULL',aj:'ADJ',
@@ -7140,11 +7142,18 @@ const RM_CLS={hit:'rm-hit',rf:'rm-rf',pl:'rm-pl',aj:'rm-aj',
   wk:'rm-re',rq:'rm-rq',re:'rm-re',st:'rm-st'};
 function rfqMonRender(){
   const el=$('rm_list'); if(!el) return;
-  const items=rfqMonItems();
+  let items=rfqMonItems();
+  const _f=($('rf_f_from')||{}).value||'';
+  const _t=($('rf_f_to')||{}).value||'';
+  if(_f||_t){ items=items.filter(it=>{
+    const r=rfqRows.find(x=>x.rfq_id===it.id)||{};
+    const d=String(r.last_updated||r.created||'').slice(0,10);
+    return (!_f||d>=_f)&&(!_t||d<=_t); }); }
   $('rf_mon_n').textContent=items.length;
   el.innerHTML=items.map(it=>{
     const R=rfqRows.find(x=>x.rfq_id===it.id)||{};
-    const tm=String(R.last_updated||"").slice(11,16);
+    const tm=String(R.last_updated||R.created||"")
+      .slice(5,16).replace("T"," ");
     return `<div class="rm-it" data-k="${it.k}" data-id="${it.id}" title="score ${Math.round(it.score)}">`+
     `<span class="rm-t">${tm}</span>`+
     `<span class="rm-b ${RM_CLS[it.k]}">${RM_LAB[it.k]}`+
@@ -7946,7 +7955,7 @@ if __name__ == "__main__":
     threading.Thread(target=_rfq_engine_loop,
                      daemon=True).start()
     print("=" * 62)
-    print("  LAGRANGE  BUILD r73  ·  %s" % os.path.abspath(__file__))
+    print("  LAGRANGE  BUILD r74  ·  %s" % os.path.abspath(__file__))
     print("  port %s  ·  if this banner is missing, you are" % PORT)
     print("  running an OLD file — kill that process first.")
     print("=" * 62)
