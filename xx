@@ -14,7 +14,7 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 
-BUILD = "2a.3"
+BUILD = "2a.5"
 
 # ---------------- §15 configuration ----------------
 ABS_LIMIT_USD   = float(os.environ.get("ABS_LIMIT_USD", 250_000))
@@ -676,8 +676,12 @@ def scan(demo_dir=None, price_mode=None):
             parts.append(f"! {n_check} check(s) -> verify before "
                          "hedging")
         rank = min(SEV[flag], SEV[flag_post], 1 if ubl else 2)
+        leg_live = {lg: float(g[g.leg == lg].D1.sum())
+                    for lg in ("CB", "Stock", "ADR",
+                               "Option", "Other")}
         unds.append({
             "ric": u, "name": name, "market": market,
+            "leg_live": leg_live,
             "flag": flag, "flag_post": flag_post, "rank": rank,
             "net_live": net_live, "net_t1": net_t1, "d_net": d_net,
             "trade": trade, "drift": drift, "resid": resid,
@@ -876,56 +880,65 @@ def api_text(refresh: int = 0):
 
 PAGE = r"""<!doctype html><html><head><meta charset="utf-8">
 <title>CB Delta Scan</title><style>
-:root{--bg:#101418;--bg2:#171d24;--fg:#dfe6ee;--mut:#8b98a8;
---bd:#2a3542;--grn:#3ddc84;--red:#ff6b6b;--amb:#ffb64d;
---blu:#6ab6ff}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--fg);
-font:12px/1.35 "Segoe UI",system-ui,sans-serif}
-.num,td.n,.mono{font-family:Consolas,Menlo,monospace;
+body{margin:0;background:#fff;color:#16181c;
+font:11.5px/1.25 "Segoe UI",system-ui,sans-serif}
+.num,td,.mono{font-family:Consolas,Menlo,monospace;
 font-variant-numeric:tabular-nums}
-#top{position:sticky;top:0;z-index:10;background:var(--bg2);
-border-bottom:1px solid var(--bd);padding:6px 10px}
-#top .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-h1{font-size:14px;margin:0 8px 0 0;letter-spacing:1px}
-.badge{padding:1px 6px;border-radius:3px;font-weight:700;
-font-size:10px}
-.b-h{background:var(--red);color:#111}
-.b-w{background:var(--amb);color:#111}
-.b-o{background:#2f4a3a;color:var(--grn)}
-.b-u{background:var(--blu);color:#04263f}
-.b-c{background:#5a4a7a;color:#efe6ff}
-.chip{cursor:pointer;padding:2px 8px;border:1px solid var(--bd);
-border-radius:10px;color:var(--mut)}
-.chip.on{border-color:var(--blu);color:var(--fg)}
-button{background:var(--bg2);color:var(--fg);
-border:1px solid var(--bd);padding:2px 8px;cursor:pointer}
-input[type=text]{background:var(--bg);color:var(--fg);
-border:1px solid var(--bd);padding:2px 6px}
-#meta{color:var(--mut);font-size:11px;margin-top:3px}
+#top{position:sticky;top:0;z-index:10;background:#fff;
+border-bottom:2px solid #16181c;padding:4px 8px}
+#top .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+h1{font:700 13px "Segoe UI";letter-spacing:2px;margin:0 6px 0 0}
+.badge{padding:0 5px;border-radius:2px;font-weight:700;
+font-size:9.5px;font-family:"Segoe UI"}
+.b-h{background:#c62828;color:#fff}
+.b-w{background:#e8a020;color:#fff}
+.b-o{background:#e8f3ea;color:#1b7a3d;border:1px solid #bfdcc7}
+.b-u{background:#1565c0;color:#fff}
+.b-c{background:#6a4fa3;color:#fff}
+.chip{cursor:pointer;padding:1px 7px;border:1px solid #ccc;
+border-radius:9px;color:#667;font-family:"Segoe UI";
+font-size:10.5px}
+.chip.on{border-color:#16181c;color:#16181c;font-weight:700}
+button{background:#fff;color:#16181c;border:1px solid #bbb;
+padding:1px 7px;cursor:pointer;font-size:11px}
+button:hover{background:#f2f2f2}
+input[type=text]{background:#fff;color:#16181c;
+border:1px solid #bbb;padding:1px 5px;font-size:11px}
+#meta{color:#778;font-size:10px;margin-top:2px;
+font-family:"Segoe UI"}
 table{border-collapse:collapse;width:100%}
-th{position:sticky;background:var(--bg2);z-index:5;
-border-bottom:1px solid var(--bd);padding:4px 6px;
-font-size:10px;letter-spacing:.5px;color:var(--mut);
-text-align:right}
-th:nth-child(-n+2),th:last-child,th:nth-child(13){text-align:left}
-td{border-bottom:1px solid #1d252e;padding:3px 6px;
-text-align:right;vertical-align:top}
+th{position:sticky;background:#fff;z-index:5;
+border-bottom:1px solid #16181c;padding:3px 5px;
+font:700 9px "Segoe UI";letter-spacing:.8px;color:#445;
+text-transform:uppercase;text-align:right}
+th:nth-child(-n+2),th:nth-child(13),th:last-child{
+text-align:left}
+td{border-bottom:1px solid #ececec;padding:1px 5px;
+text-align:right;vertical-align:middle;font-size:11px;
+white-space:nowrap}
 tr.und{cursor:pointer}
-tr.und:hover{background:#1a222c}
-tr.mkt td{background:#141b22;font-weight:700;text-align:left;
-cursor:pointer;border-top:2px solid var(--bd)}
+tr.und:hover td{background:#f6f8fa}
+tr.mkt td{background:#f2f2f2;font:700 11px "Segoe UI";
+text-align:left;cursor:pointer;border-top:1px solid #16181c;
+border-bottom:1px solid #d5d5d5;padding:2px 6px}
 td.l{text-align:left}
-.pos{color:var(--grn)}.neg{color:var(--red)}.mut{color:var(--mut)}
-.sm{font-size:10px;color:var(--mut)}
-.bar{display:inline-block;width:56px;height:6px;background:#203040;border-radius:2px;overflow:hidden;vertical-align:middle}
+.pos{color:#1b7a3d}.neg{color:#c62828}.mut{color:#99a}
+.sm{font-size:9.5px;color:#889;font-family:"Segoe UI"}
+.bar{display:inline-block;width:44px;height:5px;
+background:#e8e8e8;border-radius:2px;overflow:hidden;
+vertical-align:middle;margin:0 3px}
 .bar i{display:block;height:100%}
-tr.det td{background:#0d1116;text-align:left}
-.det table{width:auto;min-width:70%}
-.det th{position:static;background:#131a21}
-.det td{border-bottom:1px solid #16202a}
-.caret{display:inline-block;width:12px;color:var(--mut)}
-.wrapmax{max-width:420px;white-space:normal}
+tr.det>td{background:#fbfbfc;text-align:left;padding:2px 6px
+ 2px 24px}
+.det table{width:auto;min-width:64%}
+.det th{position:static;background:#fbfbfc;border-bottom:
+1px solid #ccc;font-size:8.5px}
+.det td{border-bottom:1px solid #f0f0f0;font-size:10.5px;
+padding:0 5px;line-height:1.35}
+.caret{display:inline-block;width:10px;color:#889}
+.wrapmax{max-width:420px;white-space:normal;
+font-family:"Segoe UI";font-size:10.5px;line-height:1.2}
 </style></head><body>
 <div id="top">
  <div class="row">
@@ -950,9 +963,10 @@ tr.det td{background:#0d1116;text-align:left}
 </div>
 <table id="tbl"><thead><tr>
  <th class="l">flag</th><th class="l">underlying</th>
+ <th>CB</th><th>STK</th><th>ADR</th><th>OPT</th>
  <th>net live</th><th>limit \u00b7 util</th><th>net t1</th>
  <th>\u0394 net</th><th>trade</th><th>drift</th>
- <th>unbooked</th><th>spot %</th><th>HR</th><th>CB gross</th>
+ <th>unbooked</th><th>spot %</th><th>HR</th>
  <th class="l">action</th><th class="l">driver</th>
 </tr></thead><tbody id="tb"></tbody></table>
 <script>
@@ -996,10 +1010,18 @@ function badge(f){const c=f==="HEDGE"?"b-h":(f==="WATCH"?"b-w":
 function utilBar(u){const pct=Math.min(1.6,u.util||0);
  const col=(u.util>1)?"var(--red)":((u.util>0.5)?"var(--amb)"
   :"var(--grn)");
- return fUp(u.limit)+'<br><span class="bar"><i style="width:'
-  +Math.min(100,pct*62.5)+'%;background:'+col+'"></i></span> '
+ return fUp(u.limit)+'<span class="bar"><i style="width:'
+  +Math.min(100,pct*62.5)+'%;background:'+col+'"></i></span>'
   +'<span class="sm mono">'+((u.util||0)*100).toFixed(0)
   +"%</span>";}
+function legTds(u){
+ const L=u.leg_live||{};
+ const one=v=>(v==null||v===0)
+  ?'<td><span class="mut">\u00b7</span></td>'
+  :'<td>'+fU(v)+'</td>';
+ const opt=(L.Option||0)+(L.Other||0);
+ return one(L.CB)+one(L.Stock)+one(L.ADR)+one(opt);
+}
 function undRow(u){
  const op=openU.has(u.ric);
  let f1='<span class="caret">'+(op?"\u25be":"\u25b8")+"</span>"
@@ -1016,31 +1038,32 @@ function undRow(u){
   if(u.unbooked_unknown===u.unbooked.length)
    ub='<span class="mut">est n/a</span>';
   else ub=fU(u.unbooked_est)+(u.unbooked_partial?"*":"")
-   +'<br><span class="sm">\u2192 net '+fU(u.net_post)
+   +' <span class="sm">\u2192 '+fU(u.net_post)
    +"</span>";}
  let sp=fP(u.spot_pct);
  if(u.spot_pct_risk!=null)
-  sp+='<br><span class="sm">risk '
+  sp+=' <span class="sm">r'
    +((u.spot_pct_risk>0?"+":"")+(u.spot_pct_risk*100)
      .toFixed(1))+"%</span>";
  let act=esc(u.action||"");
  if(u.action_post&&u.action_post!==u.action)
-  act+=(act?"<br>":"")+'<span class="sm">after booking '
+  act+=(act?" ":"")+'<span class="sm">\u2192 '
    +esc(u.action_post)+"</span>";
  return '<tr class="und" data-ric="'+esc(u.ric)+'">'
   +'<td class="l">'+f1+"</td>"
-  +'<td class="l"><b>'+esc(u.ric)+'</b><br><span class="sm">'
+  +'<td class="l"><b>'+esc(u.ric)+'</b> <span class="sm">'
    +esc(u.name||"")+"</span></td>"
-  +"<td>"+fU(u.net_live)+"</td>"
+  +legTds(u)
+  +'<td style="border-left:1px solid #999"><b>'
+   +fU(u.net_live)+"</b></td>"
   +"<td>"+utilBar(u)+"</td>"
   +"<td>"+fU(u.net_t1)+"</td><td>"+fU(u.d_net)+"</td>"
   +"<td>"+fU(u.trade)+"</td><td>"+fU(u.drift)+"</td>"
   +"<td>"+ub+"</td><td>"+sp+"</td><td>"+fR(u.hr)+"</td>"
-  +"<td>"+fUp(u.cb_gross)+"</td>"
   +'<td class="l mono">'+act+"</td>"
   +'<td class="l wrapmax">'+esc(u.driver||"")+"</td></tr>";}
 function detRow(u){
- let h='<tr class="det"><td colspan="14"><div class="det">';
+ let h='<tr class="det"><td colspan="17"><div class="det">';
  if((u.components||[]).length){
   h+='<table><tr><th>leg</th><th>component</th>'
    +'<th>type \u00b7 exotic</th><th>status</th>'
@@ -1049,7 +1072,7 @@ function detRow(u){
    +'<th>unit \u0394%</th><th>check</th></tr>';
   for(const c of u.components){
    h+="<tr><td>"+esc(c.leg)+'</td><td class="l mono">'
-    +esc(c.ric)+'<br><span class="sm">'+esc(c.isin||"")
+    +esc(c.ric)+' <span class="sm">'+esc(c.isin||"")
     +"</span></td><td class='l'>"+esc(c.sec_type)
     +(c.exotic?" \u00b7 "+esc(c.exotic):"")+"</td><td>"
     +esc(c.status)+'</td><td class="mono">'+fQ(c.q0)
@@ -1071,7 +1094,7 @@ function detRow(u){
   for(const t of u.unbooked){
    h+='<tr><td class="mono">#'+esc(t.trade_id)+"</td><td>"
     +esc(t.trade_date)+'</td><td class="l mono">'+esc(t.isin)
-    +'<br><span class="sm">'+esc(t.bond_name)+"</span></td>"
+    +' <span class="sm">'+esc(t.bond_name)+"</span></td>"
     +"<td>"+esc(t.side)+'</td><td class="mono">'+fQ(t.qty)
     +'</td><td class="mono">'+fQ(t.stock_qty)+"</td><td>"
     +esc(t.trade_type)+"</td><td>"+esc(t.client)
@@ -1128,7 +1151,7 @@ function render(){
   if(mk.n_check)mh+=' <span class="badge b-c">!</span> '
    +mk.n_check;
   h+='<tr class="mkt" data-mk="'+esc(mk.market)
-   +'"><td colspan="14">'+mh+"</td></tr>";
+   +'"><td colspan="17">'+mh+"</td></tr>";
   if(mop)for(const u of us){
    h+=undRow(u);
    if(openU.has(u.ric))h+=detRow(u);}}
