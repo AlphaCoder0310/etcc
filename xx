@@ -14,7 +14,7 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 
-BUILD = "2a.8"
+BUILD = "2b.1"
 
 # ---------------- §15 configuration ----------------
 ABS_LIMIT_USD   = float(os.environ.get("ABS_LIMIT_USD", 250_000))
@@ -53,6 +53,15 @@ RIC_MARKET = [(".TWO", "TW"), (".OQ", "US"), (".HK", "HK"),
               (".PS", "PH")]
 RIC_MARKET.sort(key=lambda p: -len(p[0]))          # longest suffix first
 INVERTED_FX = {"AUD", "NZD", "EUR", "GBP"}
+# ADR / dual-listing lines that are ONE underlying on the desk.
+# Override/extend with env UND_ALIAS='{"BABA.N":"9988.HK",...}'
+UND_ALIAS = {"BABA.N": "9988.HK", "JD.O": "9618.HK"}
+try:
+    UND_ALIAS.update(json.loads(os.environ.get("UND_ALIAS", "{}")))
+except Exception:
+    pass
+def und_alias(u):
+    return UND_ALIAS.get(_s(u), _s(u))
 
 CAND = {
     "market":    ["market"],
@@ -422,6 +431,7 @@ def scan(demo_dir=None, price_mode=None):
             risk.at[i, "underlying"] = r.component
         else:
             risk.at[i, "underlying"] = maps.get(r["isin"], r.component)
+    risk["underlying"] = risk["underlying"].map(und_alias)
     comp2und = {r.component: r.underlying for _, r in risk.iterrows()
                 if r.component}
     isin2und_risk = {r["isin"]: r.underlying for _, r in risk.iterrows()
@@ -441,6 +451,12 @@ def scan(demo_dir=None, price_mode=None):
             "risk_positions returned 0 rows in the "
             f"{LOAD_TOL_S}s loaded_at window")
 
+    # desk rule: hedge legs (Stock/ADR/Option) have no drift -
+    # their non-trade delta change is pure spot move
+    risk["spotmv"] = 0.0
+    hedge_mask = risk.leg != "CB"
+    risk.loc[hedge_mask, "spotmv"] = risk.loc[hedge_mask, "drift"]
+    risk.loc[hedge_mask, "drift"] = 0.0
     blot = load_blotter(demo_dir, warnings)
 
     # §7.1 risk-implied spot per underlying
@@ -470,6 +486,7 @@ def scan(demo_dir=None, price_mode=None):
     def map_trade_und(isin):
         u = maps.get(isin) or isin2und_risk.get(isin) or ""
         u = comp2und.get(u, u)
+        u = und_alias(u)
         return u or "?"
 
     b_unds = set()
@@ -583,6 +600,7 @@ def scan(demo_dir=None, price_mode=None):
         net_live = float(g.D1.sum()); net_t1 = float(g.D0.sum())
         d_net = net_live - net_t1
         trade = float(g.trade.sum()); drift = float(g.drift.sum())
+        spotmv = float(g.spotmv.sum())
         resid = float(g.resid.sum())
         cb_live = float(cbg.D1.sum())
         cb_gross = float(cbg.D1.abs().sum())
@@ -614,6 +632,7 @@ def scan(demo_dir=None, price_mode=None):
                 "isin": r["isin"], "status": r.status,
                 "q0": r.q0, "q1": r.q1, "D0": r.D0, "D1": r.D1,
                 "trade": r.trade, "drift": r.drift,
+                "spotmv": r.spotmv,
                 "unit_chg": (None if r.unit_chg != r.unit_chg
                              else r.unit_chg),
                 "check": r.check})
@@ -692,7 +711,8 @@ def scan(demo_dir=None, price_mode=None):
             "cb_d0": cb_d0, "hedge_q1": hedge_q1,
             "flag": flag, "flag_post": flag_post, "rank": rank,
             "net_live": net_live, "net_t1": net_t1, "d_net": d_net,
-            "trade": trade, "drift": drift, "resid": resid,
+            "trade": trade, "drift": drift, "spotmv": spotmv,
+            "resid": resid,
             "limit": limit, "util": util, "cb_live": cb_live,
             "cb_gross": cb_gross, "hedge_live": hedge_live,
             "hr": hr, "spot_pct": sp["pct"],
@@ -723,6 +743,7 @@ def scan(demo_dir=None, price_mode=None):
              "d_net": sum(x["d_net"] for x in lst),
              "trade": sum(x["trade"] for x in lst),
              "drift": sum(x["drift"] for x in lst),
+             "spotmv": sum(x["spotmv"] for x in lst),
              "unbooked_est": sum(x["unbooked_est"] for x in lst),
              "n_hedge": sum(1 for x in lst if "HEDGE" in
                             (x["flag"], x["flag_post"])),
@@ -742,6 +763,7 @@ def scan(demo_dir=None, price_mode=None):
             "d_net": float(risk.D1.sum() - risk.D0.sum()),
             "trade": float(risk.trade.sum()),
             "drift": float(risk.drift.sum()),
+            "spotmv": float(risk.spotmv.sum()),
             "resid": float(risk.resid.sum()),
             "unbooked_est": sum(x["unbooked_est"] for x in unds),
             "n_hedge": sum(m["n_hedge"] for m in markets),
@@ -778,7 +800,8 @@ def text_report(p):
     line = (f"DESK NET   live {f_usd(d['net_live'])} t1 "
             f"{f_usd(d['net_t1'])} \u0394 {f_usd(d['d_net'])} = "
             f"TRADE {f_usd(d['trade'])} + DRIFT "
-            f"{f_usd(d['drift'])} + RESID {f_usd(d['resid'])}   |"
+            f"{f_usd(d['drift'])} + SPOT {f_usd(d['spotmv'])} "
+            f"+ RESID {f_usd(d['resid'])}   |"
             f"   HEDGE {d['n_hedge']}  WATCH {d['n_watch']}  "
             f"UNBOOKED {d['n_ub']}  CHECK {d['n_check']}")
     if d["unbooked_est"]:
@@ -930,7 +953,7 @@ border-bottom:1px solid var(--ink);padding:4px 5px;
 font-size:9px;font-weight:600;letter-spacing:.7px;
 color:var(--ink2);text-transform:uppercase;text-align:right;
 border-right:1px solid var(--rule)}
-th:nth-child(-n+2),th:nth-child(19),th:last-child{
+th:nth-child(-n+2),th:nth-child(20),th:last-child{
 text-align:left}
 td{border-bottom:1px solid var(--rule);border-right:1px solid
  var(--rule);padding:2px 5px;text-align:right;
@@ -940,8 +963,8 @@ th:last-child,td:last-child{border-right:none}
    attribution(15) market(18) */
 th:nth-child(2),td:nth-child(2),th:nth-child(5),
 td:nth-child(5),th:nth-child(8),td:nth-child(8),
-th:nth-child(11),td:nth-child(11),th:nth-child(15),
-td:nth-child(15),th:nth-child(18),td:nth-child(18){
+th:nth-child(11),td:nth-child(11),th:nth-child(16),
+td:nth-child(16),th:nth-child(19),td:nth-child(19){
 border-right:1px solid var(--rule3)}
 /* section tints (th + und cells) */
 #tbl>thead th:nth-child(n+3):nth-child(-n+5),
@@ -950,10 +973,10 @@ tr.und td:nth-child(n+3):nth-child(-n+5){background:#f7f9fc}
 tr.und td:nth-child(n+6):nth-child(-n+8){background:#fbfbf7}
 #tbl>thead th:nth-child(n+9):nth-child(-n+11),
 tr.und td:nth-child(n+9):nth-child(-n+11){background:#eef2f7}
-#tbl>thead th:nth-child(n+12):nth-child(-n+15),
-tr.und td:nth-child(n+12):nth-child(-n+15){background:#f9f7fb}
-#tbl>thead th:nth-child(n+16):nth-child(-n+18),
-tr.und td:nth-child(n+16):nth-child(-n+18){background:#f5faf7}
+#tbl>thead th:nth-child(n+12):nth-child(-n+16),
+tr.und td:nth-child(n+12):nth-child(-n+16){background:#f9f7fb}
+#tbl>thead th:nth-child(n+17):nth-child(-n+19),
+tr.und td:nth-child(n+17):nth-child(-n+19){background:#f5faf7}
 tr.und:hover td:nth-child(n){background:#e8eef5}
 td.gl{background:#e5ebf3 !important}
 tr.und{cursor:pointer}
@@ -977,9 +1000,11 @@ border-bottom:1px solid var(--rule2)}
 .det table{width:auto;table-layout:fixed}
 .det col.c0{width:46px}.det col.c1{width:230px}
 .det col.c2{width:180px}.det col.c3{width:64px}
-.det col.c4{width:180px}.det col.c5{width:170px}
-.det col.c6{width:80px}.det col.c7{width:80px}
-.det col.c8{width:66px}.det col.c9{width:440px}
+.det col.c4{width:100px}.det col.c5{width:100px}
+.det col.c6{width:90px}.det col.c7{width:80px}
+.det col.c8{width:80px}.det col.c9{width:80px}
+.det col.c10{width:80px}.det col.c11{width:80px}
+.det col.c12{width:66px}.det col.c13{width:440px}
 .det th{position:static;background:#fff;
 border-bottom:1px solid var(--rule2);font-size:8.5px;
 border-right:none;padding:2px 5px;color:var(--ink3)}
@@ -1014,11 +1039,11 @@ Inter,system-ui,sans-serif}
 </div>
 <table id="tbl"><thead><tr>
  <th class="l">flag</th><th class="l">underlying</th>
- <th>qty L</th><th>qty T1</th><th>\u0394 qty</th>
- <th>CB \u0394 L</th><th>CB \u0394 T1</th><th>hdg qty</th>
- <th>net \u0394 L</th><th>net \u0394 T1</th><th>\u0394 net</th>
- <th>limit \u00b7 util</th><th>trade</th><th>drift</th>
- <th>T+D</th>
+ <th>qty L</th><th>qty T1</th><th>&#916; qty</th>
+ <th>CB &#916; L</th><th>CB &#916; T1</th><th>hdg qty</th>
+ <th>net &#916; L</th><th>net &#916; T1</th><th>&#916; net</th>
+ <th>limit &middot; util</th><th>trade</th><th>drift</th>
+ <th>spot mv</th><th>T+D+S</th>
  <th>unbooked</th><th>spot %</th><th>HR</th>
  <th class="l">action</th><th class="l">driver</th>
 </tr></thead><tbody id="tb"></tbody></table>
@@ -1121,29 +1146,32 @@ function undRow(u){
   +"<td>"+fU(u.net_t1)+"</td><td>"+fU(u.d_net)+"</td>"
   +"<td>"+utilBar(u)+"</td>"
   +"<td>"+fU(u.trade)+"</td><td>"+fU(u.drift)+"</td>"
-  +"<td>"+fU((u.trade||0)+(u.drift||0))+"</td>"
+  +"<td>"+fU(u.spotmv)+"</td>"
+  +"<td>"+fU((u.trade||0)+(u.drift||0)+(u.spotmv||0))+"</td>"
   +"<td>"+ub+"</td><td>"+sp+"</td><td>"+fR(u.hr)+"</td>"
   +'<td class="l mono">'+act+"</td>"
   +'<td class="l wrapmax">'+esc(u.driver||"")+"</td></tr>";}
 function detRow(u){
- let h='<tr class="det"><td colspan="20"><div class="det">';
+ let h='<tr class="det"><td colspan="21"><div class="det">';
  if((u.components||[]).length){
   h+='<table><colgroup>'+
-   [0,1,2,3,4,5,6,7,8,9].map(k=>'<col class="c'+k+'">')
+   [0,1,2,3,4,5,6,7,8,9,10,11,12,13].map(k=>'<col class="c'+k+'">')
     .join('')+'</colgroup><tr><th>leg</th><th>component</th>'
    +'<th>type \u00b7 exotic</th><th>status</th>'
-   +'<th>qty t1 \u2192 live</th>'
-   +'<th>delta t1 \u2192 live</th><th>trade</th><th>drift</th>'
+   +'<th>qty t1</th><th>qty live</th><th>\u0394 qty</th>'
+   +'<th>\u0394 t1</th><th>\u0394 live</th>'
+   +'<th>trade</th><th>drift</th><th>spot</th>'
    +'<th>unit \u0394%</th><th>check</th></tr>';
   for(const c of u.components){
    h+="<tr><td>"+esc(c.leg)+'</td><td class="l mono">'
     +esc(c.ric)+' <span class="sm">'+esc(c.isin||"")
     +"</span></td><td class='l'>"+esc(c.sec_type)
     +(c.exotic?" \u00b7 "+esc(c.exotic):"")+"</td><td>"
-    +esc(c.status)+'</td><td class="mono">'+fQ(c.q0)
-    +" \u2192 "+fQ(c.q1)+"</td><td>"+fU(c.D0)+" \u2192 "
-    +fU(c.D1)+"</td><td>"+fU(c.trade)+"</td><td>"
-    +fU(c.drift)+"</td><td>"+fP(c.unit_chg)
+    +esc(c.status)+'</td><td>'+fQ(c.q0)+'</td><td>'+fQ(c.q1)
+    +'</td><td>'+fQs((c.q1||0)-(c.q0||0))+'</td><td>'+fU(c.D0)
+    +'</td><td>'+fU(c.D1)+"</td><td>"+fU(c.trade)+"</td><td>"
+    +fU(c.drift)+"</td><td>"+fU(c.spotmv)+"</td><td>"
+    +fP(c.unit_chg)
     +'</td><td class="l">'+(c.check?"\u26a0 "+esc(c.check):"")
     +"</td></tr>";}
   h+="</table>";
@@ -1181,6 +1209,7 @@ function render(){
  let dl="net "+fU(d.net_live)+" (t1 "+fU(d.net_t1)+") \u00b7 "
   +"\u0394 "+fU(d.d_net)+" = trade "+fU(d.trade)+" + drift "
   +fU(d.drift);
+ dl+=" + spot "+fU(d.spotmv);
  if(Math.abs(d.resid||0)>1)dl+=" + resid "+fU(d.resid);
  if(d.unbooked_est)dl+=" \u00b7 unbooked est "
   +fU(d.unbooked_est);
@@ -1207,7 +1236,8 @@ function render(){
   let mh="<b>"+(mop?"\u25be":"\u25b8")+" "+esc(mk.market)
    +"</b> \u00b7 "+us.length+"/"+mk.n+" names \u00b7 net "
    +fU(mk.net_live)+" \u00b7 \u0394 "+fU(mk.d_net)
-   +" = trade "+fU(mk.trade)+" + drift "+fU(mk.drift);
+   +" = trade "+fU(mk.trade)+" + drift "+fU(mk.drift)
+   +" + spot "+fU(mk.spotmv);
   if(mk.unbooked_est)mh+=" \u00b7 unbooked est "
    +fU(mk.unbooked_est);
   if(mk.n_hedge)mh+=" "+badge("HEDGE")+" "+mk.n_hedge;
@@ -1216,7 +1246,7 @@ function render(){
   if(mk.n_check)mh+=' <span class="badge b-c">!</span> '
    +mk.n_check;
   h+='<tr class="mkt" data-mk="'+esc(mk.market)
-   +'"><td colspan="20">'+mh+"</td></tr>";
+   +'"><td colspan="21">'+mh+"</td></tr>";
   if(mop)for(const u of us){
    h+=undRow(u);
    if(openU.has(u.ric))h+=detRow(u);}}
