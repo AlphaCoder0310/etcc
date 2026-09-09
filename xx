@@ -14,7 +14,7 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 
-BUILD = "2a.5"
+BUILD = "2a.6"
 
 # ---------------- §15 configuration ----------------
 ABS_LIMIT_USD   = float(os.environ.get("ABS_LIMIT_USD", 250_000))
@@ -676,12 +676,15 @@ def scan(demo_dir=None, price_mode=None):
             parts.append(f"! {n_check} check(s) -> verify before "
                          "hedging")
         rank = min(SEV[flag], SEV[flag_post], 1 if ubl else 2)
+        gross_live = float(g.D1.abs().sum())
+        gross_t1 = float(g.D0.abs().sum())
         leg_live = {lg: float(g[g.leg == lg].D1.sum())
                     for lg in ("CB", "Stock", "ADR",
                                "Option", "Other")}
         unds.append({
             "ric": u, "name": name, "market": market,
             "leg_live": leg_live,
+            "gross_live": gross_live, "gross_t1": gross_t1,
             "flag": flag, "flag_post": flag_post, "rank": rank,
             "net_live": net_live, "net_t1": net_t1, "d_net": d_net,
             "trade": trade, "drift": drift, "resid": resid,
@@ -882,63 +885,80 @@ PAGE = r"""<!doctype html><html><head><meta charset="utf-8">
 <title>CB Delta Scan</title><style>
 *{box-sizing:border-box}
 body{margin:0;background:#fff;color:#16181c;
-font:11.5px/1.25 "Segoe UI",system-ui,sans-serif}
-.num,td,.mono{font-family:Consolas,Menlo,monospace;
+font:11px/1.25 Consolas,Menlo,monospace;
 font-variant-numeric:tabular-nums}
+.f,#top,h1,.badge,.chip,button,#meta,.sm,th,.wrapmax,
+tr.mkt td{font-family:"Segoe UI",system-ui,sans-serif}
 #top{position:sticky;top:0;z-index:10;background:#fff;
 border-bottom:2px solid #16181c;padding:4px 8px}
 #top .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-h1{font:700 13px "Segoe UI";letter-spacing:2px;margin:0 6px 0 0}
+h1{font-size:13px;font-weight:700;letter-spacing:2px;
+margin:0 6px 0 0}
 .badge{padding:0 5px;border-radius:2px;font-weight:700;
-font-size:9.5px;font-family:"Segoe UI"}
+font-size:9.5px}
 .b-h{background:#c62828;color:#fff}
 .b-w{background:#e8a020;color:#fff}
 .b-o{background:#e8f3ea;color:#1b7a3d;border:1px solid #bfdcc7}
 .b-u{background:#1565c0;color:#fff}
 .b-c{background:#6a4fa3;color:#fff}
 .chip{cursor:pointer;padding:1px 7px;border:1px solid #ccc;
-border-radius:9px;color:#667;font-family:"Segoe UI";
-font-size:10.5px}
+border-radius:9px;color:#667;font-size:10.5px}
 .chip.on{border-color:#16181c;color:#16181c;font-weight:700}
 button{background:#fff;color:#16181c;border:1px solid #bbb;
 padding:1px 7px;cursor:pointer;font-size:11px}
 button:hover{background:#f2f2f2}
 input[type=text]{background:#fff;color:#16181c;
 border:1px solid #bbb;padding:1px 5px;font-size:11px}
-#meta{color:#778;font-size:10px;margin-top:2px;
-font-family:"Segoe UI"}
+#meta{color:#778;font-size:10px;margin-top:2px}
 table{border-collapse:collapse;width:100%}
 th{position:sticky;background:#fff;z-index:5;
-border-bottom:1px solid #16181c;padding:3px 5px;
-font:700 9px "Segoe UI";letter-spacing:.8px;color:#445;
-text-transform:uppercase;text-align:right}
-th:nth-child(-n+2),th:nth-child(13),th:last-child{
+border-bottom:1.5px solid #16181c;padding:3px 4px;
+font-size:9px;font-weight:700;letter-spacing:.6px;color:#445;
+text-transform:uppercase;text-align:right;
+border-right:1px solid #eee}
+th:nth-child(-n+2),th:nth-child(15),th:last-child{
 text-align:left}
-td{border-bottom:1px solid #ececec;padding:1px 5px;
-text-align:right;vertical-align:middle;font-size:11px;
-white-space:nowrap}
+td{border-bottom:1px solid #ececec;border-right:1px solid
+ #f2f2f2;padding:1px 4px;text-align:right;
+vertical-align:middle;white-space:nowrap}
+th:last-child,td:last-child{border-right:none}
+/* group rules: after underlying(2), legs(6), gross(8),
+   nets(11), drift(14), HR(17) */
+th:nth-child(2),td:nth-child(2),th:nth-child(6),
+td:nth-child(6),th:nth-child(8),td:nth-child(8),
+th:nth-child(11),td:nth-child(11),th:nth-child(14),
+td:nth-child(14),th:nth-child(17),td:nth-child(17){
+border-right:1px solid #b9b9b9}
+td.gl b{font-weight:700}
 tr.und{cursor:pointer}
 tr.und:hover td{background:#f6f8fa}
-tr.mkt td{background:#f2f2f2;font:700 11px "Segoe UI";
+tr.mkt td{background:#f2f2f2;font-size:11px;font-weight:700;
 text-align:left;cursor:pointer;border-top:1px solid #16181c;
 border-bottom:1px solid #d5d5d5;padding:2px 6px}
 td.l{text-align:left}
 .pos{color:#1b7a3d}.neg{color:#c62828}.mut{color:#99a}
-.sm{font-size:9.5px;color:#889;font-family:"Segoe UI"}
+.sm{font-size:9.5px;color:#889}
 .bar{display:inline-block;width:44px;height:5px;
 background:#e8e8e8;border-radius:2px;overflow:hidden;
 vertical-align:middle;margin:0 3px}
 .bar i{display:block;height:100%}
-tr.det>td{background:#fbfbfc;text-align:left;padding:2px 6px
- 2px 24px}
-.det table{width:auto;min-width:64%}
-.det th{position:static;background:#fbfbfc;border-bottom:
-1px solid #ccc;font-size:8.5px}
-.det td{border-bottom:1px solid #f0f0f0;font-size:10.5px;
-padding:0 5px;line-height:1.35}
+tr.det>td{background:#fbfbfc;text-align:left;
+padding:2px 6px 3px 24px;border-right:none}
+.det table{width:auto;table-layout:fixed}
+.det col.c0{width:44px}.det col.c1{width:210px}
+.det col.c2{width:170px}.det col.c3{width:62px}
+.det col.c4{width:170px}.det col.c5{width:160px}
+.det col.c6{width:78px}.det col.c7{width:78px}
+.det col.c8{width:64px}.det col.c9{width:420px}
+.det th{position:static;background:#fbfbfc;
+border-bottom:1px solid #ccc;font-size:8.5px;
+border-right:none;padding:1px 5px}
+.det td{border-bottom:1px solid #f0f0f0;border-right:none;
+font-size:10.5px;padding:0 5px;line-height:1.35;
+overflow:hidden;text-overflow:ellipsis}
 .caret{display:inline-block;width:10px;color:#889}
-.wrapmax{max-width:420px;white-space:normal;
-font-family:"Segoe UI";font-size:10.5px;line-height:1.2}
+.wrapmax{max-width:none;white-space:normal;font-size:10.5px;
+line-height:1.2}
 </style></head><body>
 <div id="top">
  <div class="row">
@@ -964,8 +984,9 @@ font-family:"Segoe UI";font-size:10.5px;line-height:1.2}
 <table id="tbl"><thead><tr>
  <th class="l">flag</th><th class="l">underlying</th>
  <th>CB</th><th>STK</th><th>ADR</th><th>OPT</th>
- <th>net live</th><th>limit \u00b7 util</th><th>net t1</th>
- <th>\u0394 net</th><th>trade</th><th>drift</th>
+ <th>gross L</th><th>gross T1</th>
+ <th>net live</th><th>net t1</th><th>\u0394 net</th>
+ <th>limit \u00b7 util</th><th>trade</th><th>drift</th>
  <th>unbooked</th><th>spot %</th><th>HR</th>
  <th class="l">action</th><th class="l">driver</th>
 </tr></thead><tbody id="tb"></tbody></table>
@@ -1054,18 +1075,21 @@ function undRow(u){
   +'<td class="l"><b>'+esc(u.ric)+'</b> <span class="sm">'
    +esc(u.name||"")+"</span></td>"
   +legTds(u)
-  +'<td style="border-left:1px solid #999"><b>'
-   +fU(u.net_live)+"</b></td>"
-  +"<td>"+utilBar(u)+"</td>"
+  +"<td>"+fUp(u.gross_live)+"</td>"
+  +"<td>"+fUp(u.gross_t1)+"</td>"
+  +'<td class="gl"><b>'+fU(u.net_live)+"</b></td>"
   +"<td>"+fU(u.net_t1)+"</td><td>"+fU(u.d_net)+"</td>"
+  +"<td>"+utilBar(u)+"</td>"
   +"<td>"+fU(u.trade)+"</td><td>"+fU(u.drift)+"</td>"
   +"<td>"+ub+"</td><td>"+sp+"</td><td>"+fR(u.hr)+"</td>"
   +'<td class="l mono">'+act+"</td>"
   +'<td class="l wrapmax">'+esc(u.driver||"")+"</td></tr>";}
 function detRow(u){
- let h='<tr class="det"><td colspan="17"><div class="det">';
+ let h='<tr class="det"><td colspan="19"><div class="det">';
  if((u.components||[]).length){
-  h+='<table><tr><th>leg</th><th>component</th>'
+  h+='<table><colgroup>'+
+   [0,1,2,3,4,5,6,7,8,9].map(k=>'<col class="c'+k+'">')
+    .join('')+'</colgroup><tr><th>leg</th><th>component</th>'
    +'<th>type \u00b7 exotic</th><th>status</th>'
    +'<th>qty t1 \u2192 live</th>'
    +'<th>delta t1 \u2192 live</th><th>trade</th><th>drift</th>'
@@ -1151,7 +1175,7 @@ function render(){
   if(mk.n_check)mh+=' <span class="badge b-c">!</span> '
    +mk.n_check;
   h+='<tr class="mkt" data-mk="'+esc(mk.market)
-   +'"><td colspan="17">'+mh+"</td></tr>";
+   +'"><td colspan="19">'+mh+"</td></tr>";
   if(mop)for(const u of us){
    h+=undRow(u);
    if(openU.has(u.ric))h+=detRow(u);}}
