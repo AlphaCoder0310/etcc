@@ -154,6 +154,28 @@ def _maybe_start_nuke():
 _NUKE_MOD = None
 
 
+def _mount_dscan():
+    """Embed delta_scan_web at /dscan/ (same process) when
+    the file sits beside this one; harmless if absent."""
+    p = os.path.join(os.path.dirname(
+        os.path.abspath(__file__)), "delta_scan_web.py")
+    dsp = os.environ.get("DSCAN_APP", p)
+    if not os.path.exists(dsp):
+        print("[dscan] delta_scan_web.py not found at", dsp)
+        return
+    try:
+        import importlib.util
+        sp2 = importlib.util.spec_from_file_location(
+            "delta_scan_embedded", dsp)
+        m2 = importlib.util.module_from_spec(sp2)
+        sys.modules["delta_scan_embedded"] = m2
+        sp2.loader.exec_module(m2)
+        app.mount("/dscan", m2.app)
+        print("[dscan] embedded at /dscan/ (same process)")
+    except Exception as e:
+        print("[dscan] embed failed:", e)
+
+
 def _embed_nuke():
     """Import app.py and mount its FastAPI app at /nuke on THIS server.
     One process, one port; no child, no 59999."""
@@ -3545,7 +3567,7 @@ def api_rfq_list(_bg: int = 0):
             payload = {"ok": True, "rows": rows,
                        "ms": int((time.time() - _t0) * 1000),
                        "qttl": RFQ_QUOTE_TTL,
-                       "build": "r76",
+                       "build": "r77",
                        "editable": sorted(RFQ_EDITABLE)}
             RFQ_SNAP["data"] = payload
             RFQ_SNAP["ts"] = time.time()
@@ -5292,7 +5314,7 @@ body.amdock-b #rm_grip{left:0;right:0;top:0;bottom:auto;
  .btnrow{display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap}
  .btnrow .hint{color:#6e6a63;font-size:12px}
 </style></head><body>
-<header>LAGRANGE <small>CB Runs desk console &middot; build 2026-08-19.r76 &middot; one port (59988)</small>
+<header>LAGRANGE <small>CB Runs desk console &middot; build 2026-08-19.r77 &middot; one port (59988)</small>
   <small id="built"></small></header>
 <div id="tabs">
   <div class="tab active" id="tabbtn-recon" onclick="showTab('recon')">TRADE BOOKING RECONCILIATION</div>
@@ -5367,7 +5389,7 @@ against a notebook-generated report.</div>
 <!-- ============ TAB 3 : BAU TASKS ============ -->
 <div id="tab-dscan" class="hide">
   <div class="bar">
-    <span class="status">standalone delta_scan_web.py (port 59966)</span>
+    <span class="status">delta scan · embedded at /dscan/ (same process)</span>
     <a id="ds_open" target="_blank" style="margin-left:10px">open in new window ↗</a>
   </div>
   <iframe id="ds_frame" style="width:100%;border:0;height:calc(100vh - 120px);background:#101418"></iframe>
@@ -5633,7 +5655,7 @@ function showTab(t){
   window.curTab=t;
   ['recon','delta','dscan','risk','bau','blotter','rfq','twcb','nuke'].forEach(x=>{
     if(t==='dscan' && x==='dscan'){
-      const u='http://'+location.hostname+':59966/';
+      const u='/dscan/';
       $('ds_open').href=u;
       if(!$('ds_frame').src) $('ds_frame').src=u; }
     if(t==='risk' && x==='risk') riskLoad();
@@ -8055,8 +8077,9 @@ if __name__ == "__main__":
     threading.Thread(target=_rfq_engine_loop,
                      daemon=True).start()
     print("=" * 62)
-    print("  LAGRANGE  BUILD r76  ·  %s" % os.path.abspath(__file__))
+    print("  LAGRANGE  BUILD r77  ·  %s" % os.path.abspath(__file__))
     print("  port %s  ·  if this banner is missing, you are" % PORT)
     print("  running an OLD file — kill that process first.")
     print("=" * 62)
+    _mount_dscan()
     uvicorn.run(app, host=BIND_HOST, port=PORT, log_level="warning")
