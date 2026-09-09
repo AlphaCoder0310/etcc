@@ -14,7 +14,7 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 
-BUILD = "2b.2"
+BUILD = "2b.5"
 
 # ---------------- §15 configuration ----------------
 ABS_LIMIT_USD   = float(os.environ.get("ABS_LIMIT_USD", 250_000))
@@ -1029,10 +1029,10 @@ Inter,system-ui,sans-serif}
 <table id="tbl"><thead><tr>
  <th class="l">flag</th><th class="l">underlying</th>
  <th>qty L</th><th>qty T1</th><th>&#916; qty</th>
- <th title="underlying row: CB legs; breakdown: that leg">&#916; L</th><th>&#916; T1</th><th>hdg qty</th>
- <th>net &#916; L</th><th>net &#916; T1</th><th>&#916; net</th>
+ <th title="underlying row: CB legs; breakdown: that leg">delta L</th><th>delta T1</th><th>hdg qty</th>
+ <th>net delta L</th><th>net delta T1</th><th title="change in net delta">&#916; net delta</th>
  <th>limit &middot; util</th><th>trade</th><th>drift</th>
- <th title="hedge legs' delta change from the spot move">hdg spot &#916;</th><th>net T+D+S</th>
+ <th title="hedge legs' delta change from the spot move">hdg spot delta</th><th>net T+D+S</th>
  <th>unbooked</th><th>spot %</th><th>HR</th>
  <th class="l">action</th><th class="l">driver</th>
 </tr></thead><tbody id="tb"></tbody></table>
