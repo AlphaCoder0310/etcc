@@ -14,7 +14,7 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 
-BUILD = "2a.6"
+BUILD = "2a.8"
 
 # ---------------- §15 configuration ----------------
 ABS_LIMIT_USD   = float(os.environ.get("ABS_LIMIT_USD", 250_000))
@@ -678,6 +678,9 @@ def scan(demo_dir=None, price_mode=None):
         rank = min(SEV[flag], SEV[flag_post], 1 if ubl else 2)
         gross_live = float(g.D1.abs().sum())
         gross_t1 = float(g.D0.abs().sum())
+        cb_q1 = float(cbg.q1.sum()); cb_q0 = float(cbg.q0.sum())
+        cb_d0 = float(cbg.D0.sum())
+        hedge_q1 = float(hg.q1.sum())
         leg_live = {lg: float(g[g.leg == lg].D1.sum())
                     for lg in ("CB", "Stock", "ADR",
                                "Option", "Other")}
@@ -685,6 +688,8 @@ def scan(demo_dir=None, price_mode=None):
             "ric": u, "name": name, "market": market,
             "leg_live": leg_live,
             "gross_live": gross_live, "gross_t1": gross_t1,
+            "cb_q1": cb_q1, "cb_q0": cb_q0, "cb_dq": cb_q1 - cb_q0,
+            "cb_d0": cb_d0, "hedge_q1": hedge_q1,
             "flag": flag, "flag_post": flag_post, "rank": rank,
             "net_live": net_live, "net_t1": net_t1, "d_net": d_net,
             "trade": trade, "drift": drift, "resid": resid,
@@ -883,82 +888,108 @@ def api_text(refresh: int = 0):
 
 PAGE = r"""<!doctype html><html><head><meta charset="utf-8">
 <title>CB Delta Scan</title><style>
+:root{--ink:#0f172a;--ink2:#475569;--ink3:#94a3b8;
+--rule:#e2e8f0;--rule2:#cbd5e1;--rule3:#64748b;--bg2:#f8fafc;
+--neg:#b91c1c;--acc:#1d4ed8;--amb:#b45309}
 *{box-sizing:border-box}
-body{margin:0;background:#fff;color:#16181c;
-font:11px/1.25 Consolas,Menlo,monospace;
-font-variant-numeric:tabular-nums}
-.f,#top,h1,.badge,.chip,button,#meta,.sm,th,.wrapmax,
-tr.mkt td{font-family:"Segoe UI",system-ui,sans-serif}
+body{margin:0;background:#fff;color:var(--ink);
+font:11px/1.3 "Segoe UI",Inter,system-ui,sans-serif}
+td,.mono,#deskline{font-family:Consolas,"SF Mono",Menlo,
+monospace;font-variant-numeric:tabular-nums}
 #top{position:sticky;top:0;z-index:10;background:#fff;
-border-bottom:2px solid #16181c;padding:4px 8px}
-#top .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-h1{font-size:13px;font-weight:700;letter-spacing:2px;
-margin:0 6px 0 0}
-.badge{padding:0 5px;border-radius:2px;font-weight:700;
-font-size:9.5px}
-.b-h{background:#c62828;color:#fff}
-.b-w{background:#e8a020;color:#fff}
-.b-o{background:#e8f3ea;color:#1b7a3d;border:1px solid #bfdcc7}
-.b-u{background:#1565c0;color:#fff}
-.b-c{background:#6a4fa3;color:#fff}
-.chip{cursor:pointer;padding:1px 7px;border:1px solid #ccc;
-border-radius:9px;color:#667;font-size:10.5px}
-.chip.on{border-color:#16181c;color:#16181c;font-weight:700}
-button{background:#fff;color:#16181c;border:1px solid #bbb;
-padding:1px 7px;cursor:pointer;font-size:11px}
-button:hover{background:#f2f2f2}
-input[type=text]{background:#fff;color:#16181c;
-border:1px solid #bbb;padding:1px 5px;font-size:11px}
-#meta{color:#778;font-size:10px;margin-top:2px}
+border-bottom:1px solid var(--ink);padding:6px 10px 4px}
+#top .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+h1{font-size:12px;font-weight:600;letter-spacing:2.5px;
+margin:0 8px 0 0;color:var(--ink)}
+.badge{display:inline-block;padding:0 5px;border-radius:2px;
+font-size:9px;font-weight:600;letter-spacing:.6px;
+border:1px solid var(--rule2);color:var(--ink2);
+line-height:14px;vertical-align:middle}
+.b-h{background:var(--neg);border-color:var(--neg);color:#fff}
+.b-w{border-color:var(--amb);color:var(--amb)}
+.b-o{border-color:var(--rule2);color:var(--ink3)}
+.b-u{border-color:var(--acc);color:var(--acc)}
+.b-c{border-color:var(--ink2);color:var(--ink2)}
+.chip{cursor:pointer;padding:1px 8px;border:1px solid var(--rule2);
+border-radius:2px;color:var(--ink2);font-size:10px;
+letter-spacing:.4px}
+.chip.on{border-color:var(--ink);color:var(--ink);
+background:var(--bg2)}
+button{background:#fff;color:var(--ink);border:1px solid
+ var(--rule2);border-radius:2px;padding:1px 8px;cursor:pointer;
+font:10px "Segoe UI",Inter,system-ui,sans-serif}
+button:hover{border-color:var(--ink)}
+input[type=text]{background:#fff;color:var(--ink);
+border:1px solid var(--rule2);border-radius:2px;
+padding:1px 6px;font:10px "Segoe UI",Inter,system-ui,sans-serif}
+label{font-size:10px;color:var(--ink2)}
+#meta{color:var(--ink3);font-size:10px;margin-top:3px}
 table{border-collapse:collapse;width:100%}
 th{position:sticky;background:#fff;z-index:5;
-border-bottom:1.5px solid #16181c;padding:3px 4px;
-font-size:9px;font-weight:700;letter-spacing:.6px;color:#445;
-text-transform:uppercase;text-align:right;
-border-right:1px solid #eee}
-th:nth-child(-n+2),th:nth-child(15),th:last-child{
+border-bottom:1px solid var(--ink);padding:4px 5px;
+font-size:9px;font-weight:600;letter-spacing:.7px;
+color:var(--ink2);text-transform:uppercase;text-align:right;
+border-right:1px solid var(--rule)}
+th:nth-child(-n+2),th:nth-child(19),th:last-child{
 text-align:left}
-td{border-bottom:1px solid #ececec;border-right:1px solid
- #f2f2f2;padding:1px 4px;text-align:right;
+td{border-bottom:1px solid var(--rule);border-right:1px solid
+ var(--rule);padding:2px 5px;text-align:right;
 vertical-align:middle;white-space:nowrap}
 th:last-child,td:last-child{border-right:none}
-/* group rules: after underlying(2), legs(6), gross(8),
-   nets(11), drift(14), HR(17) */
-th:nth-child(2),td:nth-child(2),th:nth-child(6),
-td:nth-child(6),th:nth-child(8),td:nth-child(8),
-th:nth-child(11),td:nth-child(11),th:nth-child(14),
-td:nth-child(14),th:nth-child(17),td:nth-child(17){
-border-right:1px solid #b9b9b9}
-td.gl b{font-weight:700}
+/* group rules: identity(2) qty(5) hedge(8) nets(11)
+   attribution(15) market(18) */
+th:nth-child(2),td:nth-child(2),th:nth-child(5),
+td:nth-child(5),th:nth-child(8),td:nth-child(8),
+th:nth-child(11),td:nth-child(11),th:nth-child(15),
+td:nth-child(15),th:nth-child(18),td:nth-child(18){
+border-right:1px solid var(--rule3)}
+/* section tints (th + und cells) */
+#tbl>thead th:nth-child(n+3):nth-child(-n+5),
+tr.und td:nth-child(n+3):nth-child(-n+5){background:#f7f9fc}
+#tbl>thead th:nth-child(n+6):nth-child(-n+8),
+tr.und td:nth-child(n+6):nth-child(-n+8){background:#fbfbf7}
+#tbl>thead th:nth-child(n+9):nth-child(-n+11),
+tr.und td:nth-child(n+9):nth-child(-n+11){background:#eef2f7}
+#tbl>thead th:nth-child(n+12):nth-child(-n+15),
+tr.und td:nth-child(n+12):nth-child(-n+15){background:#f9f7fb}
+#tbl>thead th:nth-child(n+16):nth-child(-n+18),
+tr.und td:nth-child(n+16):nth-child(-n+18){background:#f5faf7}
+tr.und:hover td:nth-child(n){background:#e8eef5}
+td.gl{background:#e5ebf3 !important}
 tr.und{cursor:pointer}
-tr.und:hover td{background:#f6f8fa}
-tr.mkt td{background:#f2f2f2;font-size:11px;font-weight:700;
-text-align:left;cursor:pointer;border-top:1px solid #16181c;
-border-bottom:1px solid #d5d5d5;padding:2px 6px}
+tr.und:hover td{background:#f1f5f9}
+tr.mkt td{background:var(--bg2);font-family:"Segoe UI",Inter,
+system-ui,sans-serif;font-size:10.5px;font-weight:600;
+letter-spacing:.3px;text-align:left;cursor:pointer;
+border-top:1px solid var(--ink);border-bottom:1px solid
+ var(--rule2);padding:3px 8px;color:var(--ink)}
 td.l{text-align:left}
-.pos{color:#1b7a3d}.neg{color:#c62828}.mut{color:#99a}
-.sm{font-size:9.5px;color:#889}
-.bar{display:inline-block;width:44px;height:5px;
-background:#e8e8e8;border-radius:2px;overflow:hidden;
-vertical-align:middle;margin:0 3px}
-.bar i{display:block;height:100%}
-tr.det>td{background:#fbfbfc;text-align:left;
-padding:2px 6px 3px 24px;border-right:none}
+.neg{color:var(--neg)}.pos{color:var(--ink)}.mut{color:var(--ink3)}
+.sm{font-size:9.5px;color:var(--ink3);
+font-family:"Segoe UI",Inter,system-ui,sans-serif}
+.bar{display:inline-block;width:40px;height:4px;
+background:var(--rule);overflow:hidden;vertical-align:middle;
+margin:0 4px}
+.bar i{display:block;height:100%;background:var(--ink2)}
+tr.det>td{background:#fff;text-align:left;
+padding:3px 8px 6px 26px;border-right:none;
+border-bottom:1px solid var(--rule2)}
 .det table{width:auto;table-layout:fixed}
-.det col.c0{width:44px}.det col.c1{width:210px}
-.det col.c2{width:170px}.det col.c3{width:62px}
-.det col.c4{width:170px}.det col.c5{width:160px}
-.det col.c6{width:78px}.det col.c7{width:78px}
-.det col.c8{width:64px}.det col.c9{width:420px}
-.det th{position:static;background:#fbfbfc;
-border-bottom:1px solid #ccc;font-size:8.5px;
-border-right:none;padding:1px 5px}
-.det td{border-bottom:1px solid #f0f0f0;border-right:none;
-font-size:10.5px;padding:0 5px;line-height:1.35;
+.det col.c0{width:46px}.det col.c1{width:230px}
+.det col.c2{width:180px}.det col.c3{width:64px}
+.det col.c4{width:180px}.det col.c5{width:170px}
+.det col.c6{width:80px}.det col.c7{width:80px}
+.det col.c8{width:66px}.det col.c9{width:440px}
+.det th{position:static;background:#fff;
+border-bottom:1px solid var(--rule2);font-size:8.5px;
+border-right:none;padding:2px 5px;color:var(--ink3)}
+.det td{border-bottom:1px solid var(--rule);border-right:none;
+font-size:10.5px;padding:1px 5px;line-height:1.35;
 overflow:hidden;text-overflow:ellipsis}
-.caret{display:inline-block;width:10px;color:#889}
+.caret{display:inline-block;width:10px;color:var(--ink3)}
 .wrapmax{max-width:none;white-space:normal;font-size:10.5px;
-line-height:1.2}
+line-height:1.25;color:var(--ink2);font-family:"Segoe UI",
+Inter,system-ui,sans-serif}
 </style></head><body>
 <div id="top">
  <div class="row">
@@ -983,10 +1014,11 @@ line-height:1.2}
 </div>
 <table id="tbl"><thead><tr>
  <th class="l">flag</th><th class="l">underlying</th>
- <th>CB</th><th>STK</th><th>ADR</th><th>OPT</th>
- <th>gross L</th><th>gross T1</th>
- <th>net live</th><th>net t1</th><th>\u0394 net</th>
+ <th>qty L</th><th>qty T1</th><th>\u0394 qty</th>
+ <th>CB \u0394 L</th><th>CB \u0394 T1</th><th>hdg qty</th>
+ <th>net \u0394 L</th><th>net \u0394 T1</th><th>\u0394 net</th>
  <th>limit \u00b7 util</th><th>trade</th><th>drift</th>
+ <th>T+D</th>
  <th>unbooked</th><th>spot %</th><th>HR</th>
  <th class="l">action</th><th class="l">driver</th>
 </tr></thead><tbody id="tb"></tbody></table>
@@ -1002,7 +1034,7 @@ function fU(v,signed=true){ if(v==null||!isFinite(v))
  if(a>=1e6)t=s+(a/1e6).toFixed(2)+"M";
  else if(a>=1e3)t=s+(a/1e3).toFixed(0)+"k";
  else t=s+a.toFixed(0);
- const c=v>0?"pos":(v<0?"neg":"");
+ const c=v<0?"neg":"";
  return '<span class="'+c+' mono">'+t+"</span>";}
 const fUp=v=>fU(v,false);
 function fP(v){return (v==null||!isFinite(v))
@@ -1012,8 +1044,16 @@ function fP(v){return (v==null||!isFinite(v))
 const fR=v=>(v==null||!isFinite(v))
  ?'<span class="mut">n/a</span>'
  :'<span class="mono">'+v.toFixed(2)+"</span>";
-const fQ=v=>(v==null||!isFinite(v))?"n/a"
- :Number(v).toLocaleString("en-US",{maximumFractionDigits:0});
+const fQ=v=>(v==null||!isFinite(v))?'<span class="mut">\u00b7</span>'
+ :(v===0?'<span class="mut">0</span>'
+ :'<span class="'+(v<0?'neg':'')+'">'
+  +Number(v).toLocaleString("en-US",{maximumFractionDigits:0})
+  +'</span>');
+const fQs=v=>(v==null||!isFinite(v))?'<span class="mut">\u00b7</span>'
+ :(v===0?'<span class="mut">0</span>'
+ :'<span class="'+(v<0?'neg':'')+'">'+(v>0?'+':'')
+  +Number(v).toLocaleString("en-US",{maximumFractionDigits:0})
+  +'</span>');
 let P=null,FILT="ALL",Q="",openM=new Set(),openU=new Set(),
  seeded=false;
 function flags(u){return [u.flag,u.flag_post];}
@@ -1029,8 +1069,7 @@ function vis(u){
 function badge(f){const c=f==="HEDGE"?"b-h":(f==="WATCH"?"b-w":
  "b-o");return '<span class="badge '+c+'">'+f+"</span>";}
 function utilBar(u){const pct=Math.min(1.6,u.util||0);
- const col=(u.util>1)?"var(--red)":((u.util>0.5)?"var(--amb)"
-  :"var(--grn)");
+ const col=(u.util>1)?"var(--neg)":"var(--ink2)";
  return fUp(u.limit)+'<span class="bar"><i style="width:'
   +Math.min(100,pct*62.5)+'%;background:'+col+'"></i></span>'
   +'<span class="sm mono">'+((u.util||0)*100).toFixed(0)
@@ -1074,18 +1113,20 @@ function undRow(u){
   +'<td class="l">'+f1+"</td>"
   +'<td class="l"><b>'+esc(u.ric)+'</b> <span class="sm">'
    +esc(u.name||"")+"</span></td>"
-  +legTds(u)
-  +"<td>"+fUp(u.gross_live)+"</td>"
-  +"<td>"+fUp(u.gross_t1)+"</td>"
+  +"<td>"+fQ(u.cb_q1)+"</td><td>"+fQ(u.cb_q0)+"</td>"
+  +"<td>"+fQs(u.cb_dq)+"</td>"
+  +"<td>"+fU(u.cb_live)+"</td><td>"+fU(u.cb_d0)+"</td>"
+  +"<td>"+fQs(u.hedge_q1)+"</td>"
   +'<td class="gl"><b>'+fU(u.net_live)+"</b></td>"
   +"<td>"+fU(u.net_t1)+"</td><td>"+fU(u.d_net)+"</td>"
   +"<td>"+utilBar(u)+"</td>"
   +"<td>"+fU(u.trade)+"</td><td>"+fU(u.drift)+"</td>"
+  +"<td>"+fU((u.trade||0)+(u.drift||0))+"</td>"
   +"<td>"+ub+"</td><td>"+sp+"</td><td>"+fR(u.hr)+"</td>"
   +'<td class="l mono">'+act+"</td>"
   +'<td class="l wrapmax">'+esc(u.driver||"")+"</td></tr>";}
 function detRow(u){
- let h='<tr class="det"><td colspan="19"><div class="det">';
+ let h='<tr class="det"><td colspan="20"><div class="det">';
  if((u.components||[]).length){
   h+='<table><colgroup>'+
    [0,1,2,3,4,5,6,7,8,9].map(k=>'<col class="c'+k+'">')
@@ -1175,7 +1216,7 @@ function render(){
   if(mk.n_check)mh+=' <span class="badge b-c">!</span> '
    +mk.n_check;
   h+='<tr class="mkt" data-mk="'+esc(mk.market)
-   +'"><td colspan="19">'+mh+"</td></tr>";
+   +'"><td colspan="20">'+mh+"</td></tr>";
   if(mop)for(const u of us){
    h+=undRow(u);
    if(openU.has(u.ric))h+=detRow(u);}}
