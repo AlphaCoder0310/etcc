@@ -2548,7 +2548,7 @@ h2{font-size:10.5px;font-weight:700;color:var(--muted);margin:0;
 <body>
 <header>
   <h1>CB nuke station</h1>
-  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b6</b></span>
+  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b7</b></span>
   <span id="conn" class="conn warn" title="Connection">&#9679;</span>
   <span id="online" class="sub"></span>
   <div class="tabs">
@@ -3105,6 +3105,18 @@ function eikonVal(ri, e){
   return sanitizeNum(td ? td.textContent : "");
 }
 
+function vanRow(tr){
+  const b=tr&&tr.querySelector('input[data-u="bond_type"]');
+  return b&&String(b.value||'').toLowerCase().startsWith('vanil');
+}
+function vanCbFromUnd(ri){
+  const tr=trAt(ri); if(!tr||!vanRow(tr)) return false;
+  const u=tr.querySelector('input[data-f="ovdUndFx"]');
+  const c=tr.querySelector('input[data-f="ovdCbFx"]');
+  if(u&&c&&String(u.value).trim()!==''){
+    c.value=u.value; flash(c); return true; }
+  return false;
+}
 function copyEikonToInput(ri, field, e){
   const v = eikonVal(ri, e);
   if(v === "") return false;
@@ -3148,6 +3160,7 @@ function bulkCopy(kind){
   for(const ri of rows){
     let any=false;
     for(const f of FIELDS) any = copyResultToInput(ri, f, kind) || any;
+    vanCbFromUnd(ri);
     any ? ok++ : skip++;
   }
   syncRows(rows);
@@ -3171,7 +3184,8 @@ function bulkEikon(metric){
     let any=false;
     any = copyEikonToInput(ri, "ovdSpot",  "stk_"+metric) || any;
     any = copyEikonToInput(ri, "ovdUndFx", "fx_"+metric)  || any;
-    any = copyResultToInput(ri, "ovdCbFx", "live")        || any;
+    any = (vanCbFromUnd(ri)
+           || copyResultToInput(ri, "ovdCbFx", "live")) || any;
     any ? ok++ : miss++;
   }
   syncRows(rows);
@@ -3924,6 +3938,8 @@ function doAutoLast(){
       return el ? el.textContent.trim() : ""; };
     const pairs=[["ovdSpot", g('td[data-rf="last"]')],
                  ["ovdUndFx", g('td[data-fx="last"]')]];
+    if(vanRow(tr)){ const fl=g('td[data-fx="last"]');
+      if(fl!=="") pairs.push(["ovdCbFx", fl]); }
     let changed=false;
     for(const [f,src] of pairs){
       if(src==="") continue;
@@ -5115,7 +5131,7 @@ if __name__ == "__main__":
     # NOTE: reload must stay OFF (single process) so the in-memory
     # WebSocket hub works, and so the browser only opens once.
     print("=" * 62)
-    print("  NUKE STATION  BUILD borrow.b6  \u00b7  %s"
+    print("  NUKE STATION  BUILD borrow.b7  \u00b7  %s"
           % os.path.abspath(__file__))
     print("  port %s \u00b7 if this banner is missing, an OLD file is\n  running \u2014 kill that process first." % PORT)
     print("=" * 62)
