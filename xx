@@ -14,7 +14,7 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 
-BUILD = "2a.2"
+BUILD = "2a.3"
 
 # ---------------- §15 configuration ----------------
 ABS_LIMIT_USD   = float(os.environ.get("ABS_LIMIT_USD", 250_000))
@@ -1155,7 +1155,7 @@ $("exp").onclick=()=>{for(const m of P.markets){
   for(const u of m.underlyings)openU.add(u.ric);}render();};
 $("col").onclick=()=>{openU.clear();render();};
 async function load(force){
- try{const r=await fetch("/api/scan"+(force?"?refresh=1":""));
+ try{const r=await fetch("api/scan"+(force?"?refresh=1":""));
   const j=await r.json();
   if(j&&j.error){$("meta").textContent=
     "SCAN ERROR: "+j.error;return;}
