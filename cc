@@ -2554,7 +2554,7 @@ h2{font-size:10.5px;font-weight:700;color:var(--muted);margin:0;
 <body>
 <header>
   <h1>CB nuke station</h1>
-  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b10</b></span>
+  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b11</b></span>
   <span id="conn" class="conn warn" title="Connection">&#9679;</span>
   <span id="online" class="sub"></span>
   <div class="tabs">
@@ -2745,13 +2745,15 @@ const DEFAULT_IDS = __DEFAULT_IDS__;
    zones keep selections within a column group so ranges never span
    the read-only columns physically in between. */
 const COLS = ["short_name","und_fx","n_gamma",
-              "ovdSpot","ovdCbFx","ovdUndFx"];
+              "ovdSpot","ovdCbFx","ovdUndFx",
+              "dc_notl","dc_delta"];
 const NCOLS = COLS.length;
 const FIELDS = ["ovdSpot","ovdCbFx","ovdUndFx"];
 const FSUF = {ovdSpot:"Spot", ovdCbFx:"CbFx", ovdUndFx:"UndFx"};
-const zoneOf = c => c===0 ? 0 : (c===1 ? 1 : (c===2 ? 2 : 3));
+const zoneOf = c => c===0 ? 0 : (c===1 ? 1 : (c===2 ? 2 :
+                       (c<=5 ? 3 : 4)));
 const zoneBounds = z => z===0 ? [0,0] : (z===1 ? [1,1] :
-                         (z===2 ? [2,2] : [3,5]));
+                         (z===2 ? [2,2] : (z===3 ? [3,5] : [6,7])));
 const isNum = c => c >= 2;
 let lastResponse = null;
 const refCache = {};
@@ -3585,9 +3587,9 @@ function buildTable(idsOpt){
       ["iv","10","30","90","n","vega"].map((n,i)=>
         `<td data-v="${n}" data-band="vol" class="rowclick${i===0?" grp bfirst":""}"
            title="realised vol, annualised (\u221a252), from daily closes"></td>`).join("") +
-      `<td class="gc uinp grp bfirst" data-band="dcalc"><input class="gridcell dcv" data-dc="notl" data-id="${id}" oninput="dcChg(this)" inputmode="decimal" autocomplete="off" placeholder="&#8212;" title="bond notional (face) - session only, blank at launch"></td>` +
-      `<td class="gc uinp" data-band="dcalc"><input class="gridcell dcv" data-dc="delta" data-id="${id}" oninput="dcChg(this)" inputmode="decimal" autocomplete="off" placeholder="&#8212;" title="delta % (e.g. 56)"></td>` +
-      `<td data-c="dc_shares" data-band="dcalc" class="rowclick" title="notional x delta% x PARITY% / ovdSpot"></td>` +
+      `<td class="gc uinp grp bfirst" data-band="dcalc"><input class="gridcell dcv" data-dc="notl" data-id="${id}" data-row="${ri}" data-col="6" oninput="dcChg(this)" inputmode="decimal" autocomplete="off" placeholder="&#8212;" title="bond notional (face) - session only, blank at launch"></td>` +
+      `<td class="gc uinp" data-band="dcalc"><input class="gridcell dcv" data-dc="delta" data-id="${id}" data-row="${ri}" data-col="7" oninput="dcChg(this)" inputmode="decimal" autocomplete="off" placeholder="&#8212;" title="delta % (e.g. 56)"></td>` +
+      `<td data-c="dc_shares" data-band="dcalc" class="rowclick" title="notional x (ovdCbFx/ovdUndFx) x delta% x PARITY% / ovdSpot"></td>` +
       `<td data-c="dc_usd" data-band="dcalc" class="rowclick" title="notional x delta% x PARITY% / ovdCbFx"></td>` +
       FIELDS.map((f,ci)=>
         `<td class="gc inp${ci===0?" grp bfirst":""}" data-band="inp">` +
@@ -4062,12 +4064,14 @@ function updDeltaCalc(tr){
   const par = parseFloat((tr.querySelector('td[data-c="parityPct"]')||{}).textContent) / 100;
   const sp = parseFloat((tr.querySelector('input[data-f="ovdSpot"]')||{}).value);
   const cb = parseFloat((tr.querySelector('input[data-f="ovdCbFx"]')||{}).value);
+  const uf = parseFloat((tr.querySelector('input[data-f="ovdUndFx"]')||{}).value);
   const shT = tr.querySelector('td[data-c="dc_shares"]');
   const usT = tr.querySelector('td[data-c="dc_usd"]');
   const base = notl * dl * par;
   const fmt = v => isFinite(v) ? Math.round(v).toLocaleString("en-US") : "\u2014";
   const ok = isFinite(notl) && isFinite(dl) && isFinite(par);
-  if(shT) shT.textContent = (ok && isFinite(sp) && sp>0) ? fmt(base/sp) : "\u2014";
+  if(shT) shT.textContent = (ok && isFinite(sp) && sp>0 && isFinite(cb)
+    && isFinite(uf) && uf>0) ? fmt(base*(cb/uf)/sp) : "\u2014";
   if(usT) usT.textContent = (ok && isFinite(cb) && cb>0) ? fmt(base/cb) : "\u2014";
 }
 function updParityAll(){
@@ -4272,6 +4276,11 @@ function rowPayload(ri){
 }
 
 function syncRows(ris){
+  [...new Set(ris)].forEach(ri=>{ const tr=trAt(ri); if(!tr) return;
+    const sid=Number(tr.dataset.id); DC[sid]=DC[sid]||{};
+    tr.querySelectorAll("input[data-dc]").forEach(i=>{
+      DC[sid][i.dataset.dc]=i.value.trim(); });
+    updDeltaCalc(tr); });
   const list = [...new Set(ris)].map(rowPayload).filter(Boolean);
   if(!list.length) return;
   for(const p of list) NS.rows[p.secId] = {short_name:p.short_name,
@@ -5179,7 +5188,7 @@ if __name__ == "__main__":
     # NOTE: reload must stay OFF (single process) so the in-memory
     # WebSocket hub works, and so the browser only opens once.
     print("=" * 62)
-    print("  NUKE STATION  BUILD borrow.b10  \u00b7  %s"
+    print("  NUKE STATION  BUILD borrow.b11  \u00b7  %s"
           % os.path.abspath(__file__))
     print("  port %s \u00b7 if this banner is missing, an OLD file is\n  running \u2014 kill that process first." % PORT)
     print("=" * 62)
