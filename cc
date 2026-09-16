@@ -1,5139 +1,8134 @@
-"""
-app.py -- CB Nuke Station v10 (multi-user, WebSocket-shared)
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+r"""
+cb_recon_web.py  --  LAGRANGE : CB desk web app
+------------------------------------------------------------
+Minimal, reliable shell over the existing verified modules:
+  load_trade_history.py  (EQRMS txt -> eqrms.trade_history)
+  recon_cb.py            (matching engine + report HTML + Outlook send)
 
-Deploy (desk-wide):
-  * Run on ONE machine: python app.py   (binds 0.0.0.0:59999, single worker).
-  * Overrides via env vars: APP_PORT, APP_HOST, APP_FQDN, BROWSER_URL.
-  * On the production box the browser auto-opens the FQDN link (the one to
-    share); on a dev laptop it opens localhost instead.
-  * Colleagues open   http://<machine-name>:59999   -- allow inbound TCP 59999
-    in Windows Firewall the first time.
-  * All users share one live table: security list, short names, und_fx,
-    nGamma (manual, Δ-points per 1% und move) and overrides sync instantly;
-    a client-computed theo · γ-adj section (m%, rollΔ, Δpnl, γpnl, theo,
-    vs live) sits between override result and stock, re-priced on every
-    Refinitiv tick / override / nuke; nukes are serialized on the server and the
-    result is broadcast to everyone with the requester's name.
-  * One server-side Refinitiv poller feeds all browsers (interval settable
-    in Config, applies to everyone). A second poller re-fetches eqrms /
-    cbanalytics reference data (ric, sec_fx, qty, usd, expiry, isin) every
-    5 min by default -- also settable in Config -- so positions track fresh
-    snaps without reloading. Latest-batch reads use a 10s tolerance window
-    on loaded_at because the snap loader takes 1-2s to write a batch.
-  * Durability: working state -> cba_app.cb_state (+ cb_state_meta for the
-    book order), audit trail -> cba_app.app_events, rotating file log
-    nuke_station.log next to this file. Tables are auto-created.
-  * Do NOT run multiple workers/instances: state is in-process by design.
--------------------------------------------------------------
-Minimal stack: FastAPI + Uvicorn backend, vanilla HTML/JS frontend
-embedded in this single file. No build tools.
+Two tabs:
+  1. Trade Booking Reconciliation  (recon_cb.py)
+  2. Delta Check (CBA)             (delta_check_recovered.py, DB leg only;
+     the derivation leg needs the Derivation window + Bloomberg and
+     stays in the notebook)
 
-Install:
-    pip install fastapi uvicorn requests pymysql refinitiv-data
+Stack: FastAPI + uvicorn (already used by CB Nuke Station) + one
+embedded HTML page. No frontend framework, no CDN, no templates.
 
-Run:
-    python app.py     (Refinitiv Workspace desktop running for live data)
-    -> open http://127.0.0.1:59999
+Buttons
+-------
+  Refresh    : (1) load any new "Trade History.YYYYMMDD.txt" from
+               M:\CB\Snaps\TradeHistory into MariaDB (idempotent upsert),
+               (2) re-query the DB, (3) rebuild the report.
+               NOTE: exporting the txt out of EQRMS is still manual.
+  Open Draft : compose the current report in Outlook for review.
+  Send Now   : send the current report immediately.
 
-v9:
-    * short_name and und_fx are now first-class grid columns with the
-      same spreadsheet behaviour as the overrides: click selects,
-      drag / Shift+arrows extend (within their own column), multi
-      copy / cut / paste, drag-fill handle, Ctrl+D, Delete, Esc,
-      double-click to edit. Arrow keys travel across all five
-      editable columns; selections stay within a column zone so
-      ranges never span the read-only columns in between.
-    * und_fx takes an Eikon FX RIC (TWD=, KRW=, HKD=, TWDKRW=R, or
-      1 for USD) and drives the fx group, which now also shows the
-      FX close and close date (TR.PriceClose with CF_CLOSE fallback)
-      alongside fx last / time / date.
-    * cba_app.cb_nuke gains fx_close / fx_close_date (auto-migrated).
+Run
+---
+  python cb_recon_web.py            # http://127.0.0.1:59988
+  (or use run_cb_recon_web.bat)
 """
 
-import asyncio
-import json
-import logging
+import io
 import os
-from contextlib import asynccontextmanager
-from datetime import datetime, date, timedelta
-from collections import deque
-from logging.handlers import RotatingFileHandler
-from typing import Any, Dict, List, Optional, Set
+import json
+import time
+import sys
+import threading
+import contextlib
+import datetime as dt
+from typing import Optional, Dict, Any
 
-import pymysql
-import requests
-import uvicorn
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse
+import hmac
+import hashlib
+import secrets
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, RedirectResponse
 from pydantic import BaseModel
-from starlette.concurrency import run_in_threadpool
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
-# ------------------------------------------------------------------
-# Config
-# ------------------------------------------------------------------
-HOST = os.environ.get("APP_HOST", "0.0.0.0")       # all interfaces for the desk
-PORT = int(os.environ.get("APP_PORT", "59999"))    # override: SET APP_PORT=...
+import load_trade_history as ldr
+import recon_cb as rc
+em = rc   # single combined module serves both roles
 
-# Production box: when the app runs THERE, the browser opens the friendly
-# FQDN (which is also the link to share); on a dev laptop it opens localhost.
-SERVER_FQDN = os.environ.get(
-    "APP_FQDN", "apachkgfiwx507.apac.nsroot.net")
-SERVER_SHORT = SERVER_FQDN.split(".")[0]
+LAGRANGE_BUILD = "2026-08-01.embed"   # shown in header/console; bump on deploy
+
+NUKE_EMBED = os.environ.get("NUKE_EMBED", "1") == "1"
+# embedded mode serves Nuke Station at /nuke/ from THIS process; the desk
+# reaches it via this host, so default to all interfaces in that mode
+HOST = os.environ.get("LAGRANGE_HOST",
+                      "0.0.0.0" if NUKE_EMBED else "127.0.0.1")
+PORT = 59988
+
+# DB updater script (writes cbanalytics.lp_model_output / nuked_price).
+# Override with env var CBA_UPDATER if the path ever moves.
+CBA_UPDATER = os.environ.get("CBA_UPDATER", r"M:\CB\BAU\cba_mariadb.py")
+CBA_UPDATER_TIMEOUT = 900   # seconds
+
+# Derivation app window (delta check auto-grab). Exact title preferred,
+# any window starting with the prefix accepted (survives version bumps).
+DERIV_WINDOW_TITLE = "Derivation (2023-12-rev3-db466.1 : Release)"
+DERIV_TITLE_PREFIX = "Derivation ("
+DERIV_MIN_ROWS = 600   # below this the grab retries with the simple sequence
+
+# CB Nuke Station server (embedded in its own tab; app runs separately)
+NUKE_URL = os.environ.get("NUKE_URL", "http://127.0.0.1:59999")
+NUKE_AUTOSTART = os.environ.get("NUKE_AUTOSTART", "1") == "1"
+NUKE_APP = os.environ.get("NUKE_APP", os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "app.py"))
+_NUKE_PROC = None
 
 
-def _running_on_server() -> bool:
-    """True if the current host looks like the production server."""
-    import socket
+def _nuke_up(timeout=2):
+    import urllib.request
     try:
-        this_host = socket.gethostname().lower()
+        with urllib.request.urlopen(NUKE_URL, timeout=timeout) as r:
+            return 200 <= r.status < 500
     except Exception:
-        this_host = ""
-    try:
-        this_fqdn = socket.getfqdn().lower()
-    except Exception:
-        this_fqdn = ""
-    candidates = {this_host, this_fqdn, this_host.split(".")[0]}
-    return SERVER_FQDN.lower() in candidates or SERVER_SHORT.lower() in candidates
+        return False
 
 
-def resolve_browser_url() -> str:
-    """1. BROWSER_URL env override  2. FQDN on the real server  3. localhost."""
-    if os.environ.get("BROWSER_URL"):
-        return os.environ["BROWSER_URL"]
-    if _running_on_server():
-        return f"http://{SERVER_FQDN}:{PORT}/"
-    return f"http://localhost:{PORT}/"
-RFX_REFRESH_DEFAULT = 5   # server-side Refinitiv poll, seconds (shared by all)
-REFDATA_REFRESH_DEFAULT = 300   # eqrms/cbanalytics refdata re-fetch, seconds
-
-BASE_URL = "http://cbprice-on-demand.wlb4.apac.nsroot.net:65450"
-ENDPOINT_NUKED = "/GetNukedCBPrice"
-MAIN_LOOP = None
-BW_FIELDS = ("bw_dvb", "bw_dvs", "bw_brw", "bw_lo", "bw_hi",
-             "bw_gap", "bw_util", "bw_d5", "bw_htb", "bw_evt",
-             "bw_src", "bw_tnr")
-USERNAME = "jb33880"
-OVERRIDES_KEY = "lstOverrides"
-JSON_PAYLOAD_TYPE = (
-    "Citi.Equity.CbService.Web.RestApi.JsonRequest_CBPricing_PriceCb_Overrides_list"
-)
-CONNECT_TIMEOUT = 10
-READ_TIMEOUT = 120
-BATCH_SIZE = 50
-
-DB_CONFIG = {
-    "host": "localhost",
-    "port": 33306,
-    "user": "root",
-    "password": "",
-    "charset": "utf8mb4",
-    "connect_timeout": 10,
-}
-CBA_DB = "cbanalytics"
-REF_TABLE = "nuked_price"
-EQRMS_DB = "eqrms"
-RIC_TABLE = "risk_positions"
-APP_DB = "cba_app"
-APP_TABLE = "cb_nuke"
-
-REFINITIV_FIELDS = ["CF_LAST", "CF_TIME", "CF_DATE", "CF_CLOSE",
-                    "TR.PriceClose", "TR.PriceClose.date"]
-
-DEFAULT_SEC_IDS = [
-    42863076, 55995604, 30622018, 29647868, 43338089,
-    52853490, 44497742, 28357967, 52940785,
-]
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s : %(message)s",
-)
-logger = logging.getLogger("nuke_station")
-
-LOG_RING: "deque[str]" = deque(maxlen=800)
+_NUKE_NOTE = "autostart not attempted yet"
 
 
-class _RingHandler(logging.Handler):
-    def emit(self, record):
-        try:
-            LOG_RING.append("%s [%s] %s" % (
-                datetime.now().strftime("%H:%M:%S"),
-                record.levelname[:4], self.format(record)))
-        except Exception:
-            pass
+def _maybe_start_nuke():
+    """Start app.py as a child ONLY if nothing already serves NUKE_URL
+    and the URL is local. Child log -> nuke_station_console.log; its
+    browser popup suppressed; terminated when Lagrange exits.
+    Records its verdict in _NUKE_NOTE and is safe to call again (the
+    Connect button retries it)."""
+    global _NUKE_PROC, _NUKE_NOTE
+    if not NUKE_AUTOSTART:
+        _NUKE_NOTE = "autostart disabled (NUKE_AUTOSTART=0)"
+        print("[nuke]", _NUKE_NOTE)
+        return
+    from urllib.parse import urlparse
+    host = urlparse(NUKE_URL).hostname
+    if host not in ("127.0.0.1", "localhost"):
+        _NUKE_NOTE = "NUKE_URL is remote (%s) - autostart skipped" % host
+        print("[nuke]", _NUKE_NOTE)
+        return
+    if _NUKE_PROC is not None and _NUKE_PROC.poll() is None:
+        _NUKE_NOTE = "child running (pid %d)" % _NUKE_PROC.pid
+        return
+    if _nuke_up():
+        _NUKE_NOTE = "already running at %s (not started by Lagrange)" % NUKE_URL
+        print("[nuke]", _NUKE_NOTE)
+        return
+    if not os.path.exists(NUKE_APP):
+        _NUKE_NOTE = ("app.py NOT FOUND at %s - put Nuke Station's app.py "
+                      "there, or set NUKE_APP to its real path" % NUKE_APP)
+        print("[nuke]", _NUKE_NOTE)
+        return
+    import subprocess
+    import atexit
+    logpath = os.path.join(os.path.dirname(NUKE_APP),
+                           "nuke_station_console.log")
+    logf = open(logpath, "a")
+    env = dict(os.environ, NUKE_NO_BROWSER="1", LAGRANGE_CHILD="1")
+    _NUKE_PROC = subprocess.Popen(
+        [sys.executable, NUKE_APP],
+        cwd=os.path.dirname(NUKE_APP) or ".",
+        stdin=subprocess.PIPE,          # child exits when this pipe closes
+        stdout=logf, stderr=subprocess.STDOUT, env=env)
+    _NUKE_NOTE = "started app.py (pid %d), log: %s" % (_NUKE_PROC.pid, logpath)
+    print("[nuke]", _NUKE_NOTE)
 
-
-_rh = _RingHandler()
-_rh.setFormatter(logging.Formatter("%(name)s: %(message)s"))
-logging.getLogger().addHandler(_rh)
-logging.getLogger().setLevel(logging.INFO)
-for _noisy in ("httpx", "httpcore", "numexpr", "numexpr.utils"):
-    logging.getLogger(_noisy).setLevel(logging.WARNING)
-_fh = RotatingFileHandler("nuke_station.log", maxBytes=5_000_000,
-                          backupCount=3, encoding="utf-8")
-_fh.setFormatter(logging.Formatter(
-    "%(asctime)s [%(levelname)s] %(name)s : %(message)s"))
-logger.addHandler(_fh)
-logging.getLogger("uvicorn.access").addHandler(_fh)
-
-# ------------------------------------------------------------------
-# Upstream HTTP session
-# ------------------------------------------------------------------
-def _make_session() -> requests.Session:
-    s = requests.Session()
-    retry = Retry(
-        total=3, backoff_factor=1.0,
-        status_forcelist=(500, 502, 503, 504),
-        allowed_methods=("POST",), raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    s.mount("http://", adapter)
-    s.mount("https://", adapter)
-    s.headers.update({"Content-Type": "application/json"})
-    return s
-
-
-SESSION = _make_session()
-if os.environ.get("NUKE_TRUST_ENV", "1") != "1":
-    SESSION.trust_env = False       # bypass HTTP(S)_PROXY env for pricing
-
-
-def call_nuked_api(entries: List[Dict[str, Any]]) -> Dict[str, Any]:
-    payload = {
-        "UserName": USERNAME,
-        "JsonPayload": json.dumps({OVERRIDES_KEY: entries}),
-        "JsonPayloadType": JSON_PAYLOAD_TYPE,
-    }
-    url = BASE_URL + ENDPOINT_NUKED
-    try:
-        resp = SESSION.post(url, json=payload,
-                            timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
-    except requests.RequestException as exc:
-        logger.warning("pricing POST failed once (%s) - retrying: %s",
-                       url, str(exc)[:160])
-        import time as _t
-        _t.sleep(0.4)
-        resp = SESSION.post(url, json=payload,
-                            timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
-    resp.raise_for_status()
-    env = resp.json()
-    rows = json.loads(env.get("JsonPayload") or "[]")
-    return {
-        "host": env.get("HostName", "?"),
-        "elapsed": resp.elapsed.total_seconds(),
-        "rows": rows,
-    }
-
-
-# ------------------------------------------------------------------
-# MariaDB
-# ------------------------------------------------------------------
-def _db(**kw):
-    cfg = dict(DB_CONFIG); cfg.update(kw)
-    return pymysql.connect(**cfg)
-
-
-APP_DDL = f"""
-CREATE TABLE IF NOT EXISTS {APP_DB}.{APP_TABLE} (
-  id BIGINT AUTO_INCREMENT PRIMARY KEY,
-  saved_at DATETIME NOT NULL,
-  sec_id BIGINT NOT NULL,
-  short_name VARCHAR(64) NULL,
-  company_name VARCHAR(128) NULL,
-  ric VARCHAR(32) NULL,
-  expiry_date VARCHAR(16) NULL,
-  isin VARCHAR(24) NULL,
-  und_fx VARCHAR(24) NULL,
-  ovd_spot DOUBLE NULL, ovd_cbfx DOUBLE NULL, ovd_undfx DOUBLE NULL,
-  n_bid DOUBLE NULL, n_delta DOUBLE NULL, n_spread DOUBLE NULL,
-  n_spot DOUBLE NULL, n_spotfx DOUBLE NULL,
-  live_bid DOUBLE NULL, live_ask DOUBLE NULL, live_spot DOUBLE NULL,
-  live_cbfx DOUBLE NULL, live_undfx DOUBLE NULL,
-  eod_bid DOUBLE NULL, eod_ask DOUBLE NULL, eod_spot DOUBLE NULL,
-  eod_cbfx DOUBLE NULL, eod_undfx DOUBLE NULL,
-  ovd_bid DOUBLE NULL, ovd_ask DOUBLE NULL,
-  stk_last DOUBLE NULL, stk_time VARCHAR(16) NULL, stk_date VARCHAR(20) NULL,
-  stk_close DOUBLE NULL, stk_close_date VARCHAR(20) NULL,
-  fx_last DOUBLE NULL, fx_time VARCHAR(16) NULL, fx_date VARCHAR(20) NULL,
-  fx_close DOUBLE NULL, fx_close_date VARCHAR(20) NULL,
-  KEY idx_sec_saved (sec_id, saved_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-"""
-
-SAVE_COLS = ["saved_at","sec_id","short_name","company_name","ric","expiry_date",
-    "isin","und_fx","ovd_spot","ovd_cbfx","ovd_undfx",
-    "n_bid","n_delta","n_spread","n_spot","n_spotfx",
-    "live_bid","live_ask","live_spot","live_cbfx","live_undfx",
-    "eod_bid","eod_ask","eod_spot","eod_cbfx","eod_undfx",
-    "ovd_bid","ovd_ask","x_bid","x_ask","x_both","vol_flag","bond_type",
-    "stk_last","stk_time","stk_date","stk_close","stk_close_date",
-    "fx_last","fx_time","fx_date","fx_close","fx_close_date"]
-
-
-def ensure_schema() -> None:
-    conn = _db()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(f"CREATE DATABASE IF NOT EXISTS {APP_DB} "
-                        f"DEFAULT CHARSET utf8mb4")
-            cur.execute(APP_DDL)
-            # migrate older tables that predate the fx close columns
-            for ddl in (
-                f"ALTER TABLE {APP_DB}.{APP_TABLE} "
-                f"ADD COLUMN IF NOT EXISTS fx_close DOUBLE NULL",
-                f"ALTER TABLE {APP_DB}.{APP_TABLE} "
-                f"ADD COLUMN IF NOT EXISTS fx_close_date VARCHAR(20) NULL",
-                f"ALTER TABLE {APP_DB}.cb_state "
-                f"ADD COLUMN IF NOT EXISTS bw_dvb VARCHAR(32) NULL",
-                f"ALTER TABLE {APP_DB}.cb_state "
-                f"ADD COLUMN IF NOT EXISTS bw_dvs VARCHAR(32) NULL",
-                f"ALTER TABLE {APP_DB}.cb_state "
-                f"ADD COLUMN IF NOT EXISTS bw_brw VARCHAR(32) NULL",
-                f"ALTER TABLE {APP_DB}.cb_state "
-                f"ADD COLUMN IF NOT EXISTS bw_lo VARCHAR(32) NULL",
-                f"ALTER TABLE {APP_DB}.cb_state "
-                f"ADD COLUMN IF NOT EXISTS bw_hi VARCHAR(32) NULL",
-                f"ALTER TABLE {APP_DB}.cb_state "
-                f"ADD COLUMN IF NOT EXISTS bw_gap VARCHAR(32) NULL",
-                f"ALTER TABLE {APP_DB}.cb_state "
-                f"ADD COLUMN IF NOT EXISTS bw_util VARCHAR(32) NULL",
-                f"ALTER TABLE {APP_DB}.cb_state "
-                f"ADD COLUMN IF NOT EXISTS bw_d5 VARCHAR(32) NULL",
-                f"ALTER TABLE {APP_DB}.cb_state "
-                f"ADD COLUMN IF NOT EXISTS bw_htb VARCHAR(32) NULL",
-                f"ALTER TABLE {APP_DB}.cb_state "
-                f"ADD COLUMN IF NOT EXISTS bw_evt VARCHAR(32) NULL",
-                f"ALTER TABLE {APP_DB}.cb_state "
-                f"ADD COLUMN IF NOT EXISTS bw_src VARCHAR(32) NULL",
-                f"ALTER TABLE {APP_DB}.cb_state "
-                f"ADD COLUMN IF NOT EXISTS bw_tnr VARCHAR(32) NULL",
-                f"ALTER TABLE {APP_DB}.cb_state "
-                f"ADD COLUMN IF NOT EXISTS or_bid_sprd VARCHAR(32) NULL",
-                f"ALTER TABLE {APP_DB}.cb_state "
-                f"ADD COLUMN IF NOT EXISTS or_ask_sprd VARCHAR(32) NULL",
-                f"ALTER TABLE {APP_DB}.cb_state "
-                f"ADD COLUMN IF NOT EXISTS x_bid VARCHAR(32) NULL",
-                f"ALTER TABLE {APP_DB}.cb_state "
-                f"ADD COLUMN IF NOT EXISTS x_ask VARCHAR(32) NULL",
-                f"ALTER TABLE {APP_DB}.cb_state "
-                f"ADD COLUMN IF NOT EXISTS x_both VARCHAR(32) NULL",
-                f"ALTER TABLE {APP_DB}.cb_state "
-                f"ADD COLUMN IF NOT EXISTS bond_type VARCHAR(32) NULL",
-                f"ALTER TABLE {APP_DB}.cb_state "
-                f"ADD COLUMN IF NOT EXISTS vol_flag VARCHAR(32) NULL",
-
-            ):
+    def _stop():
+        if _NUKE_PROC and _NUKE_PROC.poll() is None:
+            try:
+                _NUKE_PROC.stdin.close()      # primary: pipe EOF
+            except Exception:
+                pass
+            try:
+                _NUKE_PROC.terminate()        # belt and braces
+                _NUKE_PROC.wait(timeout=5)
+            except Exception:
                 try:
-                    cur.execute(ddl)
+                    _NUKE_PROC.kill()
                 except Exception:
                     pass
-        conn.commit()
-    finally:
-        conn.close()
+    atexit.register(_stop)
+
+_NUKE_MOD = None
 
 
-def save_rows(rows: List[Dict[str, Any]]) -> int:
-    ensure_schema()
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    ph = ", ".join(["%s"] * len(SAVE_COLS))
-    # arity guard: a tuple/SAVE_COLS mismatch surfaces as the
-    # cryptic 'not enough arguments for format string'
-    sql = (f"INSERT INTO {APP_DB}.{APP_TABLE} "
-           f"({', '.join(SAVE_COLS)}) VALUES ({ph})")
-    def num(v):
+_DSCAN = {"ok": False, "note": "not attempted", "path": ""}
+
+def _mount_dscan():
+    """Embed delta_scan_web at /dscan/ (same process) when
+    the file sits beside this one; harmless if absent."""
+    p = os.path.join(os.path.dirname(
+        os.path.abspath(__file__)), "delta_scan_web.py")
+    dsp = os.environ.get("DSCAN_APP", p)
+    _DSCAN["path"] = dsp
+    if not os.path.exists(dsp):
+        _DSCAN["note"] = "delta_scan_web.py not found at " + dsp
+        print("[dscan]", _DSCAN["note"])
+        return
+    try:
+        import importlib.util
+        sp2 = importlib.util.spec_from_file_location(
+            "delta_scan_embedded", dsp)
+        m2 = importlib.util.module_from_spec(sp2)
+        sys.modules["delta_scan_embedded"] = m2
+        sp2.loader.exec_module(m2)
+        app.mount("/dscan", m2.app)
+        _DSCAN.update({"ok": True, "note": "embedded at /dscan/ "
+                       "(same process), build " +
+                       str(getattr(m2, "BUILD", "?"))})
+        print("[dscan]", _DSCAN["note"])
+    except Exception as e:
+        import traceback
+        _DSCAN["note"] = "embed failed: " + traceback.format_exc(
+            limit=4)[-700:]
+        print("[dscan]", _DSCAN["note"])
+
+
+def _embed_nuke():
+    """Import app.py and mount its FastAPI app at /nuke on THIS server.
+    One process, one port; no child, no 59999."""
+    global _NUKE_MOD, _NUKE_NOTE
+    if not os.path.exists(NUKE_APP):
+        _NUKE_NOTE = ("embed failed: app.py NOT FOUND at %s - put Nuke "
+                      "Station's app.py there or set NUKE_APP" % NUKE_APP)
+        print("[nuke]", _NUKE_NOTE)
+        return
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("nuke_station_embedded",
+                                                      NUKE_APP)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["nuke_station_embedded"] = mod
+        spec.loader.exec_module(mod)
+        app.mount("/nuke", mod.app)
+        _NUKE_MOD = mod
+        _NUKE_NOTE = "embedded at /nuke/ (same process, port %d)" % PORT
+        print("[nuke]", _NUKE_NOTE)
+    except Exception as e:
+        import traceback
+        _NUKE_NOTE = "embed failed: %r" % e
+        print("[nuke]", _NUKE_NOTE)
+        traceback.print_exc()
+
+
+import contextlib as _ctxlib
+
+
+@_ctxlib.asynccontextmanager
+async def _lagrange_lifespan(_a):
+    import asyncio
+    if _NUKE_MOD is not None:
+        from starlette.concurrency import run_in_threadpool as _rit
+        await _rit(_NUKE_MOD.load_persisted_state)
+        started = []
+        for _fn in ("rfx_poller", "refdata_poller", "autosave_poller",
+                    "div_poller", "snap8_poller", "vol_poller"):
+            if hasattr(_NUKE_MOD, _fn):
+                asyncio.create_task(getattr(_NUKE_MOD, _fn)())
+                started.append(_fn)
         try:
-            return None if v in (None, "") else float(v)
-        except (TypeError, ValueError):
-            return None
-    def txt(v):
-        v = "" if v is None else str(v).strip()
-        return v or None
-    data = []
+            if getattr(_NUKE_MOD, "RFX_WAKE", None):
+                _NUKE_MOD.RFX_WAKE.set()
+        except Exception:
+            pass
+        print("[nuke] embedded pollers started: " + ", ".join(started))
+    asyncio.create_task(_blotter_ws_listener())
+    yield
+
+
+app = FastAPI(title="Lagrange", lifespan=_lagrange_lifespan)
+
+# last successfully built report, guarded by a lock (Send uses this)
+_LOCK = threading.Lock()
+_LAST = {"subject": None, "html": None, "label": None, "built_at": None}
+_LAST_DELTA = {"subject": None, "html": None, "built_at": None}
+
+_DESKTOP_ONLY = ["pyautogui", "pyperclip", "win32gui", "win32con",
+                 "win32com", "win32com.client",
+                 "openpyxl", "xbbg", "tkinter", "tkinter.ttk"]
+
+
+def _import_delta():
+    """Import the delta-check module; stub desktop-only deps if absent.
+    The web tab only uses its DB query + HTML builder, so missing
+    Bloomberg/GUI libraries must not block the tab."""
+    import types
+    for m in _DESKTOP_ONLY:
+        if m not in sys.modules:
+            try:
+                __import__(m)
+            except Exception:
+                stub = types.ModuleType(m)
+                if m == "xbbg":
+                    stub.blp = None
+                if m == "openpyxl":
+                    stub.Workbook = stub.load_workbook = None
+                if m == "win32com.client":
+                    stub.Dispatch = None
+                    if "win32com" in sys.modules:
+                        sys.modules["win32com"].client = stub
+                if m == "tkinter":
+                    class _T:  # attribute sponge
+                        def __getattr__(self, k): return object
+                    stub = _T()
+                sys.modules[m] = stub
+    if "tkinter" in sys.modules and "tkinter.ttk" not in sys.modules:
+        sys.modules["tkinter.ttk"] = types.ModuleType("tkinter.ttk")
+    import delta_check_recovered as dcmod
+    return dcmod
+
+
+# ----------------------------------------------------------------------
+# report building (mirrors recon_cb_email.main's data path, no argparse)
+# ----------------------------------------------------------------------
+def run_loader():
+    """Run the txt loader; never raise -- return (ok, output_text)."""
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            ldr.main([])
+        return True, buf.getvalue()
+    except SystemExit as e:          # loader sys.exits on e.g. missing M: dir
+        return False, (buf.getvalue() + "\n[loader] %s" % e)
+    except Exception as e:
+        return False, (buf.getvalue() + "\n[loader] unexpected error: %s" % e)
+
+
+def build_report(date_from=None, date_to=None, single_date=None):
+    """Fetch, reconcile and build the email-grade HTML. Returns dict."""
+    use_range = bool(date_from)
+    if use_range:
+        start_day = rc.parse_date(date_from)
+        end_day = rc.parse_date(date_to)
+        days = rc.date_range(start_day, end_day)
+        day_label = "%s to %s" % (start_day.isoformat(), end_day.isoformat())
+    else:
+        start_day = end_day = rc.parse_date(single_date)
+        days = [start_day]
+        day_label = start_day.isoformat()
+
+    conn = rc.connect()
+    if use_range:
+        hist_all, no_isin_all, zero_qty = rc.fetch_history_range(
+            conn, start_day, end_day)
+        blot_all, bad_side, neg_qty = rc.fetch_blotter_range(
+            conn, start_day, end_day)
+    else:
+        hist_all, no_isin_all, zero_qty = rc.fetch_history(conn, start_day)
+        blot_all, bad_side, neg_qty = rc.fetch_blotter(conn, start_day)
+        for row in hist_all + no_isin_all + blot_all:
+            row.setdefault("trade_date", start_day)
+    ref, ref_notes = em.bond_ref(conn, hist_all + no_isin_all, blot_all)
+    prevmap = rc.fetch_prev_accts(
+        conn, [r["isin"] for r in hist_all + blot_all], end_day)
+    conn.close()
+
+    notes = list(ref_notes)
+    if zero_qty:
+        notes.append("%d history rows with zero/NULL quantity skipped"
+                     % zero_qty)
+    if bad_side:
+        notes.append("%d blotter rows with unrecognized client_side skipped"
+                     % len(bad_side))
+    if neg_qty:
+        notes.append("%d blotter rows had negative quantity; ABS used - "
+                     "verify sign convention" % neg_qty)
+    if not hist_all and not no_isin_all:
+        notes.append("no CB rows in trade_history for %s - run the loader?"
+                     % day_label)
+
+    per_day_counts = None
+    if use_range:
+        from collections import defaultdict
+        by = lambda rows: _group(rows)
+        hist_by, no_by, blot_by = by(hist_all), by(no_isin_all), by(blot_all)
+        per_day_counts = {}
+        for day in days:
+            h_copy = em._fresh_copy(hist_by.get(day, []))
+            b_copy = em._fresh_copy(blot_by.get(day, []))
+            day_res = rc.reconcile(h_copy, b_copy)
+            per_day_counts[day] = em.build_counts(day_res, no_by.get(day, []))
+
+    for row in hist_all + blot_all:
+        row["matched"] = False
+    results = rc.reconcile(hist_all, blot_all)
+    rc.annotate_prev_accts(results, prevmap)
+    nets = rc.net_check(hist_all, blot_all)
+
+    subject, html = em.build_html(
+        day_label, results, nets, no_isin_all, notes,
+        hist_all, blot_all, ref,
+        per_day_counts=per_day_counts, days=days)
+
+    counts = em.build_counts(results, no_isin_all)
+    alerts = sum(v for k, v in counts.items() if k != "MATCHED")
+    return dict(subject=subject, html=html, label=day_label,
+                counts=counts, alerts=alerts,
+                matched=counts.get("MATCHED", 0))
+
+
+def _group(rows):
+    out = {}
     for r in rows:
-        data.append((
-            now, int(r.get("sec_id", 0)),
-            txt(r.get("short_name")), txt(r.get("company_name")),
-            txt(r.get("ric")), txt(r.get("expiry_date")), txt(r.get("isin")),
-            txt(r.get("und_fx")),
-            num(r.get("ovd_spot")), num(r.get("ovd_cbfx")), num(r.get("ovd_undfx")),
-            num(r.get("n_bid")), num(r.get("n_delta")), num(r.get("n_spread")),
-            num(r.get("n_spot")), num(r.get("n_spotfx")),
-            num(r.get("live_bid")), num(r.get("live_ask")), num(r.get("live_spot")),
-            num(r.get("live_cbfx")), num(r.get("live_undfx")),
-            num(r.get("eod_bid")), num(r.get("eod_ask")), num(r.get("eod_spot")),
-            num(r.get("eod_cbfx")), num(r.get("eod_undfx")),
-            num(r.get("ovd_bid")), num(r.get("ovd_ask")),
-            num(r.get("stk_last")), txt(r.get("stk_time")), txt(r.get("stk_date")),
-            num(r.get("stk_close")), txt(r.get("stk_close_date")),
-            num(r.get("fx_last")), txt(r.get("fx_time")), txt(r.get("fx_date")),
-            num(r.get("fx_close")), txt(r.get("fx_close_date")),
-        ))
-    conn = _db()
-    try:
-        with conn.cursor() as cur:
-            cur.executemany(sql, data)
-        conn.commit()
-    finally:
-        conn.close()
-    return len(data)
-
-
-def fetch_saved_prefs(sec_ids: List[int]) -> Dict[int, Dict[str, str]]:
-    if not sec_ids:
-        return {}
-    ph = ", ".join(["%s"] * len(sec_ids))
-    query = f"""
-        SELECT sec_id, short_name, und_fx
-        FROM {APP_DB}.{APP_TABLE}
-        WHERE sec_id IN ({ph})
-        ORDER BY saved_at DESC, id DESC
-    """
-    try:
-        conn = _db()
-    except Exception:
-        return {}
-    try:
-        with conn.cursor() as cur:
-            cur.execute(query, sec_ids)
-            rows = cur.fetchall()
-    except Exception:
-        return {}
-    finally:
-        conn.close()
-    out: Dict[int, Dict[str, str]] = {}
-    for sec_id, short_name, und_fx in rows:
-        sid = int(sec_id)
-        if sid not in out:
-            out[sid] = {"short_name": short_name or "", "und_fx": und_fx or ""}
+        out.setdefault(r["trade_date"], []).append(r)
     return out
 
 
-def fetch_startup_ids() -> tuple:
-    """Unique sec_ids from the most recent save batch in cba_app.cb_nuke
-    (latest saved_at), in their saved row order. Falls back to
-    DEFAULT_SEC_IDS if the table is missing or empty."""
-    query = f"""
-        SELECT sec_id FROM {APP_DB}.{APP_TABLE}
-        WHERE saved_at = (SELECT MAX(saved_at) FROM {APP_DB}.{APP_TABLE})
-        ORDER BY id
-    """
-    try:
-        conn = _db()
+# ----------------------------------------------------------------------
+# API
+# ----------------------------------------------------------------------
+class RefreshReq(BaseModel):
+    mode: str = "today"          # today | date | range
+    date: Optional[str] = None
+    date_from: Optional[str] = None
+    date_to: Optional[str] = None
+    skip_loader: bool = False
+
+
+class SendReq(BaseModel):
+    to: str = ""
+    cc: str = ""
+    send: bool = False           # False = open draft, True = send now
+
+
+@app.post("/api/refresh")
+def api_refresh(req: RefreshReq):
+    with _LOCK:
+        loader_ok, loader_out = (True, "[loader] skipped by request")
+        if not req.skip_loader:
+            loader_ok, loader_out = run_loader()
         try:
-            with conn.cursor() as cur:
-                cur.execute(query)
-                rows = cur.fetchall()
-        finally:
-            conn.close()
-        ids, seen = [], set()
-        for (sec_id,) in rows:
-            sid = int(sec_id)
-            if sid not in seen:
-                seen.add(sid)
-                ids.append(sid)
-        if ids:
-            return ids, "last save"
-    except Exception as exc:
-        logger.warning("Startup id lookup failed, using defaults: %s", exc)
-    return DEFAULT_SEC_IDS, "defaults"
+            if req.mode == "range":
+                rep = build_report(date_from=req.date_from,
+                                   date_to=req.date_to)
+            elif req.mode == "date":
+                rep = build_report(single_date=req.date)
+            else:
+                rep = build_report(single_date=None)   # today
+        except SystemExit as e:
+            return JSONResponse(status_code=400,
+                                content={"ok": False, "error": str(e),
+                                         "loader": loader_out})
+        except Exception as e:
+            return JSONResponse(status_code=500,
+                                content={"ok": False, "error": repr(e),
+                                         "loader": loader_out})
+        _LAST.update(subject=rep["subject"], html=rep["html"],
+                     label=rep["label"],
+                     built_at=dt.datetime.now().strftime("%H:%M:%S"))
+        return {"ok": True, "loader_ok": loader_ok, "loader": loader_out,
+                "subject": rep["subject"], "label": rep["label"],
+                "alerts": rep["alerts"], "matched": rep["matched"],
+                "counts": rep["counts"], "html": rep["html"],
+                "built_at": _LAST["built_at"]}
 
 
-def fetch_ref_rows(sec_ids: List[int]) -> List[Dict[str, Any]]:
-    if not sec_ids:
-        return []
-    ph = ", ".join(["%s"] * len(sec_ids))
-    query = f"""
-        SELECT sec_id, company_name, expiry_date, isin, conversion_price
-        FROM {CBA_DB}.{REF_TABLE}
-        WHERE sec_id IN ({ph})
-        ORDER BY snap_ts DESC
-    """
-    conn = _db()
+@app.post("/api/send")
+def api_send(req: SendReq):
+    with _LOCK:
+        if not _LAST["html"]:
+            return JSONResponse(status_code=400, content={
+                "ok": False, "error": "No report built yet - press Refresh first."})
+        subject, html = _LAST["subject"], _LAST["html"]
+    # Outlook COM in a FastAPI worker thread needs COM initialised
     try:
-        with conn.cursor() as cur:
-            cur.execute(query, sec_ids)
-            rows = cur.fetchall()
+        import pythoncom
+        pythoncom.CoInitialize()
+        com_inited = True
+    except ImportError:
+        com_inited = False
+    try:
+        ok, msg = em.send_outlook(subject, html, req.to, req.cc, req.send)
     finally:
-        conn.close()
-
-    seen: Dict[int, Dict[str, Any]] = {}
-    for sec_id, company, expiry, isin, conv_px in rows:
-        sid = int(sec_id)
-        if sid in seen:
-            # newer snaps may leave conversion_price NULL; fall back to the
-            # most recent snap that actually carries one
-            if not seen[sid]["conversion_price"] and conv_px is not None:
-                seen[sid]["conversion_price"] = str(conv_px)
-            continue
-        seen[sid] = {
-            "secId": sid,
-            "conversion_price": ("" if conv_px is None else str(conv_px)),
-            "company_name": company or "",
-            "expiry_date": expiry.isoformat() if hasattr(expiry, "isoformat")
-                           else (str(expiry) if expiry else ""),
-            "isin": isin or "",
-        }
-    return list(seen.values())
+        if com_inited:
+            pythoncom.CoUninitialize()
+    return {"ok": ok, "message": msg, "subject": subject}
 
 
-_QTY_DIAG_DONE = False
-_RP_META = {"checked": False, "cols": [], "qty_cands": []}
-_QTY_CANDS = ["quantity_live", "quantity_t1", "quantity_t2",
-              "net_quantity", "quantity", "position_quantity",
-              "pos_qty", "quantity_sod", "qty"]
-_QTY_SRC = {"col": None}    # last chosen source, for change-logging
-
-
-def fetch_ric_map(sec_ids: List[int]) -> Dict[int, Dict[str, str]]:
-    if not sec_ids:
-        return {}
-    conn = _db()
+def _latest_snap_ts():
+    """MAX(snap_ts) from cbanalytics.lp_model_output, or None."""
     try:
-        with conn.cursor() as cur:
-            if not _RP_META["checked"]:
-                cur.execute(f"SHOW COLUMNS FROM {EQRMS_DB}.{RIC_TABLE}")
-                _RP_META["cols"] = [str(r[0]) for r in cur.fetchall()]
-                low = {c.lower(): c for c in _RP_META["cols"]}
-                _RP_META["qty_cands"] = [low[c] for c in _QTY_CANDS
-                                         if c in low]
-                _RP_META["checked"] = True
-            cands = _RP_META["qty_cands"] or ["quantity_live"]
-            sel_extra = ", ".join(f"`{c}`" for c in cands)
-            ph = ", ".join(["%s"] * len(sec_ids))
-            cur.execute(f"""
-                SELECT security_id, component_ric, security_currency,
-                       cb_notional_usd, {sel_extra}
-                FROM {EQRMS_DB}.{RIC_TABLE}
-                WHERE loaded_at >= (SELECT MAX(loaded_at)
-                                    FROM {EQRMS_DB}.{RIC_TABLE})
-                      - INTERVAL 10 SECOND
-                  AND security_id IN ({ph})
-            """, sec_ids)
-            rows = cur.fetchall()
-    finally:
-        conn.close()
-
-    def fnum(v):
-        try:
-            return float(v)
-        except (TypeError, ValueError):
-            return None
-
-    out: Dict[int, Dict[str, Any]] = {}
-    acc: Dict[int, Dict[str, Dict[str, float]]] = {}
-    raws: Dict[int, list] = {}
-    for row in rows:
-        sec_id, ric, ccy, usd = row[0], row[1], row[2], row[3]
-        qvals = row[4:]
-        sid = int(sec_id)
-        if sid not in out:
-            out[sid] = {"ric": str(ric).strip() if ric else "",
-                        "ccy": str(ccy).strip().upper() if ccy else "",
-                        "qty": 0.0, "usd": 0.0}
-            acc[sid] = {c: {"all": 0.0, "usd": 0.0, "has_usd": 0.0}
-                        for c in cands}
-            raws[sid] = []
-        u = fnum(usd) or 0.0
-        out[sid]["usd"] += u
-        for c, v in zip(cands, qvals):
-            q = fnum(v) or 0.0
-            acc[sid][c]["all"] += q
-            if u:
-                acc[sid][c]["usd"] += q
-                acc[sid][c]["has_usd"] = 1.0
-        if len(raws[sid]) < 6:
-            raws[sid].append((str(ric or ""), u) + tuple(
-                fnum(v) for v in qvals))
-
-    # pick the quantity source PER BATCH: first candidate producing a
-    # nonzero notional-row quantity. Weekend snaps carry quantities on
-    # quantity_t1 (next business day) with quantity_live NULL - and on
-    # Monday the choice flips back to quantity_live automatically.
-    src = None
-    for c in cands:
-        if any(a[c]["usd"] for a in acc.values()):
-            src = c
-            break
-    src = src or (cands[0] if cands else "quantity_live")
-    if src != _QTY_SRC["col"]:
-        logger.info("quantity source column: %s%s", src,
-                    "" if src == "quantity_live"
-                    else " (quantity_live empty on notional rows - "
-                         "weekend/holiday snap)")
-        _QTY_SRC["col"] = src
-
-    global _QTY_DIAG_DONE
-    for sid, rec in out.items():
-        a = acc[sid].get(src) or {"all": 0.0, "usd": 0.0, "has_usd": 0.0}
-        rec["qty"] = a["usd"] if a["has_usd"] else a["all"]
-        if not _QTY_DIAG_DONE and rec["usd"] and not rec["qty"]:
-            _QTY_DIAG_DONE = True
-            logger.info("qty/usd mismatch: sec %s | risk_positions cols=%s "
-                        "| sample rows (ric, usd, %s)=%s",
-                        sid, _RP_META["cols"], ", ".join(cands), raws[sid])
-    return out
-
-
-def default_fx_ric(ccy: str) -> str:
-    if not ccy:
-        return ""
-    return "1" if ccy == "USD" else f"{ccy}="
-
-
-# ------------------------------------------------------------------
-# Refinitiv (Workspace desktop session)
-# ------------------------------------------------------------------
-_RD = None
-
-
-_RD_OPENING = False
-_RD_LOCK = __import__("threading").Lock()
-
-
-def _get_rd():
-    """Open the Refinitiv session exactly once, even if a slow first open
-    outlives the poller's timeout: concurrent open attempts wedge the
-    library's session layer, so late-comers wait on the lock instead of
-    starting a second handshake."""
-    global _RD, _RD_OPENING
-    if _RD is None:
-        with _RD_LOCK:
-            if _RD is None:
-                import time as _t
-                import refinitiv.data as rd
-                _RD_OPENING = True
-                t0 = _t.time()
-                try:
-                    _cfg_path = None
-                    for _base in (os.getcwd(),
-                                  os.path.dirname(os.path.abspath(__file__))):
-                        _cand = os.path.join(_base,
-                                             "refinitiv-data.config.json")
-                        if os.path.exists(_cand):
-                            _cfg_path = _cand
-                            break
-                    if _cfg_path:
-                        logger.info("refinitiv config: %s", _cfg_path)
-                        try:
-                            rd.open_session(config_name=_cfg_path)
-                        except TypeError:
-                            rd.open_session()
-                    else:
-                        logger.warning("refinitiv-data.config.json not found "
-                                       "in cwd or app dir - opening DEFAULT "
-                                       "session (usually no entitlements)")
-                        rd.open_session()
-                finally:
-                    _RD_OPENING = False
-                cfg = os.path.join(os.getcwd(),
-                                   "refinitiv-data.config.json")
-                logger.info("session cwd=%s config_json=%s", os.getcwd(),
-                            "FOUND" if os.path.exists(cfg) else "MISSING")
-                globals()["_SESS_OPEN_TS"] = __import__("time").time()
-                logger.info("Refinitiv session opened in %.1fs",
-                            _t.time() - t0)
-                _RD = rd
-    return _RD
-
-
-def _clean(v) -> Any:
-    try:
-        import pandas as pd
-        if v is None or (hasattr(pd, "isna") and pd.isna(v)):
-            return None
-    except Exception:
-        if v is None:
-            return None
-    if hasattr(v, "isoformat"):
-        return str(v)
-    if isinstance(v, (int, float, str, bool)):
-        return v
-    try:
-        return float(v)
-    except Exception:
-        return str(v)
-
-
-def fetch_refinitiv(rics: List[str]) -> List[Dict[str, Any]]:
-    rd = _get_rd()
-    try:
-        df = rd.get_data(universe=rics, fields=REFINITIV_FIELDS)
-    except Exception:
-        global _RD
-        try:
-            rd.close_session()
-        except Exception:
-            pass
-        _RD = None
-        rd = _get_rd()
-        df = rd.get_data(universe=rics, fields=REFINITIV_FIELDS)
-
-    out: List[Dict[str, Any]] = []
-    if df is None or getattr(df, "empty", True) or len(df.columns) == 0:
-        # streaming warm-up right after session open, or a Workspace-side
-        # gap: treat as "no data this cycle", never as a crash
-        try:
-            logger.info("empty rfx df: shape=%s cols=%s",
-                        None if df is None else getattr(df, "shape", "?"),
-                        [] if df is None else list(df.columns)[:8])
-        except Exception:
-            pass
-        return out
-    cols = {str(c).strip().lower(): c for c in df.columns}
-    inst_col = cols.get("instrument") or df.columns[0]
-    for _, row in df.iterrows():
-        rec = {"ric": _clean(row[inst_col]),
-               "last": None, "last_time": None, "last_date": None,
-               "close": None, "close_date": None}
-        cf_close = None
-        for key, col in cols.items():
-            v = _clean(row[col])
-            if key == "cf_last":
-                rec["last"] = v
-            elif key == "cf_time":
-                rec["last_time"] = v
-            elif key == "cf_date":
-                rec["last_date"] = v
-            elif key == "cf_close":
-                cf_close = v
-            elif "close" in key and "date" not in key:
-                rec["close"] = v
-            elif key == "date" or ("close" in key and "date" in key):
-                rec["close_date"] = v
-        if rec["close"] is None:
-            rec["close"] = cf_close          # FX RICs: CF_CLOSE fallback
-        out.append(rec)
-    return out
-
-
-# ------------------------------------------------------------------
-# Shared state (single-process; run with exactly one worker)
-# ------------------------------------------------------------------
-OVD_FIELDS = ("ovdSpot", "ovdCbFx", "ovdUndFx")
-USER_FIELDS = ("short_name", "und_fx", "n_gamma",
-               "or_bid_sprd", "or_ask_sprd",
-               "x_bid", "x_ask", "x_both", "vol_flag", "bond_type",
-               "bw_dvb", "bw_dvs", "bw_brw", "bw_lo", "bw_hi",
-               "bw_gap", "bw_util", "bw_d5", "bw_htb", "bw_evt",
-               "bw_src", "bw_tnr")
-AUTOSAVE_DEFAULT = 300      # seconds; 0 = off
-
-STATE: Dict[str, Any] = {
-    "version": 0,
-    "ids": [],                     # ordered sec_ids
-    "rows": {},                    # sec_id -> {short_name, und_fx, ovdSpot,...}
-    "stockRics": {},               # sec_id -> ric (server-side, for the poller)
-    "nuke": {},                    # sec_id -> last upstream row
-    "nukeMeta": {},                # host / elapsed / by / ts / missing
-    "rfx": {},                     # ric -> refinitiv rec
-    "rfxTs": None,
-    "rfxErr": None,
-    "refreshSec": RFX_REFRESH_DEFAULT,
-    "autosaveSec": AUTOSAVE_DEFAULT,
-    "refdataSec": REFDATA_REFRESH_DEFAULT,
-    "flagTh": {"staleSpot": 0.5, "staleFx": 0.25,
-               "moveStk": 3.0, "moveFx": 30.0},
-    "refErr": None,
-}
-CLIENTS: Set[WebSocket] = set()
-CLIENT_NAMES: Dict[WebSocket, str] = {}
-CLIENT_LOCKS: Dict[WebSocket, "asyncio.Lock"] = {}
-NUKE_LOCK = None   # created lazily inside the running loop
-# (py3.9: a module-level asyncio.Lock binds the import-time loop
-#  and poisons wait_for from uvicorn's loop)
-def _nlock():
-    global NUKE_LOCK
-    if NUKE_LOCK is None:
-        NUKE_LOCK = asyncio.Lock()
-    return NUKE_LOCK
-
-RFX_WAKE: Optional[asyncio.Event] = None
-REFDATA_WAKE: Optional[asyncio.Event] = None
-
-
-def _blank_row() -> Dict[str, Any]:
-    return {"short_name": "", "und_fx": "", "n_gamma": "",
-            "or_bid_sprd": "", "or_ask_sprd": "",
-            "x_bid": "", "x_ask": "", "x_both": "", "vol_flag": "",
-            "bond_type": "",
-            "ovdSpot": "", "ovdCbFx": "", "ovdUndFx": ""}
-
-
-def _van_mirror(row) -> bool:
-    """Vanilla bonds settle in the underlying ccy: ovdCbFx
-    follows ovdUndFx. Idempotent; True when it changed."""
-    try:
-        bt = (row.get("bond_type") or "").strip().lower()
-        uv = str(row.get("ovdUndFx") or "")
-        if bt.startswith("vanil") and uv \
-                and row.get("ovdCbFx") != uv:
-            row["ovdCbFx"] = uv
-            return True
-    except Exception:
-        pass
-    return False
-
-
-def snapshot() -> Dict[str, Any]:
-    for _r in (STATE.get("rows") or {}).values():
-        _van_mirror(_r)
-    return {"version": STATE["version"], "ids": STATE["ids"],
-            "rows": STATE["rows"], "nuke": STATE["nuke"],
-            "nukeMeta": STATE["nukeMeta"], "rfx": STATE["rfx"],
-            "rfxTs": STATE["rfxTs"], "rfxErr": STATE["rfxErr"],
-            "refreshSec": STATE["refreshSec"],
-            "autosaveSec": STATE["autosaveSec"],
-            "userCfg": STATE.get("userCfg", {}),
-            "refdataSec": STATE["refdataSec"],
-            "flagTh": STATE["flagTh"]}
-
-
-async def broadcast(msg: Dict[str, Any], skip: Optional[WebSocket] = None):
-    """Concurrent fan-out with a per-peer timeout: one sleeping browser
-    tab must never delay everyone else's nuke results."""
-    data = json.dumps(msg)
-    peers = [ws for ws in list(CLIENTS) if ws is not skip]
-    if not peers:
-        return
-
-    async def _one(ws):
-        try:
-            lock = CLIENT_LOCKS.get(ws)
-            if lock is None:
-                lock = CLIENT_LOCKS.setdefault(ws, asyncio.Lock())
-            async with lock:                 # one frame at a time per peer
-                await asyncio.wait_for(ws.send_text(data), timeout=1.5)
-            return None
-        except Exception:
-            return ws
-
-    results = await asyncio.gather(*(_one(w) for w in peers),
-                                   return_exceptions=False)
-    dead = [w for w in results if w is not None]
-    for ws in dead:
-        CLIENTS.discard(ws)
-        CLIENT_NAMES.pop(ws, None)
-        CLIENT_LOCKS.pop(ws, None)
-    if dead:
-        logger.info("broadcast: dropped %d unresponsive client(s); "
-                    "they will reconnect", len(dead))
-
-
-# ---- durability: working state + audit log in cba_app ----
-STATE_DDL = f"""
-CREATE TABLE IF NOT EXISTS {APP_DB}.cb_state (
-  sec_id BIGINT PRIMARY KEY,
-  short_name VARCHAR(64) NULL, und_fx VARCHAR(24) NULL,
-  n_gamma VARCHAR(32) NULL,
-  or_bid_sprd VARCHAR(32) NULL,
-  or_ask_sprd VARCHAR(32) NULL,
-  x_bid VARCHAR(32) NULL,
-  x_ask VARCHAR(32) NULL,
-  x_both VARCHAR(32) NULL,
-  bond_type VARCHAR(32) NULL,
-  vol_flag VARCHAR(32) NULL,
-  ovd_spot VARCHAR(32) NULL, ovd_cbfx VARCHAR(32) NULL,
-  bw_dvb VARCHAR(32) NULL,
-  bw_dvs VARCHAR(32) NULL,
-  bw_brw VARCHAR(32) NULL,
-  bw_lo VARCHAR(32) NULL,
-  bw_hi VARCHAR(32) NULL,
-  bw_gap VARCHAR(32) NULL,
-  bw_util VARCHAR(32) NULL,
-  bw_d5 VARCHAR(32) NULL,
-  bw_htb VARCHAR(32) NULL,
-  bw_evt VARCHAR(32) NULL,
-  bw_src VARCHAR(32) NULL,
-  bw_tnr VARCHAR(32) NULL,
-
-  ovd_undfx VARCHAR(32) NULL,
-  updated_at DATETIME NULL, updated_by VARCHAR(32) NULL
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-"""
-META_DDL = f"""
-CREATE TABLE IF NOT EXISTS {APP_DB}.cb_state_meta (
-  k VARCHAR(32) PRIMARY KEY, v TEXT NULL
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-"""
-EVENTS_DDL = f"""
-CREATE TABLE IF NOT EXISTS {APP_DB}.app_events (
-  id BIGINT AUTO_INCREMENT PRIMARY KEY,
-  ts DATETIME NOT NULL,
-  user VARCHAR(32) NULL,
-  action VARCHAR(32) NOT NULL,
-  detail TEXT NULL,
-  KEY idx_ts (ts)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-"""
-
-
-def db_log(user: str, action: str, detail: Any = "") -> None:
-    """Audit trail; never lets a DB hiccup break the app."""
-    try:
-        conn = _db()
+        conn = rc.connect()
         try:
             with conn.cursor() as cur:
-                cur.execute(
-                    f"INSERT INTO {APP_DB}.app_events (ts,user,action,detail) "
-                    f"VALUES (%s,%s,%s,%s)",
-                    (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), user[:32],
-                     action[:32], json.dumps(detail)[:4000]))
-            conn.commit()
+                cur.execute("SELECT MAX(snap_ts) "
+                            "FROM cbanalytics.lp_model_output")
+                row = cur.fetchone()
+                return row[0] if row else None
         finally:
             conn.close()
-    except Exception as exc:
-        logger.warning("event log skipped: %s", exc)
-
-
-COLMAP = {"short_name": "short_name", "und_fx": "und_fx",
-          "n_gamma": "n_gamma", "or_bid_sprd": "or_bid_sprd",
-          "or_ask_sprd": "or_ask_sprd", "x_bid": "x_bid", "x_ask": "x_ask",
-          "x_both": "x_both", "vol_flag": "vol_flag",
-          "bond_type": "bond_type", "ovdSpot": "ovd_spot",
-          "ovdCbFx": "ovd_cbfx", "ovdUndFx": "ovd_undfx",
-          "bw_dvb": "bw_dvb",
-          "bw_dvs": "bw_dvs",
-          "bw_brw": "bw_brw",
-          "bw_lo": "bw_lo",
-          "bw_hi": "bw_hi",
-          "bw_gap": "bw_gap",
-          "bw_util": "bw_util",
-          "bw_d5": "bw_d5",
-          "bw_htb": "bw_htb",
-          "bw_evt": "bw_evt",
-          "bw_src": "bw_src",
-          "bw_tnr": "bw_tnr"}
-
-
-def db_upsert_state_fields(sec_id: int, row: Dict[str, Any], user: str,
-                           fields) -> None:
-    """Write ONLY the given row fields. A one-field edit must never blank
-    the other columns - full-row writes wiped short_name/und_fx once when
-    an edit landed on an empty in-memory row."""
-    cols = [COLMAP[f] for f in fields if f in COLMAP]
-    if not cols:
-        return
-    try:
-        conn = _db()
-        try:
-            with conn.cursor() as cur:
-                collist = ", ".join(cols)
-                ph = ", ".join(["%s"] * len(cols))
-                upd = ", ".join(f"{c}=VALUES({c})" for c in cols)
-                cur.execute(
-                    f"INSERT INTO {APP_DB}.cb_state (sec_id, {collist}, "
-                    f"updated_at, updated_by) VALUES (%s, {ph}, %s, %s) "
-                    f"ON DUPLICATE KEY UPDATE {upd}, "
-                    "updated_at=VALUES(updated_at), "
-                    "updated_by=VALUES(updated_by)",
-                    [sec_id] + [str(row.get(f) or "") or None
-                                for f in fields if f in COLMAP]
-                    + [datetime.now(), user])
-            conn.commit()
-        finally:
-            conn.close()
-    except Exception as exc:
-        logger.warning("state upsert (partial) failed: %s", exc)
-
-
-def db_upsert_state(sec_id: int, row: Dict[str, Any], user: str) -> None:
-    try:
-        conn = _db()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    f"""INSERT INTO {APP_DB}.cb_state
-                        (sec_id, short_name, und_fx, n_gamma,
-                         or_bid_sprd, or_ask_sprd, x_bid, x_ask, x_both,
-                         vol_flag, bond_type, ovd_spot, ovd_cbfx, ovd_undfx,
-                         updated_at, updated_by)
-                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                        ON DUPLICATE KEY UPDATE
-                          short_name=VALUES(short_name), und_fx=VALUES(und_fx),
-                          n_gamma=VALUES(n_gamma),
-                          or_bid_sprd=VALUES(or_bid_sprd),
-                          or_ask_sprd=VALUES(or_ask_sprd),
-                          x_bid=VALUES(x_bid), x_ask=VALUES(x_ask),
-                          x_both=VALUES(x_both),
-                          vol_flag=VALUES(vol_flag),
-                          bond_type=VALUES(bond_type),
-                          ovd_spot=VALUES(ovd_spot), ovd_cbfx=VALUES(ovd_cbfx),
-                          ovd_undfx=VALUES(ovd_undfx),
-                          updated_at=VALUES(updated_at),
-                          updated_by=VALUES(updated_by)""",
-                    (sec_id, row.get("short_name") or None,
-                     row.get("und_fx") or None,
-                     str(row.get("n_gamma") or "") or None,
-                     str(row.get("or_bid_sprd") or "") or None,
-                     str(row.get("or_ask_sprd") or "") or None,
-                     str(row.get("x_bid") or "") or None,
-                     str(row.get("x_ask") or "") or None,
-                     str(row.get("x_both") or "") or None,
-                     str(row.get("vol_flag") or "") or None,
-                     str(row.get("bond_type") or "") or None,
-                     str(row.get("ovdSpot") or "") or None,
-                     str(row.get("ovdCbFx") or "") or None,
-                     str(row.get("ovdUndFx") or "") or None,
-                     datetime.now().strftime("%Y-%m-%d %H:%M:%S"), user[:32]))
-            conn.commit()
-        finally:
-            conn.close()
-    except Exception as exc:
-        logger.warning("state upsert skipped: %s", exc)
-
-
-def db_meta_set(k: str, v: Any) -> None:
-    try:
-        conn = _db()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    f"INSERT INTO {APP_DB}.cb_state_meta (k,v) VALUES (%s,%s) "
-                    f"ON DUPLICATE KEY UPDATE v=VALUES(v)",
-                    (k, json.dumps(v)))
-            conn.commit()
-        finally:
-            conn.close()
-    except Exception as exc:
-        logger.warning("meta set skipped: %s", exc)
-
-
-def db_meta_get(k: str) -> Any:
-    try:
-        conn = _db()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    f"SELECT v FROM {APP_DB}.cb_state_meta WHERE k=%s", (k,))
-                r = cur.fetchone()
-        finally:
-            conn.close()
-        return json.loads(r[0]) if r and r[0] else None
     except Exception:
         return None
 
 
-def load_persisted_state() -> None:
-    """Startup: restore id order and per-bond working state."""
+def _df_data_as_of(df):
     try:
-        ensure_schema_state()
-    except Exception as exc:
-        logger.warning("state schema skipped: %s", exc)
-    for ddl in (
-        f"ALTER TABLE {APP_DB}.cb_state ADD COLUMN IF NOT "
-        "EXISTS x_bid VARCHAR(32) NULL",
-        f"ALTER TABLE {APP_DB}.cb_state ADD COLUMN IF NOT "
-        "EXISTS x_ask VARCHAR(32) NULL",
-        f"ALTER TABLE {APP_DB}.cb_state ADD COLUMN IF NOT "
-        "EXISTS x_both VARCHAR(32) NULL",
-        f"ALTER TABLE {APP_DB}.cb_state ADD COLUMN IF NOT "
-        "EXISTS vol_flag VARCHAR(12) NULL",
-        f"ALTER TABLE {APP_DB}.cb_state ADD COLUMN IF NOT "
-        "EXISTS bond_type VARCHAR(32) NULL",
-        f"ALTER TABLE {APP_DB}.{APP_TABLE} ADD COLUMN IF NOT "
-        "EXISTS x_bid VARCHAR(32) NULL",
-        f"ALTER TABLE {APP_DB}.{APP_TABLE} ADD COLUMN IF NOT "
-        "EXISTS x_ask VARCHAR(32) NULL",
-        f"ALTER TABLE {APP_DB}.{APP_TABLE} ADD COLUMN IF NOT "
-        "EXISTS x_both VARCHAR(32) NULL",
-        f"ALTER TABLE {APP_DB}.{APP_TABLE} ADD COLUMN IF NOT "
-        "EXISTS vol_flag VARCHAR(12) NULL",
-        f"ALTER TABLE {APP_DB}.{APP_TABLE} ADD COLUMN IF NOT "
-        "EXISTS bond_type VARCHAR(32) NULL"):
-        try:
-            conn = _db()
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(ddl)
-                conn.commit()
-            finally:
-                conn.close()
-        except Exception as exc:
-            logger.warning("column ensure failed [%s...]: %s",
-                           ddl[:60], exc)
-    ids = db_meta_get("sec_ids")
-    src = "shared state"
-    if not ids:
-        ids, src = fetch_startup_ids()
-    STATE["ids"] = [int(i) for i in ids]
-    def _load_rows(cols, n_new):
-        conn = _db()
+        m = df["eqrms_snap_ts"].dropna().astype(str).max()
+        return m.split(".")[0] if m else None
+    except Exception:
+        return None
+
+
+def _run_db_updater():
+    """Run cba_mariadb.py as a subprocess. Returns (ok, log_text).
+    Subprocess (not import) so its argparse/sys.exit/globals cannot
+    affect the server."""
+    import subprocess
+    if not os.path.exists(CBA_UPDATER):
+        return False, "[updater] script not found: %s" % CBA_UPDATER
+    try:
+        r = subprocess.run(
+            [sys.executable, CBA_UPDATER],
+            cwd=os.path.dirname(CBA_UPDATER) or ".",
+            capture_output=True, text=True,
+            timeout=CBA_UPDATER_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return False, ("[updater] timed out after %ds" % CBA_UPDATER_TIMEOUT)
+    except Exception as e:
+        return False, "[updater] failed to launch: %r" % e
+    log = (r.stdout or "") + (("\n" + r.stderr) if r.stderr else "")
+    tail = "\n".join(log.strip().splitlines()[-25:])
+    if r.returncode != 0:
+        return False, ("[updater] exit code %d\n%s" % (r.returncode, tail))
+    return True, "[updater] ok\n%s" % tail
+
+
+class DeltaUpdateReq(BaseModel):
+    pass
+
+
+@app.post("/api/delta/update_db")
+def api_delta_update_db():
+    with _LOCK:
+        ok, log = _run_db_updater()
+    if not ok:
+        return JSONResponse(status_code=500,
+                            content={"ok": False, "error": "DB update failed",
+                                     "log": log})
+    return {"ok": True, "log": log}
+
+
+_LAST_TWCB = {"html": "", "subject": ""}
+
+
+_BONDCFG_FILE: dict = {}
+
+
+class BondCfgReq(BaseModel):
+    isin: str = ""
+    short_name: str = ""
+    tol: str = ""
+    autopilot: str = ""
+
+
+@app.get("/api/rfq/bondcfg")
+def api_bondcfg_get():
+    if os.environ.get("LAGRANGE_TEST_LIVE") == "FILE":
+        return {"ok": True, "rows": list(_BONDCFG_FILE.values())}
+    try:
+        _ensure_rfq()
+        conn = rc.connect()
         try:
             with conn.cursor() as cur:
-                cur.execute(f"SELECT {cols} FROM {APP_DB}.cb_state")
-                for r in cur.fetchall():
-                    sid, sn, uf, ng, sb, sa = r[:6]
-                    bt = ""
-                    if n_new == 5:
-                        xb, xa, x2, vf, bt = r[6:11]
-                    elif n_new == 4:
-                        xb, xa, x2, vf = r[6:10]
-                    elif n_new:
-                        xb, xa, vf = r[6:9]; x2 = ""
-                    else:
-                        xb, xa, x2, vf = "", "", "", ""
-                    o1, o2, o3 = r[6 + n_new:9 + n_new]
-                    STATE["rows"][int(sid)] = {
-                        "short_name": sn or "", "und_fx": uf or "",
-                        "n_gamma": ng or "",
-                        "or_bid_sprd": sb or "", "or_ask_sprd": sa or "",
-                        "x_bid": xb or "", "x_ask": xa or "",
-                        "x_both": x2 or "", "vol_flag": vf or "",
-                        "bond_type": bt or "",
-                        "ovdSpot": o1 or "", "ovdCbFx": o2 or "",
-                        "ovdUndFx": o3 or ""}
+                cur.execute("SELECT isin, short_name, tol, "
+                            "autopilot FROM cba_app.rfq_bond_cfg "
+                            "ORDER BY short_name")
+                return {"ok": True, "rows": [
+                    {"isin": a, "short_name": b,
+                     "tol": "" if c is None else str(c),
+                     "autopilot": int(d or 0)}
+                    for a, b, c, d in cur.fetchall()]}
         finally:
             conn.close()
+    except Exception as e:
+        return JSONResponse(status_code=500,
+                            content={"ok": False, "error": str(e)})
+
+
+@app.post("/api/rfq/bondcfg")
+def api_bondcfg_set(req: BondCfgReq, request: Request):
+    user = ((getattr(request.state, "auth", None) or {})
+            .get("user") or "lagrange")
+    isin = (req.isin or "").strip().upper()[:20]
+    if not isin:
+        return JSONResponse(status_code=400, content={
+            "ok": False, "error": "isin required"})
+    tol = _fnum(req.tol)
+    ap = 1 if str(req.autopilot) in ("1", "true", "True") else 0
+    if os.environ.get("LAGRANGE_TEST_LIVE") == "FILE":
+        _BONDCFG_FILE[isin] = {"isin": isin,
+            "short_name": req.short_name[:64],
+            "tol": "" if tol is None else str(tol),
+            "autopilot": ap}
+        return {"ok": True}
     try:
-        _load_rows("sec_id, short_name, und_fx, n_gamma, or_bid_sprd, "
-                   "or_ask_sprd, x_bid, x_ask, x_both, vol_flag, bond_type, "
-                   "ovd_spot, ovd_cbfx, ovd_undfx", 5)
-    except Exception as exc:
-        logger.warning("extended state load failed (%s) - falling back to "
-                       "legacy columns so names/overrides still restore",
-                       exc)
+        conn = rc.connect()
         try:
-            _load_rows("sec_id, short_name, und_fx, n_gamma, or_bid_sprd, "
-                       "or_ask_sprd, ovd_spot, ovd_cbfx, ovd_undfx", 0)
-        except Exception as exc2:
-            logger.warning("state load skipped: %s", exc2)
-    for sid in STATE["ids"]:
-        STATE["rows"].setdefault(sid, _blank_row())
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO cba_app.rfq_bond_cfg "
+                            "(isin, short_name, tol, autopilot, "
+                            "updated_by, updated_at) VALUES "
+                            "(%s,%s,%s,%s,%s,NOW()) ON DUPLICATE KEY UPDATE short_name=VALUES(short_name), tol=VALUES(tol), autopilot=VALUES(autopilot), updated_by=VALUES(updated_by), updated_at=NOW()",
+                            (isin, req.short_name[:64], tol, ap, user))
+            conn.commit()
+            return {"ok": True}
+        finally:
+            conn.close()
+    except Exception as e:
+        return JSONResponse(status_code=500,
+                            content={"ok": False, "error": str(e)})
+
+
+class TwcbRunReq(BaseModel):
+    mark_seen: bool = False
+
+
+@app.post("/api/twcb/run")
+def api_twcb_run(req: TwcbRunReq):
+    """Run the TW CB issuance pipeline feeds (TWSE / TPEx / SFB)
+    library-style and cache the report for Open Draft / Send
+    Now. mark_seen=False views without consuming novelty."""
+    if os.environ.get("LAGRANGE_TEST_LIVE") == "FILE":
+        evs = [
+            {"source": "MOPS (TWSE listed)", "date": "2026-08-15",
+             "company": "2330 TSMC", "text": "board resolved issuance of unsecured convertible bonds", "link": "",
+             "text_en": "board resolved issuance of unsecured convertible bonds", "is_new": True},
+            {"source": "SFB effective-registration", "date":
+             "2026-08-14", "company": "6488 GlobalWafers",
+             "text": "CB shelf registration effective NT$8,000,000,000", "link": "",
+             "text_en": "CB shelf registration effective NT$8,000,000,000", "is_new": False},
+        ]
+        shelf_rows = [
+            {"days_left": 5, "date": "2026-05-20",
+             "company": "1560", "text": "\u8f49\u63db\u516c\u53f8\u50b5 1,000,000,000",
+             "text_en": "convertible bonds 1,000,000,000"},
+            {"days_left": 88, "date": "2026-08-11",
+             "company": "2464", "text": "\u8f49\u63db\u516c\u53f8\u50b5(\u7121\u64d4\u4fdd) 1,000,000,000",
+             "text_en": "convertible bonds (unsecured) 1,000,000,000"},
+        ]
+        _LAST_TWCB["html"] = "<html><body>FILE-mode TW CB report</body></html>"
+        _LAST_TWCB["subject"] = "[TW CB pipeline] 1 new | FILE"
+        return {"ok": True, "events": evs, "new": 1,
+                "shelf_live": 3, "shelf_rows": shelf_rows,
+                "stats": "TWSE raw=120 TPEx raw=88 SFB raw=6",
+                "errors": [], "warnings": []}
     try:
-        a = db_meta_get("autosaveSec")
-        if a is not None:
-            STATE["autosaveSec"] = max(0, int(a))
+        if TW_BF["running"]:
+            return JSONResponse(status_code=409, content={
+                "ok": False, "error": "backfill in progress - try again in a minute"})
+        import importlib
+        try:
+            twm = importlib.import_module("tw_cb_pipeline_monitor")
+        except ImportError:
+            return JSONResponse(status_code=500, content={
+                "ok": False, "error": "tw_cb_pipeline_monitor.py not found - place it next to cb_recon_web.py "
+                "(M:\\CB\\BAU) and restart."})
+        session = twm.make_session()
+        all_events, errors, warnings = [], [], []
+        raw_counts = {}
+        import datetime as _dt
+        is_weekday = _dt.date.today().weekday() < 5
+        feeds = [
+            ("TWSE", lambda: twm.feed_mops(session,
+                twm.TWSE_MATERIAL_URL, "MOPS (TWSE listed)")),
+            ("TPEx", lambda: twm.feed_tpex(session)),
+            ("SFB", lambda: twm.feed_sfb(session, warnings)),
+        ]
+        for name, fn in feeds:
+            try:
+                evs, raw = fn()
+                raw_counts[name] = raw
+                all_events.extend(evs)
+                if raw == 0 and is_weekday:
+                    warnings.append("%s returned 0 raw rows on a weekday (TW holiday, or feed degraded)" % name)
+            except Exception as e:
+                errors.append("%s: %s" % (name, e))
+        shelf, live_now = {}, []
+        _has_shelf = all(hasattr(twm, a) for a in
+                         ("_load_json", "_save_json", "SHELF_FILE",
+                          "update_shelf", "shelf_days_left"))
+        if _has_shelf:
+            shelf = twm._load_json(twm.SHELF_FILE)
+            sfb_events = [e for e in all_events
+                          if e["source"] == "SFB effective-registration"]
+            twm.update_shelf(shelf, sfb_events, warnings)
+            try:
+                twm._save_json(twm.SHELF_FILE, shelf)
+            except Exception as e:
+                errors.append("shelf save failed: %s" % e)
+            live_now = [v for v in shelf.values()
+                        if (twm.shelf_days_left(v["date"]) or -1) >= 0]
+        else:
+            warnings.append("desk monitor is an older version (no shelf tracking) - drop in the v2 file to enable it")
+        seen = twm.load_seen()
+        now_ts = time.time()
+        new_events = []
+        for ev in all_events:
+            k = twm.event_key(ev)
+            ev["is_new"] = k not in seen
+            if ev["is_new"]:
+                new_events.append(ev)
+                if req.mark_seen:
+                    seen[k] = now_ts
+        if req.mark_seen:
+            try:
+                twm.save_seen(seen)
+            except Exception as e:
+                errors.append("seen-state save failed: %s" % e)
+        stats = " ".join("%s raw=%s" % (k, v)
+                         for k, v in raw_counts.items())
+        try:
+            _LAST_TWCB["html"] = twm.render_html(
+                new_events, errors, warnings, stats, shelf)
+        except TypeError:
+            _LAST_TWCB["html"] = twm.render_html(
+                new_events, errors, warnings, stats)
+        except Exception:
+            _LAST_TWCB["html"] = (
+                "<html><body><h3>TW CB pipeline</h3><ul>"
+                + "".join("<li>[%s] %s | %s | %s</li>" % (
+                    e.get("source", ""), e.get("date", ""),
+                    e.get("company", ""), e.get("text", ""))
+                    for e in new_events)
+                + "</ul></body></html>")
+        _LAST_TWCB["subject"] = (
+            "[TW CB pipeline] %d new | shelf %d | %d err | %d warn | %s" % (len(new_events), len(live_now),
+            len(errors), len(warnings),
+            _dt.date.today().isoformat()))
+        _fmt = getattr(twm, "fmt_thousands", None) or (lambda s: s)
+        _ten = getattr(twm, "translate_en", None)
+        _cjk = getattr(twm, "has_cjk", None) or (lambda s: True)
+        for ev in all_events:
+            raw = ev.get("text") or ""
+            ev["text_en"] = (_fmt(_ten(raw))
+                             if (_ten and _cjk(raw)) else "")
+            ev["text"] = _fmt(raw)
+        shelf_rows = []
+        if _has_shelf:
+            for v in shelf.values():
+                dl = twm.shelf_days_left(v.get("date", ""))
+                if dl is None or dl < 0:
+                    continue
+                _t = v.get("text") or ""
+                shelf_rows.append({
+                    "days_left": dl, "date": v.get("date", ""),
+                    "company": v.get("company", ""),
+                    "text": _fmt(_t),
+                    "text_en": (_fmt(_ten(_t)) if (_ten and
+                        _cjk(_t)) else "")})
+            shelf_rows.sort(key=lambda x: x["days_left"])
+        return {"ok": True, "events": all_events,
+                "new": len(new_events),
+                "shelf_live": len(live_now),
+                "shelf_rows": shelf_rows, "stats": stats,
+                "errors": errors, "warnings": warnings}
+    except Exception as e:
+        return JSONResponse(status_code=500,
+                            content={"ok": False, "error": str(e)})
+
+
+TW_BF = {"running": False, "msg": "", "error": ""}
+
+
+class TwcbBackfillReq(BaseModel):
+    days: int = 92
+
+
+def _tw_backfill_worker(days: int):
+    try:
+        import importlib
+        twm = importlib.import_module("tw_cb_pipeline_monitor")
+        session = twm.make_session()
+        warnings: list = []
+        evs, raw = twm.backfill_sfb(session, days, warnings)
+        shelf = twm._load_json(twm.SHELF_FILE)
+        sfb_events = [e for e in evs
+                      if e["source"] == "SFB effective-registration"]
+        twm.update_shelf(shelf, sfb_events, warnings)
+        twm._save_json(twm.SHELF_FILE, shelf)
+        seen = twm.load_seen()
+        now_ts = time.time()
+        for ev in evs:
+            seen.setdefault(twm.event_key(ev), now_ts)
+        twm.save_seen(seen)
+        live = [v for v in shelf.values()
+                if (twm.shelf_days_left(v.get("date", "")) or -1) >= 0]
+        TW_BF["msg"] = ("backfill done: walked %dd, %d SFB events, shelf now %d live (marked seen so the daily email stays quiet)" % (days, len(evs), len(live)))
+    except Exception as e:
+        TW_BF["error"] = str(e)
+    finally:
+        TW_BF["running"] = False
+
+
+@app.post("/api/twcb/backfill")
+def api_twcb_backfill(req: TwcbBackfillReq):
+    if os.environ.get("LAGRANGE_TEST_LIVE") == "FILE":
+        TW_BF.update(running=False, error="",
+                     msg="backfill done: walked 92d, 14 SFB events, shelf now 9 live (FILE)")
+        return {"ok": True, "started": True}
+    if TW_BF["running"]:
+        return JSONResponse(status_code=409, content={
+            "ok": False, "error": "backfill already running"})
+    try:
+        import importlib
+        twm = importlib.import_module("tw_cb_pipeline_monitor")
+    except ImportError:
+        return JSONResponse(status_code=500, content={
+            "ok": False, "error": "tw_cb_pipeline_monitor.py not found next to cb_recon_web.py"})
+    if not hasattr(twm, "backfill_sfb"):
+        return JSONResponse(status_code=500, content={
+            "ok": False, "error": "desk monitor is an older version without backfill - drop in the v2 file"})
+    days = max(1, min(int(req.days or 92), 200))
+    TW_BF.update(running=True, msg="", error="")
+    threading.Thread(target=_tw_backfill_worker,
+                     args=(days,), daemon=True).start()
+    return {"ok": True, "started": True}
+
+
+@app.get("/api/twcb/backfill_status")
+def api_twcb_backfill_status():
+    return {"ok": True, **TW_BF}
+
+
+class DelReq(BaseModel):
+    rfq_id: str = ""
+
+
+@app.post("/api/rfq/delete")
+def api_rfq_delete(req: DelReq, request: Request):
+    """Hard-delete a CANCELLED line (and its quote history)."""
+    user = ((getattr(request.state, "auth", None) or {})
+            .get("user") or "trader")
+    if os.environ.get("LAGRANGE_TEST_LIVE") == "FILE":
+        return {"ok": True}
+    try:
+        conn = rc.connect()
+        try:
+            with conn.cursor() as cur:
+                _st = ("('CANCELLED','DONE')"
+                       if user == "jb33880" else
+                       "('CANCELLED')")
+                cur.execute("DELETE FROM cba_app.rfq WHERE "
+                            "rfq_id=%s AND status IN " + _st,
+                            (req.rfq_id,))
+                if not cur.rowcount:
+                    conn.rollback()
+                    return JSONResponse(status_code=409, content={
+                        "ok": False, "error": ("only CANCELLED"
+                        + ("/DONE" if user == "jb33880" else "")
+                        + " lines can be deleted")})
+                cur.execute("DELETE FROM cba_app.rfq_quote_hist "
+                            "WHERE rfq_id=%s", (req.rfq_id,))
+            conn.commit()
+            return {"ok": True}
+        finally:
+            conn.close()
+    except Exception as e:
+        return JSONResponse(status_code=500,
+                            content={"ok": False, "error": str(e)})
+
+
+@app.get("/api/rfq/live")
+def api_rfq_live_lane():
+    """Zero-build live lane: M-LIVE fields for active rows,
+    straight from in-memory nuke state. No DB, no service."""
+    out = {}
+    try:
+        snap = RFQ_SNAP.get("data") or {}
+        for r in snap.get("rows", []):
+            if r.get("status") not in ("REQUESTED", "QUOTED",
+                                       "WORKING", "IMPROVE",
+                                       "HIT"):
+                continue
+            lv = _rfq_live(r.get("sec_id"), r.get("style"))
+            _b = lv.get("nqb");  _b = lv.get("bid") if _b is None else _b
+            _a = lv.get("nqa");  _a = lv.get("ask") if _a is None else _a
+            out[str(r.get("rfq_id"))] = {
+                "lb": None if _b is None else round(_b, 2),
+                "la": None if _a is None else round(_a, 2),
+                "lvs": lv.get("nvs") if lv.get("nvs") is not None else lv.get("und"),
+                "lfx": lv.get("nfx") if lv.get("nfx") is not None else lv.get("fx"),
+                "ld": lv.get("nd")}
     except Exception:
         pass
-    for _k, _lo in (("refreshSec", 2), ("refdataSec", 30)):
+    return {"ok": True, "live": out, "ts": time.time()}
+
+
+class RePx(BaseModel):
+    sec_id: str = ""
+    style: str = ""
+    ovd_spot: str = ""
+    ovd_fx: str = ""
+    ovd_delta: str = ""
+
+
+@app.post("/api/rfq/reprice")
+def api_rfq_reprice(req: RePx):
+    """Instant draft repricing at the caller's refs \u2014 pure
+    in-memory engine, no DB, no service. Feeds the live
+    preview while typing OvdSpot / OvdFx."""
+    if os.environ.get("LAGRANGE_TEST_LIVE") == "FILE":
+        return {"ok": True, "bid": None, "ask": None}
+    try:
+        q = _rfq_live(req.sec_id, (req.style or "outright"),
+                      ovd_spot=_fnum(req.ovd_spot),
+                      ovd_delta=_fnum(req.ovd_delta),
+                      ovd_fx=_fnum(req.ovd_fx))
+        return {"ok": True,
+                "bid": q.get("bid"), "ask": q.get("ask"),
+                "nd": q.get("nd")}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/api/dscan/status")
+def api_dscan_status():
+    return {"ok": _DSCAN["ok"], "note": _DSCAN["note"],
+            "path": _DSCAN["path"]}
+
+
+@app.get("/api/risk/latest")
+def api_risk_latest():
+    """Latest risk_positions: newest snapshot_date, then the
+    freshest loaded_at batch within it, where every row whose
+    loaded_at falls inside a 60-second buffer of the max
+    counts as the same load."""
+    if os.environ.get("LAGRANGE_TEST_LIVE") == "FILE":
+        return {"ok": True, "cols": [], "rows": [],
+                "snap": "", "loaded": "", "table": "FILE"}
+    try:
+        conn = rc.connect()
         try:
-            v = db_meta_get(_k)
-            if v is not None:
-                STATE[_k] = max(_lo, int(v))
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT TABLE_SCHEMA FROM "
+                    "information_schema.tables WHERE "
+                    "TABLE_NAME='risk_positions' LIMIT 1")
+                h = cur.fetchone()
+                if not h:
+                    return {"ok": False, "error":
+                            "risk_positions table not found "
+                            "in any schema"}
+                tbl = "`%s`.`risk_positions`" % h[0]
+                cur.execute("SELECT MAX(snapshot_date) "
+                            "FROM " + tbl)
+                snap = (cur.fetchone() or [None])[0]
+                if snap is None:
+                    return {"ok": False,
+                            "error": "risk_positions is empty"}
+                cur.execute("SELECT MAX(loaded_at) FROM " + tbl
+                            + " WHERE snapshot_date=%s",
+                            (snap,))
+                mload = (cur.fetchone() or [None])[0]
+                cur.execute(
+                    "SELECT * FROM " + tbl +
+                    " WHERE snapshot_date=%s AND "
+                    "loaded_at >= (%s - INTERVAL 60 SECOND)",
+                    (snap, mload))
+                cols = [d[0] for d in cur.description]
+                rows = [["" if v is None else str(v)
+                         for v in r] for r in cur.fetchall()]
+            return {"ok": True, "cols": cols, "rows": rows,
+                    "snap": str(snap), "loaded": str(mload),
+                    "table": h[0] + ".risk_positions"}
+        finally:
+            conn.close()
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+class NkEdit(BaseModel):
+    sec_id: str = ""
+    field: str = ""
+    value: str = ""
+
+
+@app.post("/api/rfq/nkedit")
+def api_rfq_nkedit(req: NkEdit, request: Request):
+    """Edit a nuke-state field (x/or spreads) from the RFQ
+    grid: shared STATE + cb_state persist + live push to every
+    Nuke window."""
+    user = ((getattr(request.state, "auth", None) or {})
+            .get("user") or "trader")
+    _F = ("x_bid", "x_ask", "x_both", "or_bid_sprd",
+          "or_ask_sprd")
+    if req.field not in _F:
+        return JSONResponse(status_code=400, content={
+            "ok": False, "error": "bad field"})
+    if os.environ.get("LAGRANGE_TEST_LIVE") == "FILE":
+        return {"ok": True}
+    try:
+        sid = int(req.sec_id)
+    except (TypeError, ValueError):
+        return JSONResponse(status_code=400, content={
+            "ok": False, "error": "bad sec_id"})
+    if _NUKE_MOD is None:
+        return JSONResponse(status_code=503, content={
+            "ok": False, "error": "nuke module not loaded"})
+    try:
+        row = _NUKE_MOD.STATE["rows"].setdefault(
+            sid, _NUKE_MOD._blank_row())
+        row[req.field] = req.value
+        _NUKE_MOD.db_upsert_state_fields(sid, row, user,
+                                         [req.field])
+        lp = getattr(_NUKE_MOD, "MAIN_LOOP", None)
+        if lp:
+            import asyncio as _aio
+            _aio.run_coroutine_threadsafe(
+                _NUKE_MOD.broadcast({
+                    "type": "snapshot",
+                    "state": _NUKE_MOD.snapshot(),
+                    "online": len(_NUKE_MOD.CLIENTS)}), lp)
+        return {"ok": True}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={
+            "ok": False, "error": str(e)})
+
+
+class ImpReq2(BaseModel):
+    rfq_id: str = ""
+
+
+def _rfq_log(cur, rfq_id, user, note):
+    """Audit line in cba_app.rfq_log (field_name carries the
+    event, new_value the note)."""
+    try:
+        cur.execute(
+            "INSERT INTO cba_app.rfq_log (rfq_id, field_name, "
+            "old_value, new_value, changed_by, changed_at) "
+            "VALUES (%s,%s,NULL,%s,%s,NOW())",
+            (rfq_id, "event", str(note)[:200], user))
+    except Exception:
+        pass
+
+
+
+@app.post("/api/rfq/impreq")
+def api_rfq_impreq(req: ImpReq2, request: Request):
+    user = ((getattr(request.state, "auth", None) or {})
+            .get("user") or "sales")
+    if os.environ.get("LAGRANGE_TEST_LIVE") == "FILE":
+        return {"ok": True}
+    try:
+        conn = rc.connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT sides, ord_level, ord_level2 FROM cba_app.rfq WHERE rfq_id=%s", (req.rfq_id,))
+                h = cur.fetchone()
+                if not h:
+                    return JSONResponse(status_code=404, content={"ok": False, "error": "no such RFQ"})
+                sides, l1, l2 = (h[0] or "two_way"), h[1], h[2]
+                cur.execute("SELECT status FROM cba_app.rfq "
+                            "WHERE rfq_id=%s", (req.rfq_id,))
+                _st0 = (cur.fetchone() or [""])[0]
+                if _st0 not in ("QUOTED", "WORKING"):
+                    return JSONResponse(status_code=409, content={
+                        "ok": False, "error": "improve is only available while QUOTED or WORKING"})
+                miss = []
+                if sides == "two_way":
+                    if l1 is None and l2 is None:
+                        miss.append("bid level or ask level")
+                elif sides == "bid":
+                    if l1 is None:
+                        miss.append("bid level")
+                else:
+                    if l2 is None:
+                        miss.append("ask level")
+                if miss:
+                    return JSONResponse(status_code=400, content={"ok": False, "miss": miss, "error": "improve needs: " + ", ".join(miss)})
+                cur.execute("UPDATE cba_app.rfq SET status='IMPROVE', adj_req=1, last_updated=NOW(), updated_by=%s, row_version=row_version+1 WHERE rfq_id=%s", (user, req.rfq_id))
+                _rfq_log(cur, req.rfq_id, user, "improve requested")
+            conn.commit()
+            return {"ok": True}
+        finally:
+            conn.close()
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+
+
+@app.post("/api/rfq/match")
+def api_rfq_match(req: ImpReq2, request: Request):
+    user = ((getattr(request.state, "auth", None) or {})
+            .get("user") or "trader")
+    if os.environ.get("LAGRANGE_TEST_LIVE") == "FILE":
+        return {"ok": True}
+    try:
+        conn = rc.connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT ord_level, ord_level2, q_rev, ord_side FROM cba_app.rfq WHERE rfq_id=%s", (req.rfq_id,))
+                h = cur.fetchone()
+                if not h:
+                    return JSONResponse(status_code=404, content={"ok": False, "error": "no such RFQ"})
+                l1, l2, rev, ords = h[0], h[1], int(h[2] or 0) + 1, h[3]
+                if l1 is None and l2 is None:
+                    return JSONResponse(status_code=409, content={"ok": False, "error": "no improve terms to match"})
+                _st = "WORKING" if ords else "QUOTED"
+                cur.execute("UPDATE cba_app.rfq SET bid_px=COALESCE(%s, bid_px), ask_px=COALESCE(%s, ask_px), bid_at=NOW(), ask_at=NOW(), q_rev=%s, status=%s, adj_req=NULL, off_flag=NULL, off_by=NULL, off_at=NULL, last_updated=NOW(), updated_by=%s, row_version=row_version+1 WHERE rfq_id=%s", (l1, l2, rev, _st, user, req.rfq_id))
+                cur.execute("INSERT INTO cba_app.rfq_quote_hist (rfq_id, rev, bid, ask, quoted_by, quoted_at, action) VALUES (%s,%s,%s,%s,%s,NOW(),'match')", (req.rfq_id, rev, l1, l2, user))
+            conn.commit()
+            return {"ok": True}
+        finally:
+            conn.close()
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+
+
+class AdjReq(BaseModel):
+    rfq_id: str = ""
+    on: bool = True
+
+
+@app.post("/api/rfq/adjreq")
+def api_rfq_adjreq(req: AdjReq, request: Request):
+    user = ((getattr(request.state, "auth", None) or {})
+            .get("user") or "sales")
+    if os.environ.get("LAGRANGE_TEST_LIVE") == "FILE":
+        return {"ok": True}
+    try:
+        conn = rc.connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE cba_app.rfq SET adj_req=%s, "
+                            "last_updated=NOW(), updated_by=%s, "
+                            "row_version=row_version+1 WHERE rfq_id=%s",
+                            (1 if req.on else None, user, req.rfq_id))
+                _rfq_log(cur, req.rfq_id, user,
+                         "adj-req " + ("on" if req.on else "off"))
+            conn.commit()
+            return {"ok": True}
+        finally:
+            conn.close()
+    except Exception as e:
+        return JSONResponse(status_code=500,
+                            content={"ok": False, "error": str(e)})
+
+
+class TwcbSendReq(BaseModel):
+    to: str = ""
+    cc: str = ""
+    send: bool = False
+
+
+@app.post("/api/twcb/send")
+def api_twcb_send(req: TwcbSendReq):
+    if not _LAST_TWCB["html"]:
+        return JSONResponse(status_code=400, content={
+            "ok": False,
+            "error": "No TW CB report built yet - press Refresh first."})
+    if os.environ.get("LAGRANGE_TEST_LIVE") == "FILE":
+        return {"ok": True, "message": "FILE mode: no Outlook here (draft prepared)", "subject": _LAST_TWCB["subject"]}
+    try:
+        import pythoncom
+        pythoncom.CoInitialize()
+        com_inited = True
+    except ImportError:
+        com_inited = False
+    try:
+        ok, msg = em.send_outlook(_LAST_TWCB["subject"],
+                                  _LAST_TWCB["html"],
+                                  req.to, req.cc, req.send)
+    finally:
+        if com_inited:
+            pythoncom.CoUninitialize()
+    return {"ok": ok, "message": msg,
+            "subject": _LAST_TWCB["subject"]}
+
+
+class DeltaSendReq(BaseModel):
+    to: str = ""
+    cc: str = ""
+    send: bool = False
+
+
+class DeltaRefreshReq(BaseModel):
+    update_db: bool = False
+
+
+@app.post("/api/delta/refresh")
+def api_delta_refresh(req: DeltaRefreshReq = DeltaRefreshReq()):
+    with _LOCK:
+        upd_log = ""
+        stale_warn = ""
+        prev_snap = _latest_snap_ts() if req.update_db else None
+        if req.update_db:
+            ok, upd_log = _run_db_updater()
+            if not ok:
+                return JSONResponse(status_code=500, content={
+                    "ok": False,
+                    "error": "DB update failed - check NOT run "
+                             "(avoid stale-data checks). Run plain Refresh "
+                             "deliberately if you want the current DB state.",
+                    "log": upd_log})
+        try:
+            dcmod = _import_delta()
+        except Exception as e:
+            return JSONResponse(status_code=500, content={
+                "ok": False,
+                "error": "delta_check_recovered.py not importable: %r" % e})
+        try:
+            df = dcmod.get_cba_delta_check(dcmod.CBA_SEC_IDS)
+        except Exception as e:
+            return JSONResponse(status_code=500,
+                                content={"ok": False, "error": repr(e)})
+        if df is None or len(df) == 0:
+            return JSONResponse(status_code=400, content={
+                "ok": False,
+                "error": "CBA delta check returned no rows - check "
+                         "cbanalytics tables / snap availability."})
+        if req.update_db:
+            new_snap = _latest_snap_ts()
+            if prev_snap is not None and new_snap is not None \
+                    and new_snap <= prev_snap:
+                stale_warn = ("[warning] DB update wrote NO new snap - "
+                              "API likely unavailable (weekend/holiday?). "
+                              "Results below reflect the last good snap.")
+                upd_log = (upd_log + "\n" + stale_warn).strip()
+
+        html = dcmod.build_email_html(df)
+        if "flag_reason" in df.columns:
+            flagged = int((df["flag_reason"].fillna("").astype(str)
+                           .str.strip() != "").sum())
+        else:
+            flagged = int((df["flag_delta"].fillna("").astype(str)
+                           .str.strip() == "Y").sum())
+        subject = ("CB Runs - Delta and Price Check (CBA) %s"
+                   % dt.datetime.now().strftime("%Y/%m/%d %H:%M"))
+        _LAST_DELTA.update(subject=subject, html=html,
+                           built_at=dt.datetime.now().strftime("%H:%M:%S"))
+        return {"ok": True, "rows": int(len(df)), "flagged": flagged,
+                "subject": subject, "html": html, "log": upd_log,
+                "stale": bool(stale_warn),
+                "data_as_of": _df_data_as_of(df),
+                "built_at": _LAST_DELTA["built_at"]}
+
+
+@app.post("/api/delta/send")
+def api_delta_send(req: DeltaSendReq):
+    with _LOCK:
+        if not _LAST_DELTA["html"]:
+            return JSONResponse(status_code=400, content={
+                "ok": False,
+                "error": "No delta report built yet - press Refresh first."})
+        subject, html = _LAST_DELTA["subject"], _LAST_DELTA["html"]
+    try:
+        import pythoncom
+        pythoncom.CoInitialize()
+        com_inited = True
+    except ImportError:
+        com_inited = False
+    try:
+        ok, msg = em.send_outlook(subject, html, req.to, req.cc, req.send)
+    finally:
+        if com_inited:
+            pythoncom.CoUninitialize()
+    return {"ok": ok, "message": msg, "subject": subject}
+
+
+
+
+def _force_foreground(dcmod, hwnd):
+    """Bring hwnd to foreground despite Windows focus-stealing rules.
+    Tries: plain call -> Alt-keypress trick -> AttachThreadInput ->
+    minimize/restore jolt. Returns True only if hwnd IS the foreground
+    window afterwards (verified, so keystrokes cannot misfire)."""
+    def _is_fg():
+        try:
+            return dcmod.win32gui.GetForegroundWindow() == hwnd
+        except Exception:
+            return False
+
+    # attempt 0: plain
+    try:
+        dcmod.win32gui.SetForegroundWindow(hwnd)
+    except Exception:
+        pass
+    if _is_fg():
+        return True
+
+    # attempt 1: Alt keypress grants SetForegroundWindow rights
+    try:
+        dcmod.pyautogui.press("alt")
+        dcmod.time.sleep(0.1)
+        dcmod.win32gui.SetForegroundWindow(hwnd)
+    except Exception:
+        pass
+    if _is_fg():
+        return True
+
+    # attempt 2: AttachThreadInput to the current foreground thread
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        fg = user32.GetForegroundWindow()
+        fg_tid = user32.GetWindowThreadProcessId(fg, None)
+        cur_tid = kernel32.GetCurrentThreadId()
+        if fg_tid and fg_tid != cur_tid:
+            user32.AttachThreadInput(cur_tid, fg_tid, True)
+            try:
+                user32.BringWindowToTop(hwnd)
+                dcmod.win32gui.SetForegroundWindow(hwnd)
+            finally:
+                user32.AttachThreadInput(cur_tid, fg_tid, False)
+    except Exception:
+        pass
+    if _is_fg():
+        return True
+
+    # attempt 3: minimize/restore jolt
+    try:
+        dcmod.win32gui.ShowWindow(hwnd, dcmod.win32con.SW_MINIMIZE)
+        dcmod.time.sleep(0.3)
+        dcmod.win32gui.ShowWindow(hwnd, dcmod.win32con.SW_RESTORE)
+        dcmod.time.sleep(0.3)
+        dcmod.win32gui.SetForegroundWindow(hwnd)
+    except Exception:
+        pass
+    return _is_fg()
+
+
+def _scrape_derivation(dcmod):
+    """Web-safe automated grab from the Derivation window.
+    Forces foreground through Windows focus-stealing restrictions and
+    VERIFIES focus before sending any keystroke. On any failure returns
+    (None, reason) instead of opening Tk dialogs."""
+    try:
+        hwnd = dcmod.win32gui.FindWindow(None, DERIV_WINDOW_TITLE)
+        matched = DERIV_WINDOW_TITLE if hwnd else None
+        if not hwnd:
+            # prefix fallback: survive version-string changes
+            cands = []
+
+            def _enum(h, _):
+                try:
+                    if dcmod.win32gui.IsWindowVisible(h):
+                        t = dcmod.win32gui.GetWindowText(h)
+                        if t.startswith(DERIV_TITLE_PREFIX):
+                            cands.append((h, t))
+                except Exception:
+                    pass
+                return True
+
+            dcmod.win32gui.EnumWindows(_enum, None)
+            if cands:
+                hwnd, matched = cands[0]
+    except Exception as e:
+        return None, "win32gui unavailable: %r" % e
+    if not hwnd:
+        return None, ("Derivation window not found (looked for exact "
+                      "title '%s' and any window starting with '%s'). "
+                      "Use the paste box instead."
+                      % (DERIV_WINDOW_TITLE, DERIV_TITLE_PREFIX))
+    print("[grab] using window: %s" % matched)
+    try:
+        dcmod.win32gui.ShowWindow(hwnd, dcmod.win32con.SW_RESTORE)
+        dcmod.time.sleep(0.5)
+        if not _force_foreground(dcmod, hwnd):
+            return None, ("Could not bring the Derivation window to the "
+                          "foreground (Windows focus rules). Click the "
+                          "Derivation window once yourself, then either "
+                          "retry auto-grab immediately or just Ctrl+A / "
+                          "Ctrl+C and use the paste box.")
+        def _copy_rows(with_click_expand):
+            """One grab attempt. Returns (df_or_None, rows, note)."""
+            if dcmod.win32gui.GetForegroundWindow() != hwnd:
+                if not _force_foreground(dcmod, hwnd):
+                    return None, 0, "lost foreground"
+            if with_click_expand:
+                # click INTO the grid (read-only Name column, below header)
+                l, t, r_, b_ = dcmod.win32gui.GetWindowRect(hwnd)
+                cx = l + min(150, max(60, (r_ - l) // 8))
+                cy = t + 230
+                dcmod.pyautogui.click(cx, cy); dcmod.time.sleep(0.5)
+                if dcmod.win32gui.GetForegroundWindow() != hwnd:
+                    return None, 0, "lost foreground after click"
+            dcmod.pyperclip.copy("")
+            dcmod.pyautogui.hotkey('ctrl', 'a'); dcmod.time.sleep(1)
+            if with_click_expand:
+                dcmod.pyautogui.hotkey('ctrl', 'add'); dcmod.time.sleep(1)
+            dcmod.pyautogui.hotkey('ctrl', 'c'); dcmod.time.sleep(5)
+            clip = dcmod.pyperclip.paste()
+            if not clip or len(clip.strip()) < 50:
+                return None, 0, "clipboard empty"
+            import pandas as _pd, io as _io
+            try:
+                d = _pd.read_csv(_io.StringIO(clip), sep="\t")
+            except Exception as e:
+                return None, 0, "parse failed: %r" % e
+            return d, len(d), "ok"
+
+        data, n1, note1 = _copy_rows(with_click_expand=True)
+        print("[grab] click+expand sequence: %d rows (%s)" % (n1, note1))
+        if n1 < DERIV_MIN_ROWS:
+            data2, n2, note2 = _copy_rows(with_click_expand=False)
+            print("[grab] simple sequence retry: %d rows (%s)" % (n2, note2))
+            if n2 > n1:
+                data, n1 = data2, n2
+        if data is None or n1 == 0:
+            return None, ("Both grab sequences failed (%s / see log). "
+                          "Use the paste box instead." % note1)
+        dcmod.win32gui.ShowWindow(hwnd, dcmod.win32con.SW_MINIMIZE)
+        if data.empty:
+            return None, "Grabbed data parsed to an empty table."
+        print("[grab] columns: %s" % list(data.columns)[:15])
+        return data, "auto-grab ok: %d rows" % len(data)
+    except Exception as e:
+        return None, ("Automated grab failed (%r). "
+                      "Use the paste box instead." % e)
+
+
+def run_full_delta_pipeline(dcmod, derivation_df):
+    """Run the notebook __main__ flow (minus popup/auto-email) and return
+    the combined derivation+CBA DataFrame. Mirrors delta_check_recovered's
+    main cell; that cell remains the source of truth."""
+    import pandas as pd
+    import numpy as np
+
+    dcmod.derivation_underlying_map = {}
+    booking_cb = "4. Afternoon (All Regions)"
+    print(f"Run mode: {booking_cb}")
+
+    dcmod.data = derivation_df
+
+    (dcmod.df, index_cn_hk_dict, index_tw_dict,
+     index_kr_dict, index_jp_dict) = dcmod.get_cb_analyzer()
+    dcmod.usdkrw, usdjpy = dcmod.get_fx_currency()
+
+    col_num = 20  # FIXME(OCR): mirror of the notebook's unverified value
+    num_range = range(2, col_num + 2)
+    header_row = dcmod.df.iloc[1, 1:col_num].tolist()
+    dcmod.header_row_map = dict(zip(num_range, header_row))
+    dcmod.header_row_map.update({col_num + 1: "IVDelta",
+                                 col_num + 2: "Delta_Now"})
+
+    dcmod.derivation_map = {
+        "ISIN": "Isin", "Bid": "Citi Bid", "Offer": "Citi Ask",
+        "VS": "Last Price", "Delta": "HousePriceDelta",
+        "IVDelta": "IVDelta", "Delta_Now": "Delta",
+    }
+
+    dcmod.full_runs_dict = {}
+    dcmod.process_derivation_data(index_cn_hk_dict, "CN")
+    dcmod.process_derivation_data(index_tw_dict,    "TW")
+    dcmod.process_derivation_data(index_kr_dict,    "KR")
+    dcmod.process_derivation_data(index_jp_dict,    "JP")
+
+    runs_df = pd.DataFrame(dcmod.full_runs_dict).T
+    runs_df = dcmod.get_security_data(runs_df)
+
+    eqrms_df = pd.read_csv(
+        r"\\apacdfs\HK\MKT\GROUPS\futures\CB\KK\Main Book by ACCTS.txt",
+        sep="\t")  # FIXME(OCR): filename mirror
+    runs_df = dcmod.process_quantities_and_currency(runs_df, eqrms_df,
+                                                    dcmod.usdkrw)
+
+    country_map = {"KR": "South Korea", "JP": "Japan",
+                   "CN": "China / Hong Kong", "TW": "Taiwan"}
+    country_runs = {
+        country_map[c]: runs_df[runs_df["Country"] == c].sort_values("Name")
+        for c in runs_df["Country"].unique()
+    }
+    combined_df = dcmod.combine_country_runs(country_runs, dcmod.usdkrw)
+
+    final_df = dcmod.post_process(combined_df, booking_cb)
+    final_df = dcmod.get_delta_qlx(final_df)
+    final_df = dcmod.compute_delta_checks(final_df)
+
+    output_cols = ["sec_id", "company_name", "expiry_date", "eqrms_snap_ts",
+                   "eqrms_delta", "nuked_delta", "eqrms_vs_nuked",
+                   "eqrms_fair_price", "nuked_mkt_price", "px_vs_nuked",
+                   "flag_delta", "flag_price", "flag_reason"]
+    output_cols = [c for c in output_cols if c in final_df.columns]
+    derivation_out = final_df[output_cols].copy()
+    derivation_out = derivation_out.dropna(subset=["sec_id"]) \
+                                   .reset_index(drop=True)
+    derivation_out.insert(0, "source_pricing", "derivation")
+    derivation_out = dcmod.enrich_derivation_prices(derivation_out)
+
+    cba_out = dcmod.get_cba_delta_check(dcmod.CBA_SEC_IDS)
+
+    final_output_cols = ["source_pricing", "sec_id", "company_name",
+                         "expiry_date", "eqrms_snap_ts", "eqrms_delta",
+                         "nuked_delta", "eqrms_vs_nuked",
+                         "eqrms_fair_price", "nuked_mkt_price", "px_vs_nuked",
+                         "flag_delta", "flag_price", "flag_reason"]
+    for col in final_output_cols:
+        if col not in cba_out.columns:        cba_out[col] = np.nan
+        if col not in derivation_out.columns: derivation_out[col] = np.nan
+    cba_out        = cba_out[final_output_cols]
+    derivation_out = derivation_out[final_output_cols]
+
+    derivation_out["_sec_id_int"] = pd.to_numeric(
+        derivation_out["sec_id"], errors="coerce").round(0).astype("Int64")
+    cba_ids = set(pd.to_numeric(cba_out["sec_id"], errors="coerce")
+                  .dropna().round(0).astype(int).tolist())
+    derivation_out = derivation_out[
+        ~derivation_out["_sec_id_int"].isin(cba_ids)
+    ].drop(columns=["_sec_id_int"]).reset_index(drop=True)
+
+    combined_output = pd.concat([derivation_out, cba_out],
+                                ignore_index=True)
+    print(f"combined output: {len(combined_output)} rows "
+          f"({len(derivation_out)} derivation + {len(cba_out)} cba)")
+    return combined_output
+
+
+class DeltaFullReq(BaseModel):
+    source: str = "paste"        # paste | auto
+    pasted: str = ""
+    update_db: bool = False
+
+
+@app.post("/api/delta/full")
+def api_delta_full(req: DeltaFullReq):
+    with _LOCK:
+        try:
+            dcmod = _import_delta()
+        except Exception as e:
+            return JSONResponse(status_code=500, content={
+                "ok": False,
+                "error": "delta_check_recovered.py not importable: %r" % e})
+
+        import pandas as pd
+        log = io.StringIO()
+        stale = False
+        prev_snap = _latest_snap_ts() if req.update_db else None
+        if req.update_db:
+            ok, upd_log = _run_db_updater()
+            print(upd_log, file=log)
+            if not ok:
+                return JSONResponse(status_code=500, content={
+                    "ok": False,
+                    "error": "DB update failed - pipeline NOT run "
+                             "(avoid stale-data checks).",
+                    "log": log.getvalue()})
+        # -- acquire derivation data --
+        if req.source == "auto":
+            with contextlib.redirect_stdout(log):
+                deriv_df, msg = _scrape_derivation(dcmod)
+            print("[grab]", msg, file=log)
+            if deriv_df is None:
+                return JSONResponse(status_code=400, content={
+                    "ok": False, "error": msg, "log": log.getvalue()})
+        else:
+            if not req.pasted.strip():
+                return JSONResponse(status_code=400, content={
+                    "ok": False,
+                    "error": "Paste box is empty - copy the Derivation "
+                             "grid (Ctrl+A, Ctrl+C) and paste it here."})
+            try:
+                deriv_df = pd.read_csv(io.StringIO(req.pasted), sep="\t")
+            except Exception as e:
+                return JSONResponse(status_code=400, content={
+                    "ok": False,
+                    "error": "Could not parse pasted data as "
+                             "tab-separated: %r" % e})
+            if deriv_df.empty:
+                return JSONResponse(status_code=400, content={
+                    "ok": False, "error": "Pasted data parsed to an "
+                                          "empty table."})
+            print("[paste] %d rows parsed" % len(deriv_df), file=log)
+
+        # -- run the pipeline with captured output --
+        try:
+            with contextlib.redirect_stdout(log), \
+                 contextlib.redirect_stderr(log):
+                combined = run_full_delta_pipeline(dcmod, deriv_df)
+        except Exception as e:
+            import traceback
+            tb = "\n".join(traceback.format_exc().splitlines()[-12:])
+            print("--- traceback (tail) ---\n" + tb, file=log)
+            return JSONResponse(status_code=500, content={
+                "ok": False, "error": "pipeline failed: %r" % e,
+                "log": log.getvalue()})
+
+        if combined is None or len(combined) == 0:
+            return JSONResponse(status_code=400, content={
+                "ok": False, "error": "pipeline produced no rows",
+                "log": log.getvalue()})
+
+        if req.update_db:
+            new_snap = _latest_snap_ts()
+            if prev_snap is not None and new_snap is not None \
+                    and new_snap <= prev_snap:
+                stale = True
+                print("[warning] DB update wrote NO new snap - results "
+                      "reflect the last good snap.", file=log)
+
+        html = dcmod.build_email_html(combined)
+        if "flag_reason" in combined.columns:
+            flagged = int((combined["flag_reason"].fillna("").astype(str)
+                           .str.strip() != "").sum())
+        else:
+            flagged = int((combined["flag_delta"].fillna("").astype(str)
+                           .str.strip() == "Y").sum())
+        subject = ("CB Runs - Delta and Price Check (derivation + CBA) %s"
+                   % dt.datetime.now().strftime("%Y/%m/%d %H:%M"))
+        _LAST_DELTA.update(subject=subject, html=html,
+                           built_at=dt.datetime.now().strftime("%H:%M:%S"))
+        return {"ok": True, "rows": int(len(combined)), "flagged": flagged,
+                "subject": subject, "html": html,
+                "log": log.getvalue(), "stale": stale,
+                "data_as_of": _df_data_as_of(combined),
+                "built_at": _LAST_DELTA["built_at"]}
+
+
+
+
+@app.get("/api/nuke/status")
+def api_nuke_status():
+    if NUKE_EMBED:
+        return {"ok": True, "up": _NUKE_MOD is not None, "url": "/nuke/",
+                "mode": "embedded", "autostart": False, "child": None,
+                "build": LAGRANGE_BUILD, "note": _NUKE_NOTE}
+    """Health-check the Nuke Station server so the tab can embed or
+    explain. Uses stdlib urllib; 2s timeout."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(NUKE_URL, timeout=2) as r:
+            up = 200 <= r.status < 500
+    except Exception:
+        up = False
+    note = _NUKE_NOTE
+    if _NUKE_PROC is not None and _NUKE_PROC.poll() is not None:
+        note = ("child EXITED with code %s - see nuke_station_console.log "
+                "next to app.py" % _NUKE_PROC.returncode)
+    child = (None if _NUKE_PROC is None
+             else ("running" if _NUKE_PROC.poll() is None else "exited"))
+    return {"ok": True, "up": up, "url": NUKE_URL,
+            "autostart": NUKE_AUTOSTART, "child": child, "note": note}
+
+
+@app.post("/api/nuke/start")
+def api_nuke_start():
+    """Connect-button path: (re)attempt start/embed, then report."""
+    if NUKE_EMBED:
+        if _NUKE_MOD is None:
+            return JSONResponse(status_code=500, content={
+                "ok": False, "up": False, "url": "/nuke/",
+                "note": _NUKE_NOTE + " - fix and RESTART Lagrange "
+                        "(embedding happens at startup)"})
+        return api_nuke_status()
+    _maybe_start_nuke()
+    return api_nuke_status()
+
+
+# ----------------------------------------------------------------------
+# Trade Blotter tab (read + limited edit of eqrms.trade_blotter)
+# Integration is DB-only: the blotter app runs separately; Lagrange never
+# launches, imports, or calls it. Concurrency uses the blotter's own
+# row_version counter; audits go to the blotter's own trade_blotter_audit
+# so Lagrange edits appear in its Activity Log.
+# ----------------------------------------------------------------------
+BLOTTER_DB = os.environ.get("BLOTTER_DB", "trade_blotter")
+BLOTTER_TABLE = "trade_blotter"
+# Logical fields -> candidate physical column names, tried in order.
+# The tab introspects SHOW COLUMNS once and adapts, so it survives the
+# schema differences between main.py's model and the migrated table.
+BLOTTER_CANDIDATES = {
+    "trade_id":        ["trade_id", "id"],
+    "trade_date":      ["trade_date"],
+    "client_side":     ["client_side", "side"],
+    "isin":            ["isin"],
+    "bond_name":       ["bond_name"],
+    "bond_type":       ["bond_type"],
+    "bond_currency":   ["bond_currency", "bond_ccy", "currency", "ccy"],
+    "fx_rate":         ["fx_rate"],
+    "quantity":        ["quantity", "qty"],
+    "price":           ["price"],
+    "client_name":     ["client_name", "client"],
+    "client_type":     ["client_type", "clienttype", "client_typ",
+                        "cust_type"],
+    "client_account":  ["client_account", "client_acct", "account", "acct"],
+    "sales":           ["sales", "sales_person", "salesperson"],
+    "trade_type":      ["trade_type"],
+    "stock_ref":       ["stock_ref"],
+    "fx_ref":          ["fx_ref"],
+    "bond_fx_ref":     ["bond_fx_ref"],
+    "stock_quantity":  ["stock_quantity", "stock_qty"],
+    "delta":           ["delta"],
+    "parity":          ["parity"],
+    "bond_usd_settlement":  ["bond_usd_settlement", "bond_usd_settle"],
+    "stock_usd_settlement": ["stock_usd_settlement", "stock_usd_settle"],
+    "bond_settlement_ccy":  ["bond_settlement_ccy", "bond_settle_ccy"],
+    "stock_settlement_ccy": ["stock_settlement_ccy", "stock_settle_ccy"],
+    "working_stock_instruction": ["working_stock_instruction",
+                                  "ws_instruction"],
+    "working_stock_start":  ["working_stock_start", "ws_start"],
+    "working_stock_end":    ["working_stock_end", "ws_end"],
+    "working_fx_instruction": ["working_fx_instruction", "fx_instruction"],
+    "working_fx_time":      ["working_fx_time", "fx_time"],
+    "settlement_date": ["settlement_date", "settle_date", "settlement",
+                        "value_date"],
+    "trader_agree":    ["trader_agree", "trader", "trader_agreed",
+                        "trader_ok"],
+    "booked":          ["booked", "is_booked", "booked_flag"],
+    "hedged_delta":    ["hedged_delta"],
+    "hedged_fx":       ["hedged_fx"],
+    "hedged_vol":      ["hedged_vol"],
+    "hedged_credit":   ["hedged_credit"],
+    "hedged_rates":    ["hedged_rates"],
+    "internal_acct":   ["internal_acct", "internal_account", "int_acct"],
+    "citi_give_up_stocks": ["citi_give_up_stocks", "citi_give_up",
+                            "citi_gu"],
+    "other_comments":  ["other_comments", "comments", "comment"],
+    "cross_flag":      ["cross_flag", "cross", "is_cross"],
+    "cross_quantity":  ["cross_quantity", "cross_qty"],
+    "last_updated":    ["last_updated", "updated_at"],
+    "updated_by":      ["updated_by", "update_by", "updated"],
+    "row_version":     ["row_version"],
+}
+# main.py's rule: everything is editable EXCEPT identity/server-managed
+BLOTTER_NON_EDITABLE = {"trade_id", "last_updated", "updated_by",
+                        "row_version"}
+BLOTTER_EDITABLE = [k for k in BLOTTER_CANDIDATES
+                    if k not in BLOTTER_NON_EDITABLE]
+
+# ---- transcribed from the blotter's main.py (types + rules) ------------
+import re as _re
+from decimal import Decimal as _Dec, InvalidOperation as _DecErr
+from datetime import date as _date, datetime as _dt, timedelta as _td
+
+BL_BOOL = {"bond_usd_settlement", "stock_usd_settlement", "booked",
+           "citi_give_up_stocks", "cross_flag"}
+BL_NUM = {"fx_rate", "quantity", "price", "stock_ref", "fx_ref",
+          "bond_fx_ref", "stock_quantity", "delta", "parity",
+          "cross_quantity"}
+BL_DATE = {"trade_date"}                    # settlement_date is special
+BL_TIME = {"working_stock_start", "working_stock_end", "working_fx_time"}
+BL_HEDGE = {"hedged_delta", "hedged_fx", "hedged_vol", "hedged_credit",
+            "hedged_rates"}
+BL_HEDGE_STATES = {"N/A", "Open", "Done"}
+BL_MAXLEN = {"client_side": 10, "isin": 12, "bond_name": 100,
+             "bond_type": 50, "bond_currency": 10, "client_name": 100,
+             "client_type": 50, "sales": 50, "trade_type": 50,
+             "bond_settlement_ccy": 10, "stock_settlement_ccy": 10,
+             "working_stock_start": 20, "working_stock_end": 20,
+             "working_fx_time": 20, "trader_agree": 50, "internal_acct": 50,
+             "client_account": 50}
+BL_MAXLEN.update({h: 8 for h in BL_HEDGE})
+BL_TPLUS = _re.compile(r"^[tT]\s*\+?\s*(-?\d+)$")
+BL_DATE_FMTS = ("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y")
+# trade_field -> (map_table, key_col, {trade_col: map_col})
+BL_AUTOFILL = {
+    "isin": ("bond_mappings", "isin",
+             {"bond_name": "bond_name", "bond_type": "bond_type",
+              "bond_currency": "bond_currency", "fx_rate": "fx_rate"}),
+    "bond_name": ("bond_mappings", "bond_name",
+                  {"isin": "isin", "bond_type": "bond_type",
+                   "bond_currency": "bond_currency", "fx_rate": "fx_rate"}),
+    "client_name": ("client_mappings", "client_name",
+                    {"client_type": "client_type",
+                     "client_account": "client_account"}),
+}
+
+
+class BLVal(Exception):
+    pass
+
+
+def _bl_parse_date(v):
+    if isinstance(v, _dt):
+        return v.date()
+    if isinstance(v, _date):
+        return v
+    sv = str(v).strip()
+    for f in BL_DATE_FMTS:
+        try:
+            return _dt.strptime(sv, f).date()
+        except ValueError:
+            continue
+    raise BLVal(f"Invalid date: {v!r}")
+
+
+def _bl_bdays(start, n):
+    if n == 0:
+        return start
+    step = 1 if n > 0 else -1
+    d, rem = start, abs(n)
+    while rem > 0:
+        d += _td(days=step)
+        if d.weekday() < 5:
+            rem -= 1
+    return d
+
+
+def _bl_settlement(raw, trade_date):
+    if raw is None:
+        return None
+    sv = str(raw).strip()
+    if sv == "":
+        return None
+    mm = BL_TPLUS.match(sv)
+    if mm:
+        if trade_date in (None, ""):
+            raise BLVal("Enter the Trade Date first, then use 't+N' for "
+                        "settlement.")
+        return _bl_bdays(_bl_parse_date(trade_date), int(mm.group(1)))
+    return _bl_parse_date(sv)
+
+
+def _bl_mmss(text):
+    digits = "".join(ch for ch in str(text) if ch.isdigit())
+    if not digits:
+        return str(text).strip()
+    digits = digits[:4]
+    if len(digits) <= 2:
+        return f"{int(digits):02d}:00"
+    return f"{int(digits[:-2]):02d}:{digits[-2:]}"
+
+
+def _bl_coerce(field, value):
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip() == "":
+        return None
+    try:
+        if field in BL_BOOL:
+            if isinstance(value, bool):
+                return 1 if value else 0
+            if isinstance(value, (int, float)):
+                return 1 if value else 0
+            return 1 if str(value).strip().lower() in (
+                "1", "true", "yes", "y", "t") else 0
+        if field in BL_NUM:
+            return _Dec(str(value))
+        if field in BL_DATE:
+            return _bl_parse_date(value)
+    except (_DecErr, ValueError):
+        raise BLVal(f"Invalid number: {value!r}")
+    text = str(value)
+    if field == "client_side":
+        text = text.strip().upper()
+    if field in BL_TIME:
+        text = _bl_mmss(text)
+    return text
+
+
+def _bl_validate(field, value):
+    if value is None:
+        return
+    if field == "isin":
+        if len(str(value)) != 12:
+            raise BLVal("ISIN must be exactly 12 characters (or blank).")
+    elif field == "delta":
+        if not (_Dec("0") <= value <= _Dec("100")):
+            raise BLVal("Delta must be between 0 and 100 (percent).")
+    elif field == "quantity":
+        if value < 0:
+            raise BLVal("Quantity must be >= 0.")
+    elif field == "client_side":
+        if value not in ("BUY", "SELL"):
+            raise BLVal("Client side must be BUY or SELL.")
+    elif field in BL_HEDGE:
+        if str(value) not in BL_HEDGE_STATES:
+            raise BLVal("Hedge state must be N/A, Open or Done.")
+    if field in BL_MAXLEN and value is not None:
+        if len(str(value)) > BL_MAXLEN[field]:
+            raise BLVal(f"{field} is too long (max {BL_MAXLEN[field]} "
+                        f"characters).")
+
+
+def _bl_ser(v):
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    return str(v)
+
+_BLOTTER_MAP = None            # logical -> physical (None if missing)
+_BLOTTER_AUDIT_MODE = None     # "blotter" | "lagrange"
+
+
+def _blotter_schema(conn):
+    """Resolve logical->physical once per process; pick the audit target."""
+    global _BLOTTER_MAP, _BLOTTER_AUDIT_MODE
+    if _BLOTTER_MAP is not None:
+        return _BLOTTER_MAP
+    with conn.cursor() as cur:
+        cur.execute(f"SHOW COLUMNS FROM {BLOTTER_DB}.{BLOTTER_TABLE}")
+        _phys = [r[0] for r in cur.fetchall()]
+        have = {c.lower() for c in _phys}
+        globals()["_BLOTTER_PHYS"] = _phys
+        mapping = {}
+        for logical, cands in BLOTTER_CANDIDATES.items():
+            mapping[logical] = next((c for c in cands if c.lower() in have),
+                                    None)
+        try:
+            cur.execute(f"SHOW COLUMNS FROM {BLOTTER_DB}.trade_blotter_audit")
+            acols = {r[0].lower() for r in cur.fetchall()}
+            _BLOTTER_AUDIT_MODE = ("blotter" if
+                {"trade_id", "field_name", "old_value", "new_value",
+                 "changed_by", "changed_at"} <= acols else "lagrange")
+        except Exception:
+            _BLOTTER_AUDIT_MODE = "lagrange"
+        if _BLOTTER_AUDIT_MODE == "lagrange":
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS cba_app.blotter_edit_log ("
+                "log_id BIGINT PRIMARY KEY AUTO_INCREMENT, row_id INT, "
+                "field_name VARCHAR(50), old_value TEXT, new_value TEXT, "
+                "changed_by VARCHAR(50), changed_at DATETIME)")
+    conn.commit()
+    _BLOTTER_MAP = mapping
+    return mapping
+
+
+def _blotter_audit(cur, row_id, field, old, new, user):
+    if _BLOTTER_AUDIT_MODE == "blotter":
+        cur.execute(
+            f"INSERT INTO {BLOTTER_DB}.trade_blotter_audit "
+            f"(trade_id, field_name, old_value, new_value, changed_by, "
+            f"changed_at) VALUES (%s,%s,%s,%s,%s,NOW())",
+            (row_id, field, old, new, user))
+    else:
+        cur.execute(
+            "INSERT INTO cba_app.blotter_edit_log "
+            "(row_id, field_name, old_value, new_value, changed_by, "
+            "changed_at) VALUES (%s,%s,%s,%s,%s,NOW())",
+            (row_id, field, old, new, user))
+
+
+def _blotter_payload(dfrom="", dto="", ticker="", ttype=""):
+    """One source of truth for both /list and /stream."""
+    conn = rc.connect()
+    try:
+        m = _blotter_schema(conn)
+        sel = []
+        for logical in BLOTTER_CANDIDATES:
+            phys = m.get(logical)
+            sel.append(f"`{phys}` AS `{logical}`" if phys
+                       else f"'' AS `{logical}`")
+        where, params = [], []
+        if m["trade_date"]:
+            if dfrom:
+                where.append(f"`{m['trade_date']}` >= %s"); params.append(dfrom)
+            if dto:
+                where.append(f"`{m['trade_date']}` <= %s"); params.append(dto)
+        if ticker:
+            parts = [f"`{m[c]}` LIKE %s" for c in ("isin", "bond_name")
+                     if m.get(c)]
+            if parts:
+                where.append("(" + " OR ".join(parts) + ")")
+                params += [f"%{ticker}%"] * len(parts)
+        if ttype and m.get("trade_type"):
+            where.append(f"`{m['trade_type']}` = %s"); params.append(ttype)
+        wsql = (" WHERE " + " AND ".join(where)) if where else ""
+        order = m.get("trade_id") or m.get("last_updated") or "1"
+        with conn.cursor() as cur:
+            # change signature: inserts/deletes (count, max id),
+            # edits (max ts + row_version sum survives same-second edits)
+            sigcols = [f"COUNT(*)", f"IFNULL(MAX(`{order}`),0)"]
+            if m.get("last_updated"):
+                sigcols.append(f"IFNULL(MAX(`{m['last_updated']}`),'')")
+            if m.get("row_version"):
+                sigcols.append(f"IFNULL(SUM(`{m['row_version']}`),0)")
+            cur.execute(f"SELECT {', '.join(sigcols)} FROM "
+                        f"{BLOTTER_DB}.{BLOTTER_TABLE}{wsql}", params)
+            sig = "|".join(str(x) for x in cur.fetchone())
+            cur.execute(f"SELECT {', '.join(sel)} FROM "
+                        f"{BLOTTER_DB}.{BLOTTER_TABLE}{wsql} "
+                        f"ORDER BY `{order}` DESC LIMIT 500", params)
+            cols = [d[0] for d in cur.description]
+            rows = [{c: (str(v) if v is not None else "")
+                     for c, v in zip(cols, r)} for r in cur.fetchall()]
+            types = []
+            if m.get("trade_type"):
+                cur.execute(f"SELECT DISTINCT `{m['trade_type']}` "
+                            f"FROM {BLOTTER_DB}.{BLOTTER_TABLE} "
+                            f"WHERE `{m['trade_type']}` IS NOT NULL "
+                            f"AND `{m['trade_type']}` <> '' ORDER BY 1")
+                types = [r[0] for r in cur.fetchall()]
+        tok_col = "row_version" if m.get("row_version") else "last_updated"
+        for r in rows:
+            r["_tok"] = r.get(tok_col, "")
+        editable = [f for f in BLOTTER_EDITABLE if m.get(f)]
+        missing = [k for k, v in m.items() if v is None]
+        used = {v.lower() for v in m.values() if v}
+        unmapped = [c for c in globals().get("_BLOTTER_PHYS", [])
+                    if c.lower() not in used]
+        return {"ok": True, "rows": rows, "types": types,
+                "editable": editable, "audit": _BLOTTER_AUDIT_MODE,
+                "missing": missing, "unmapped": unmapped, "sig": sig}
+    finally:
+        conn.close()
+
+
+@app.get("/api/blotter/list")
+def api_blotter_list(dfrom: str = "", dto: str = "", ticker: str = "",
+                     ttype: str = ""):
+    try:
+        return _blotter_payload(dfrom, dto, ticker, ttype)
+    except Exception as e:
+        return JSONResponse(status_code=500,
+                            content={"ok": False, "error": str(e)})
+
+
+@app.get("/api/blotter/stream")
+def api_blotter_stream(dfrom: str = "", dto: str = "", ticker: str = "",
+                       ttype: str = ""):
+    """Server-Sent Events: pushes the filtered payload whenever the change
+    signature moves (edits, inserts, deletes) - checked every 2s. Works
+    with or without the blotter app running; integration stays DB-only."""
+    def gen():
+        import json as _json
+        import time as _time
+        last, last_ping = None, 0.0
+        while True:
+            woke = _BL_EVT.wait(timeout=0.5)
+            if woke:
+                _BL_EVT.clear()
+                _time.sleep(0.03)          # let the txn land
+            try:
+                p = _blotter_payload(dfrom, dto, ticker, ttype)
+                if p["sig"] != last:
+                    last = p["sig"]
+                    yield "event: rows\ndata: " + _json.dumps(p) + "\n\n"
+                elif _time.time() - last_ping > 10:
+                    last_ping = _time.time()
+                    yield ": ping\n\n"
+            except GeneratorExit:
+                return
+            except Exception as e:
+                yield ("event: err\ndata: " +
+                       _json.dumps({"error": str(e)}) + "\n\n")
+                _time.sleep(1)
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
+
+
+class BlotterEdit(BaseModel):
+    trade_id: int
+    field: str = ""                    # legacy single-field form
+    value: str = ""
+    fields: Optional[Dict[str, Any]] = None   # excel-style multi-cell
+    token: str = ""
+    user: str = "lagrange"
+
+
+# When the blotter app is RUNNING, route writes through its own WebSocket:
+# main.py validates + writes + audits + broadcasts to every open blotter
+# screen instantly (single-writer consistency). When it is down/unreachable,
+# fall back to the direct-DB pipeline below (identical rules); its clients
+# then sync on their next touch, as before.
+BLOTTER_WS = os.environ.get("BLOTTER_WS", "ws://127.0.0.1:3306/ws")
+import threading as _thr
+_BL_EVT = _thr.Event()          # wakes SSE streams the instant anything changes
+
+
+def _bl_notify():
+    _BL_EVT.set()
+
+
+async def _blotter_ws_listener():
+    """Persistent subscriber to the blotter app's broadcast hub. Any update /
+    insert / delete from ANY blotter user wakes Lagrange's SSE streams within
+    milliseconds. Reconnects forever; harmless when the app is down."""
+    if os.environ.get("BLOTTER_WS_MODE", "auto") == "off":
+        return
+    try:
+        import websockets as _ws
+    except Exception:
+        return
+    import asyncio as _aio
+    while True:
+        try:
+            async with _ws.connect(BLOTTER_WS, open_timeout=2,
+                                   close_timeout=1) as conn:
+                async for raw in conn:
+                    try:
+                        t = json.loads(raw).get("type")
+                    except Exception:
+                        continue
+                    if t in ("update", "insert", "delete", "delete_many"):
+                        _bl_notify()
         except Exception:
             pass
+        await _aio.sleep(2)
+
+_BL_CONFLICT_MSG = ("This row was changed by someone else \u2014 reloaded "
+                    "the latest values.")
+
+
+def _bl_ws_ser(v):
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    if isinstance(v, float) and v == int(v):
+        return str(int(v))
+    return str(v)
+
+
+def _blotter_edit_via_app(req, user):
+    """Returns a response dict/JSONResponse, or None to fall back to DB."""
+    if os.environ.get("BLOTTER_WS_MODE", "auto") == "off":
+        return None
     try:
-        th = db_meta_get("flagTh")
-        if isinstance(th, dict):
-            STATE["flagTh"].update({k: float(v) for k, v in th.items()
-                                    if k in STATE["flagTh"]})
+        from websockets.sync.client import connect as _ws_connect
     except Exception:
-        pass
-    refresh_stock_rics()
-    logger.info("startup: %d ids (%s), %d state rows",
-                len(STATE["ids"]), src, len(STATE["rows"]))
+        return None
+    raw_fields = dict(req.fields) if req.fields else {req.field: req.value}
+    try:
+        with _ws_connect(BLOTTER_WS, open_timeout=1.2, close_timeout=0.5) as ws:
+            ws.send(json.dumps({"action": "update", "trade_id": req.trade_id,
+                                "row_version": req.token or "0",
+                                "fields": raw_fields, "user": user}))
+            changes, new_rv = {}, None
+            deadline = time.time() + 4.0
+            while time.time() < deadline:
+                try:
+                    raw = ws.recv(timeout=0.4 if changes else
+                                  max(0.05, deadline - time.time()))
+                except TimeoutError:
+                    if changes:
+                        break            # drain finished
+                    continue
+                try:
+                    m = json.loads(raw)
+                except Exception:
+                    continue
+                if m.get("trade_id") != req.trade_id and \
+                        str(m.get("trade_id")) != str(req.trade_id):
+                    continue
+                t = m.get("type")
+                if t == "reject":
+                    msg = m.get("message", "rejected")
+                    code = 409 if msg == _BL_CONFLICT_MSG else 400
+                    return JSONResponse(status_code=code, content={
+                        "ok": False, "error": msg, "via": "blotter-app"})
+                if t == "delete":
+                    return JSONResponse(status_code=404, content={
+                        "ok": False, "error": "trade not found",
+                        "via": "blotter-app"})
+                if t == "update" and m.get("user") == user:
+                    changes[m.get("field")] = _bl_ws_ser(m.get("value"))
+                    new_rv = m.get("row_version")
+            if changes:
+                _bl_notify()
+                return {"ok": True, "token": str(new_rv),
+                        "changes": changes, "via": "blotter-app"}
+            return {"ok": True, "nochange": True,
+                    "token": str(req.token or 0), "via": "blotter-app"}
+    except Exception:
+        return None                      # app down/unreachable -> direct DB
 
 
-def ensure_schema_state() -> None:
-    conn = _db()
+@app.post("/api/blotter/edit")
+def api_blotter_edit(req: BlotterEdit, request: Request):
+    raw_fields = dict(req.fields) if req.fields else {req.field: req.value}
+    user = ((getattr(request.state, "auth", None) or {}).get("user")
+            or (req.user or "lagrange").strip()[:50] or "lagrange")
+    bad = [f for f in raw_fields if f not in BLOTTER_EDITABLE]
+    if bad:
+        return JSONResponse(status_code=400, content={
+            "ok": False, "error": f"Field '{bad[0]}' is not editable."})
+    via_app = _blotter_edit_via_app(req, user)
+    if via_app is not None:
+        return via_app
+    try:
+        conn = rc.connect()
+        try:
+            m = _blotter_schema(conn)
+            if not m.get("row_version"):
+                return JSONResponse(status_code=400, content={
+                    "ok": False,
+                    "error": "excel-style editing needs the row_version "
+                             "column (this schema lacks it)"})
+            missing_phys = [f for f in raw_fields if not m.get(f)]
+            if missing_phys:
+                return JSONResponse(status_code=400, content={
+                    "ok": False,
+                    "error": f"'{missing_phys[0]}' does not exist in "
+                             f"{BLOTTER_DB}.{BLOTTER_TABLE}"})
+            # settlement is resolved against the trade date, main.py-style
+            settlement_raw = raw_fields.pop("settlement_date", "__UNSET__")
+            coerced = {}
+            for f, v in raw_fields.items():
+                cv = _bl_coerce(f, v)
+                _bl_validate(f, cv)
+                coerced[f] = cv
+            idc = m["trade_id"]
+            sel = ", ".join(f"`{m[l]}` AS `{l}`" for l in BLOTTER_CANDIDATES
+                            if m.get(l))
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT {sel} FROM "
+                            f"{BLOTTER_DB}.{BLOTTER_TABLE} "
+                            f"WHERE `{idc}`=%s FOR UPDATE", (req.trade_id,))
+                hit = cur.fetchone()
+                if not hit:
+                    conn.rollback()
+                    return JSONResponse(status_code=404, content={
+                        "ok": False, "error": "trade not found"})
+                cols = [d[0] for d in cur.description]
+                current = dict(zip(cols, hit))
+                if int(current.get("row_version") or 0) != int(req.token or 0):
+                    conn.rollback()
+                    return JSONResponse(status_code=409, content={
+                        "ok": False,
+                        "error": "Row changed underneath you (someone else "
+                                 "edited it) - refreshing; please re-apply."})
+                # booked lock, hedge-exempt - main.py's exact rule + message
+                if current.get("booked"):
+                    attempted = set(coerced)
+                    if settlement_raw != "__UNSET__":
+                        attempted.add("settlement_date")
+                    if not attempted <= (BL_HEDGE | {"booked"}):
+                        conn.rollback()
+                        return JSONResponse(status_code=423, content={
+                            "ok": False,
+                            "error": "This trade is booked and locked. "
+                                     "Un-tick Booked first to edit it "
+                                     "(hedge state can still be changed)."})
+
+                def cur_norm(f):
+                    v = current.get(f)
+                    if f in BL_BOOL:
+                        return None if v is None else (1 if v else 0)
+                    if f in BL_NUM and v is not None:
+                        return _Dec(str(v))
+                    if f in BL_DATE | {"settlement_date"} and v not in (None, ""):
+                        return _bl_parse_date(v)
+                    return v if v not in ("",) else None
+
+                changes = {f: v for f, v in coerced.items()
+                           if cur_norm(f) != v}
+                if settlement_raw != "__UNSET__":
+                    eff_td = changes.get("trade_date", current.get("trade_date"))
+                    sval = _bl_settlement(settlement_raw, eff_td)
+                    if cur_norm("settlement_date") != sval:
+                        changes["settlement_date"] = sval
+                # server-side auto-fill, never overriding explicit fields
+                for f in list(changes):
+                    if f in BL_AUTOFILL and changes[f] is not None:
+                        tbl, keyc, colmap = BL_AUTOFILL[f]
+                        cur.execute(
+                            f"SELECT {', '.join(set(colmap.values()))} "
+                            f"FROM {BLOTTER_DB}.{tbl} WHERE `{keyc}`=%s "
+                            f"LIMIT 1", (str(changes[f]),))
+                        row = cur.fetchone()
+                        if row is not None:
+                            mv = dict(zip([d[0] for d in cur.description], row))
+                            for tcol, mcol in colmap.items():
+                                nv = mv.get(mcol)
+                                if tcol not in changes and \
+                                        cur_norm(tcol) != (
+                                            _Dec(str(nv)) if tcol in BL_NUM
+                                            and nv is not None else nv):
+                                    changes[tcol] = nv
+                if not changes:
+                    conn.rollback()
+                    return {"ok": True, "nochange": True,
+                            "token": str(current.get("row_version"))}
+                sets = [f"`{m[f]}`=%s" for f in changes]
+                vals = [None if v is None else
+                        (v.isoformat() if isinstance(v, _date) else v)
+                        for v in changes.values()]
+                sets += [f"`{m['last_updated']}`=NOW()",
+                         f"`{m['updated_by']}`=%s",
+                         f"`{m['row_version']}`=`{m['row_version']}`+1"]
+                vals += [user, req.trade_id, int(req.token or 0)]
+                cur.execute(
+                    f"UPDATE {BLOTTER_DB}.{BLOTTER_TABLE} "
+                    f"SET {', '.join(sets)} "
+                    f"WHERE `{idc}`=%s AND `{m['row_version']}`=%s", vals)
+                if cur.rowcount != 1:
+                    conn.rollback()
+                    return JSONResponse(status_code=409, content={
+                        "ok": False,
+                        "error": "Row changed underneath you - refreshing."})
+                for f, nv in changes.items():
+                    _blotter_audit(cur, req.trade_id, f,
+                                   _bl_ser(current.get(f)) or None,
+                                   _bl_ser(nv) or None, user)
+            conn.commit()
+            _bl_notify()
+            return {"ok": True,
+                    "token": str(int(req.token or 0) + 1),
+                    "changes": {f: _bl_ser(v) for f, v in changes.items()},
+                    "via": "direct-db"}
+        finally:
+            conn.close()
+    except BLVal as e:
+        return JSONResponse(status_code=400,
+                            content={"ok": False, "error": str(e)})
+    except Exception as e:
+        return JSONResponse(status_code=500,
+                            content={"ok": False, "error": str(e)})
+
+
+# ----------------------------------------------------------------------
+# RFQ Station (cba_app.rfq / rfq_log)
+# Lines mirror trade_blotter vocabulary on purpose: when an RFQ reaches
+# DONE it should map field-for-field onto a trade_blotter insert
+# (isin->isin, short_name->bond_name [autofill via bond_mappings],
+#  ccy->bond_currency, qty->quantity, client->client_name,
+#  style outright/vs -> trade_type, hit side -> client_side,
+#  executed px -> price, stock_ref->stock_ref, delta->delta).
+# The actual upload is deliberately NOT implemented yet.
+# ----------------------------------------------------------------------
+# ======================================================================
+#  AUTH: login + trader / sales roles
+#  Users live in cba_app.app_user (PBKDF2-SHA256). Sessions are
+#  in-memory HttpOnly cookies (12h sliding) - a desk-LAN level of
+#  security, not internet-grade. FILE test mode swaps the table for an
+#  in-memory dict so the whole flow is testable without MariaDB.
+# ======================================================================
+AUTH_COOKIE = "lagr_sess"
+AUTH_TTL = 12 * 3600
+AUTH_INVITE = os.environ.get("LAGRANGE_INVITE", "citi-cb")
+AUTH_ROLES = ("trader", "sales")
+SESSIONS: Dict[str, Dict[str, Any]] = {}
+_AUTH_READY = False
+_AUTH_FILE_USERS: Dict[str, Dict[str, str]] = {}
+
+
+def _ensure_auth():
+    global _AUTH_READY
+    if _AUTH_READY or os.environ.get("LAGRANGE_TEST_LIVE") == "FILE":
+        _AUTH_READY = True
+        return
+    conn = rc.connect()
     try:
         with conn.cursor() as cur:
-            cur.execute(f"CREATE DATABASE IF NOT EXISTS {APP_DB} "
-                        f"DEFAULT CHARSET utf8mb4")
-            cur.execute(STATE_DDL)
-            cur.execute(f"ALTER TABLE {APP_DB}.cb_state ADD COLUMN IF NOT "
-                        f"EXISTS n_gamma VARCHAR(32) NULL AFTER und_fx")
-            cur.execute(f"ALTER TABLE {APP_DB}.cb_state ADD COLUMN IF NOT "
-                        f"EXISTS or_bid_sprd VARCHAR(16) NULL AFTER n_gamma")
-            cur.execute(f"ALTER TABLE {APP_DB}.cb_state ADD COLUMN IF NOT "
-                        f"EXISTS or_ask_sprd VARCHAR(16) NULL "
-                        f"AFTER or_bid_sprd")
-            cur.execute(META_DDL)
-            cur.execute(EVENTS_DDL)
+            cur.execute("""CREATE TABLE IF NOT EXISTS cba_app.app_user (
+              user_id INT PRIMARY KEY AUTO_INCREMENT,
+              username VARCHAR(50) UNIQUE,
+              pw_hash VARCHAR(200),
+              role ENUM('trader','sales') DEFAULT 'sales',
+              created_at DATETIME, last_login DATETIME NULL
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""")
+        conn.commit()
+        _AUTH_READY = True
+    finally:
+        conn.close()
+
+
+def _hash_pw(pw: str) -> str:
+    salt = secrets.token_hex(16)
+    h = hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt),
+                            200_000).hex()
+    return f"pbkdf2$200000${salt}${h}"
+
+
+def _check_pw(pw: str, stored: str) -> bool:
+    try:
+        _algo, iters, salt, h = (stored or "").split("$")
+        calc = hashlib.pbkdf2_hmac("sha256", pw.encode(),
+                                   bytes.fromhex(salt),
+                                   int(iters)).hex()
+        return hmac.compare_digest(calc, h)
+    except Exception:
+        return False
+
+
+def _auth_get_user(username: str):
+    if os.environ.get("LAGRANGE_TEST_LIVE") == "FILE":
+        return _AUTH_FILE_USERS.get(username)
+    conn = rc.connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT username, pw_hash, role FROM "
+                        "cba_app.app_user WHERE username=%s",
+                        (username,))
+            r = cur.fetchone()
+            return None if not r else {"username": r[0],
+                                       "pw_hash": r[1], "role": r[2]}
+    finally:
+        conn.close()
+
+
+def _auth_add_user(username: str, pw_hash: str, role: str):
+    if os.environ.get("LAGRANGE_TEST_LIVE") == "FILE":
+        if username in _AUTH_FILE_USERS:
+            raise BLVal("Username already taken.")
+        _AUTH_FILE_USERS[username] = {"username": username,
+                                      "pw_hash": pw_hash, "role": role}
+        return
+    conn = rc.connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM cba_app.app_user WHERE "
+                        "username=%s", (username,))
+            if cur.fetchone():
+                raise BLVal("Username already taken.")
+            cur.execute("INSERT INTO cba_app.app_user (username, "
+                        "pw_hash, role, created_at) VALUES "
+                        "(%s,%s,%s,NOW())", (username, pw_hash, role))
         conn.commit()
     finally:
         conn.close()
 
 
-def refresh_stock_rics() -> None:
+def _auth_touch_login(username: str):
+    if os.environ.get("LAGRANGE_TEST_LIVE") == "FILE":
+        return
     try:
-        m = fetch_ric_map(STATE["ids"])
-        STATE["stockRics"] = {sid: d.get("ric", "") for sid, d in m.items()}
-    except Exception as exc:
-        logger.warning("stock ric refresh failed: %s", exc)
-
-
-def poll_rics() -> List[str]:
-    out = set()
-    for sid in STATE["ids"]:
-        r = STATE["stockRics"].get(sid, "")
-        if r:
-            out.add(r)
-        fx = (STATE["rows"].get(sid) or {}).get("und_fx", "").strip()
-        if fx:
-            try:
-                float(fx)
-            except ValueError:
-                out.add(fx)
-    return sorted(out)
-
-
-async def rfx_poller():
-    global RFX_WAKE, _RD, _RD
-    RFX_WAKE = asyncio.Event()
-    logger.info("Refinitiv poller started (every %ss)", STATE["refreshSec"])
-    cooldown_until = 0.0
-    while True:
+        conn = rc.connect()
         try:
-            rics = poll_rics()
-            if not rics:
-                err = ("no RICs to poll yet - set und_fx on rows and/or "
-                       "wait for EQRMS stock RICs")
-                if STATE["rfxErr"] != err:
-                    STATE["rfxErr"] = err
-                    logger.warning(err)
-                    await broadcast({"type": "rfxErr", "error": err})
-            elif _RD_OPENING:
-                err = ("opening Refinitiv session - first connection can "
-                       "take 1-2 minutes ...")
-                if STATE["rfxErr"] != err:
-                    STATE["rfxErr"] = err
-                    logger.info(err)
-                    await broadcast({"type": "rfxErr", "error": err})
-            elif (asyncio.get_event_loop().time() < cooldown_until
-                  and not RFX_WAKE.is_set()):
-                pass                       # backing off after a hang/timeout
-            else:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE cba_app.app_user SET "
+                            "last_login=NOW() WHERE username=%s",
+                            (username,))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
+def _new_sess(user: str, role: str) -> str:
+    tok = secrets.token_urlsafe(32)
+    SESSIONS[tok] = {"user": user, "role": role, "ts": time.time()}
+    return tok
+
+
+def _get_sess(tok: str):
+    s = SESSIONS.get(tok or "")
+    if not s:
+        return None
+    if time.time() - s["ts"] > AUTH_TTL:
+        SESSIONS.pop(tok, None)
+        return None
+    s["ts"] = time.time()                      # sliding expiry
+    return s
+
+
+class AuthLogin(BaseModel):
+    username: str
+    password: str
+
+
+class AuthRegister(BaseModel):
+    username: str
+    password: str
+    role: str = "sales"
+    invite: str = ""
+
+
+@app.post("/api/auth/login")
+def api_auth_login(req: AuthLogin):
+    try:
+        _ensure_auth()
+        u = _auth_get_user(req.username.strip())
+        if not u or not _check_pw(req.password, u["pw_hash"]):
+            return JSONResponse(status_code=401, content={
+                "ok": False, "error": "Wrong username or password."})
+        _auth_touch_login(u["username"])
+        tok = _new_sess(u["username"], u["role"])
+        resp = JSONResponse(content={"ok": True, "user": u["username"],
+                                     "role": u["role"]})
+        resp.set_cookie(AUTH_COOKIE, tok, httponly=True,
+                        samesite="lax", max_age=AUTH_TTL)
+        return resp
+    except Exception as e:
+        return JSONResponse(status_code=500,
+                            content={"ok": False, "error": str(e)})
+
+
+@app.post("/api/auth/register")
+def api_auth_register(req: AuthRegister):
+    try:
+        user = req.username.strip()[:50]
+        if not user or len(req.password) < 4:
+            raise BLVal("Username required; password min 4 chars.")
+        if req.role not in AUTH_ROLES:
+            raise BLVal("Role must be trader or sales.")
+        if req.invite != AUTH_INVITE:
+            raise BLVal("Wrong invite code - ask the desk.")
+        _ensure_auth()
+        _auth_add_user(user, _hash_pw(req.password), req.role)
+        return {"ok": True, "user": user, "role": req.role}
+    except BLVal as e:
+        return JSONResponse(status_code=400,
+                            content={"ok": False, "error": str(e)})
+    except Exception as e:
+        return JSONResponse(status_code=500,
+                            content={"ok": False, "error": str(e)})
+
+
+@app.post("/api/auth/logout")
+def api_auth_logout(request: Request):
+    SESSIONS.pop(request.cookies.get(AUTH_COOKIE, ""), None)
+    resp = JSONResponse(content={"ok": True})
+    resp.delete_cookie(AUTH_COOKIE)
+    return resp
+
+
+@app.get("/api/auth/me")
+def api_auth_me(request: Request):
+    s = getattr(request.state, "auth", None)
+    if not s:
+        return JSONResponse(status_code=401,
+                            content={"ok": False,
+                                     "error": "login required"})
+    return {"ok": True, "user": s["user"], "role": s["role"]}
+
+
+_PREF_FILE: Dict[str, Dict[str, str]] = {}
+_PREF_READY = False
+
+
+def _ensure_pref():
+    global _PREF_READY
+    if _PREF_READY or os.environ.get("LAGRANGE_TEST_LIVE") == "FILE":
+        _PREF_READY = True
+        return
+    conn = rc.connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""CREATE TABLE IF NOT EXISTS cba_app.app_pref (
+              username VARCHAR(50), pref_key VARCHAR(80),
+              pref_val MEDIUMTEXT, updated_at DATETIME,
+              PRIMARY KEY (username, pref_key)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""")
+        conn.commit()
+        _PREF_READY = True
+    finally:
+        conn.close()
+
+
+class PrefSet(BaseModel):
+    key: str
+    val: str = ""
+
+
+@app.get("/api/pref")
+def api_pref_get(request: Request):
+    try:
+        user = (getattr(request.state, "auth", None) or {}).get("user")
+        if not user:
+            return JSONResponse(status_code=401, content={
+                "ok": False, "error": "login required"})
+        _ensure_pref()
+        if os.environ.get("LAGRANGE_TEST_LIVE") == "FILE":
+            return {"ok": True,
+                    "prefs": dict(_PREF_FILE.get(user, {}))}
+        conn = rc.connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT pref_key, pref_val FROM "
+                            "cba_app.app_pref WHERE username=%s",
+                            (user,))
+                return {"ok": True,
+                        "prefs": {k: v for k, v in cur.fetchall()}}
+        finally:
+            conn.close()
+    except Exception as e:
+        return JSONResponse(status_code=500,
+                            content={"ok": False, "error": str(e)})
+
+
+@app.post("/api/pref")
+def api_pref_set(req: PrefSet, request: Request):
+    try:
+        user = (getattr(request.state, "auth", None) or {}).get("user")
+        if not user:
+            return JSONResponse(status_code=401, content={
+                "ok": False, "error": "login required"})
+        key = (req.key or "").strip()[:80]
+        if not key:
+            return JSONResponse(status_code=400, content={
+                "ok": False, "error": "key required"})
+        _ensure_pref()
+        if os.environ.get("LAGRANGE_TEST_LIVE") == "FILE":
+            _PREF_FILE.setdefault(user, {})[key] = req.val
+            return {"ok": True}
+        conn = rc.connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO cba_app.app_pref "
+                            "(username, pref_key, pref_val, "
+                            "updated_at) VALUES (%s,%s,%s,NOW()) "
+                            "ON DUPLICATE KEY UPDATE "
+                            "pref_val=VALUES(pref_val), "
+                            "updated_at=NOW()",
+                            (user, key, req.val))
+            conn.commit()
+            return {"ok": True}
+        finally:
+            conn.close()
+    except Exception as e:
+        return JSONResponse(status_code=500,
+                            content={"ok": False, "error": str(e)})
+
+
+AUTH_OPEN = ("/login", "/api/auth/login", "/api/auth/register",
+             "/api/auth/logout", "/favicon.ico")
+SALES_BLOCK_PREFIX = ("/api/delta/", "/api/nuke/", "/api/blotter/",
+                      "/api/bau/", "/api/twcb/")
+SALES_BLOCK_EXACT = ("/api/refresh", "/api/send", "/api/rfq/ack",
+                     "/api/rfq/quote", "/api/rfq/pull",
+                     "/api/rfq/upload", "/api/rfq/reject", "/api/rfq/delete", "/api/rfq/nkedit")
+
+
+@app.middleware("http")
+async def _auth_middleware(request: Request, call_next):
+    path = request.url.path
+    if path in AUTH_OPEN:
+        return await call_next(request)
+    s = _get_sess(request.cookies.get(AUTH_COOKIE, ""))
+    if not s:
+        if path.startswith("/api/") or "/api/" in path:
+            # API callers (incl. mounted apps at /dscan/api/...)
+            # must get JSON, never a login-page redirect
+            return JSONResponse(status_code=401, content={
+                "ok": False, "error": "login required",
+                "login": "/login"})
+        return RedirectResponse("/login", status_code=302)
+    request.state.auth = s
+    if (s["role"] == "sales"
+            and (s.get("user") or "") != "jb33880") and (
+            path in SALES_BLOCK_EXACT or
+            any(path.startswith(p) for p in SALES_BLOCK_PREFIX)):
+        return JSONResponse(status_code=403, content={
+            "ok": False,
+            "error": "sales role - trader-only function"})
+    resp = await call_next(request)
+    if request.method == "POST" and \
+            path.startswith("/api/rfq/"):
+        _rfq_snap_bust()             # writers invalidate instantly
+    return resp
+
+
+PAGE_LOGIN = r"""<!doctype html><html><head><meta charset="utf-8">
+<title>Lagrange - sign in</title><style>
+body{font:13px 'Segoe UI',Consolas,sans-serif;background:#f6f4ef;
+  display:flex;align-items:center;justify-content:center;height:100vh;
+  margin:0}
+.card{background:#fff;border:1px solid #d8d4cc;border-top:3px solid
+  #1c1c1c;padding:22px 26px;width:320px;
+  box-shadow:0 6px 18px rgba(0,0,0,.08)}
+h1{font-size:14px;letter-spacing:1.4px;margin:0 0 2px}
+.sub{color:#8a857b;font-size:11px;margin-bottom:14px}
+label{display:block;color:#6e6a63;font-size:10px;letter-spacing:.6px;
+  text-transform:uppercase;margin:9px 0 3px}
+input,select{width:100%;box-sizing:border-box;padding:6px 8px;
+  border:1px solid #c9c4b8;font:inherit;background:#fffdf6}
+input:focus,select:focus{outline:none;border-color:#8a5b00}
+button{width:100%;margin-top:14px;padding:7px;border:1px solid
+  #1c1c1c;background:#1c1c1c;color:#fff;font:inherit;font-weight:700;
+  letter-spacing:.8px;cursor:pointer}
+button:hover{background:#3a3a3a}
+.alt{margin-top:12px;text-align:center;font-size:11px;color:#6e6a63;
+  cursor:pointer;text-decoration:underline}
+#reg{display:none}
+.err{color:#a8231b;font-size:11px;margin-top:9px;min-height:14px}
+</style></head><body>
+<div class="card">
+  <h1>LAGRANGE</h1><div class="sub">CB desk workstation - sign in</div>
+  <div id="lg">
+    <label>username</label><input id="l_user" autocomplete="username">
+    <label>password</label><input id="l_pw" type="password"
+      autocomplete="current-password">
+    <button id="b_login">Sign in</button>
+    <div class="alt" id="to_reg">first time? create a user</div>
+  </div>
+  <div id="reg">
+    <label>username</label><input id="r_user">
+    <label>password</label><input id="r_pw" type="password">
+    <label>role</label><select id="r_role">
+      <option value="trader">trader</option>
+      <option value="sales">sales</option></select>
+    <label>desk invite code</label><input id="r_inv">
+    <button id="b_reg">Create user</button>
+    <div class="alt" id="to_lg">back to sign in</div>
+  </div>
+  <div class="err" id="l_err"></div>
+</div>
+<script>
+const $=i=>document.getElementById(i);
+$('to_reg').onclick=()=>{$('lg').style.display='none';
+  $('reg').style.display='block';$('l_err').textContent='';};
+$('to_lg').onclick=()=>{$('reg').style.display='none';
+  $('lg').style.display='block';$('l_err').textContent='';};
+async function post(u,b){const r=await fetch(u,{method:'POST',
+  headers:{'Content-Type':'application/json'},
+  body:JSON.stringify(b)});return r.json();}
+$('b_login').onclick=async()=>{
+  const j=await post('/api/auth/login',
+    {username:$('l_user').value.trim(),password:$('l_pw').value});
+  if(j.ok) location.href='/';
+  else $('l_err').textContent=j.error||'login failed';
+};
+$('l_pw').addEventListener('keydown',e=>{
+  if(e.key==='Enter')$('b_login').click();});
+$('b_reg').onclick=async()=>{
+  const j=await post('/api/auth/register',
+    {username:$('r_user').value.trim(),password:$('r_pw').value,
+     role:$('r_role').value,invite:$('r_inv').value.trim()});
+  if(j.ok){$('l_err').textContent='Created - sign in now.';
+    $('to_lg').onclick();}
+  else $('l_err').textContent=j.error||'register failed';
+};
+</script></body></html>"""
+
+
+@app.get("/login", response_class=HTMLResponse)
+def page_login():
+    return PAGE_LOGIN
+
+
+RFQ_STYLES = ("outright", "vs", "working")
+RFQ_SIDES = ("two_way", "bid", "ask")
+RFQ_STATUS = ("REQUESTED", "QUOTED", "WORKING", "HIT", "DONE", "CANCELLED")
+RFQ_LIST_TTL = float(os.environ.get("LAGRANGE_LIST_TTL", "2.0"))
+RFQ_SNAP: Dict[str, Any] = {"ts": 0.0, "data": None}
+
+
+def _rfq_snap_bust():
+    RFQ_SNAP["ts"] = 0.0   # stale-mark only; keep last data
+    # (data retained: mutations serve stale instantly, bg refreshes)
+RFQ_EDITABLE = {"isin", "ccy", "style", "sides", "qty", "client",
+                "stock_ref", "fx_ref", "delta", "notes", "tol",
+                "ord_level", "ord_level2", "req_vs", "req_fx", "q_delta", "db1", "db1s", "db2", "db2s", "da1", "da1s", "da2", "da2s", "auto_q",
+                "status", "hit", "trade_date"}
+_RFQ_READY = False
+
+
+def _ensure_rfq():
+    global _RFQ_READY
+    if _RFQ_READY:
+        return
+    conn = rc.connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""CREATE TABLE IF NOT EXISTS cba_app.rfq (
+              rfq_id INT PRIMARY KEY AUTO_INCREMENT,
+              created_at DATETIME, created_by VARCHAR(50),
+              sec_id BIGINT NULL, short_name VARCHAR(64),
+              isin VARCHAR(12) NULL, ccy VARCHAR(10) NULL,
+              style ENUM('outright','vs') DEFAULT 'outright',
+              sides ENUM('two_way','bid','ask') DEFAULT 'two_way',
+              qty DECIMAL(20,2) NULL, client VARCHAR(100) NULL,
+              bid_px DECIMAL(18,6) NULL, ask_px DECIMAL(18,6) NULL,
+              stock_ref DECIMAL(18,6) NULL, delta DECIMAL(10,4) NULL,
+              notes TEXT NULL, hit ENUM('','bid','ask') DEFAULT '',
+              ric VARCHAR(50) NULL, und_fx VARCHAR(24) NULL,
+              sec_fx VARCHAR(10) NULL, fx_ref DECIMAL(18,6) NULL,
+              bid_at DATETIME NULL, ask_at DATETIME NULL,
+              q_spot DECIMAL(18,6) NULL, q_fx DECIMAL(18,6) NULL,
+              status ENUM('OPEN','QUOTED','DONE','CANCELLED')
+                DEFAULT 'OPEN',
+              last_updated TIMESTAMP DEFAULT current_timestamp()
+                ON UPDATE current_timestamp(),
+              updated_by VARCHAR(50), row_version INT DEFAULT 0
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS cba_app.rfq_log (
+              log_id BIGINT PRIMARY KEY AUTO_INCREMENT, rfq_id INT,
+              field_name VARCHAR(50), old_value TEXT, new_value TEXT,
+              changed_by VARCHAR(50), changed_at DATETIME)""")
+            for ddl in (
+                "ALTER TABLE cba_app.rfq ADD COLUMN hit "
+                "ENUM('','bid','ask') DEFAULT ''",
+                "ALTER TABLE cba_app.rfq ADD COLUMN bid_at DATETIME NULL",
+                "ALTER TABLE cba_app.rfq ADD COLUMN ask_at DATETIME NULL",
+                "ALTER TABLE cba_app.rfq ADD COLUMN q_spot DECIMAL(18,6) NULL",
+                "ALTER TABLE cba_app.rfq ADD COLUMN q_fx DECIMAL(18,6) NULL",
+                "ALTER TABLE cba_app.rfq ADD COLUMN ric VARCHAR(50) NULL",
+                "ALTER TABLE cba_app.rfq ADD COLUMN und_fx VARCHAR(24) NULL",
+                "ALTER TABLE cba_app.rfq ADD COLUMN sec_fx VARCHAR(10) NULL",
+                "ALTER TABLE cba_app.rfq MODIFY sec_fx VARCHAR(10) NULL",
+                "ALTER TABLE cba_app.rfq ADD COLUMN fx_ref DECIMAL(18,6) NULL",
+                "ALTER TABLE cba_app.rfq MODIFY style ENUM('outright','vs','working') DEFAULT 'outright'",
+                "ALTER TABLE cba_app.rfq MODIFY status ENUM('OPEN','QUOTED','WORKING','DONE','CANCELLED') DEFAULT 'OPEN'",
+                "ALTER TABLE cba_app.rfq ADD COLUMN ack_by VARCHAR(50) NULL",
+                "ALTER TABLE cba_app.rfq ADD COLUMN ack_at DATETIME NULL",
+                "ALTER TABLE cba_app.rfq MODIFY status ENUM('OPEN','QUOTED','QUOTING','WORKING','DONE','CANCELLED') DEFAULT 'QUOTING'",
+                "UPDATE cba_app.rfq SET status='QUOTING' WHERE status IN ('OPEN','QUOTED')",
+                "ALTER TABLE cba_app.rfq MODIFY status ENUM('QUOTING','WORKING','DONE','CANCELLED') DEFAULT 'QUOTING'",
+                "ALTER TABLE cba_app.rfq ADD COLUMN trade_date DATE NULL",
+                "UPDATE cba_app.rfq SET trade_date=DATE(created_at) WHERE trade_date IS NULL",
+                "ALTER TABLE cba_app.rfq MODIFY status ENUM('QUOTING','REQUESTED','QUOTED','WORKING','DONE','CANCELLED') DEFAULT 'REQUESTED'",
+                "UPDATE cba_app.rfq SET status='QUOTED' WHERE status='QUOTING' AND (bid_px IS NOT NULL OR ask_px IS NOT NULL)",
+                "UPDATE cba_app.rfq SET status='REQUESTED' WHERE status='QUOTING'",
+                "ALTER TABLE cba_app.rfq MODIFY status ENUM('REQUESTED','QUOTED','WORKING','DONE','CANCELLED') DEFAULT 'REQUESTED'",
+                "ALTER TABLE cba_app.rfq ADD COLUMN q_rev INT DEFAULT 0",
+                "CREATE TABLE IF NOT EXISTS cba_app.rfq_quote_hist ("
+                "  hist_id BIGINT PRIMARY KEY AUTO_INCREMENT, rfq_id INT, "
+                "  rev INT, bid DECIMAL(18,6) NULL, ask DECIMAL(18,6) NULL, "
+                "  spot DECIMAL(18,6) NULL, fx DECIMAL(18,6) NULL, "
+                "  delta DECIMAL(10,4) NULL, quoted_by VARCHAR(50), "
+                "  quoted_at DATETIME, KEY idx_rfq (rfq_id, rev)) "
+                "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+                "ALTER TABLE cba_app.rfq_quote_hist ADD COLUMN action VARCHAR(12) NULL",
+                "ALTER TABLE cba_app.rfq ADD COLUMN refresh_by VARCHAR(50) NULL",
+                "ALTER TABLE cba_app.rfq ADD COLUMN refresh_at DATETIME NULL",
+                "ALTER TABLE cba_app.rfq MODIFY status ENUM('REQUESTED','QUOTED','WORKING','HIT','DONE','CANCELLED') DEFAULT 'REQUESTED'",
+                "ALTER TABLE cba_app.rfq MODIFY status ENUM('OPEN','REQUESTED','QUOTED','QUOTING','WORKING','IMPROVE','HIT','DONE','CANCELLED','EXPIRED') DEFAULT 'REQUESTED'",
+                "UPDATE cba_app.rfq SET status='HIT' WHERE status='DONE' AND (ack_by IS NULL OR ack_by='')",
+                "ALTER TABLE cba_app.rfq ADD COLUMN tol DECIMAL(12,6) NULL",
+                "ALTER TABLE cba_app.rfq ADD COLUMN off_flag VARCHAR(12) NULL",
+                "ALTER TABLE cba_app.rfq ADD COLUMN off_by VARCHAR(50) NULL",
+                "ALTER TABLE cba_app.rfq ADD COLUMN off_at DATETIME NULL",
+                "ALTER TABLE cba_app.rfq ADD COLUMN ord_side VARCHAR(6) NULL",
+                "ALTER TABLE cba_app.rfq ADD COLUMN ord_level DECIMAL(14,6) NULL",
+                "ALTER TABLE cba_app.rfq ADD COLUMN auto_q TINYINT NULL",
+                "ALTER TABLE cba_app.rfq ADD COLUMN ord_level2 DECIMAL(14,6) NULL",
+                "ALTER TABLE cba_app.rfq ADD COLUMN adj_req TINYINT NULL",
+                "ALTER TABLE cba_app.rfq ADD COLUMN req_vs DECIMAL(14,6) NULL",
+                "ALTER TABLE cba_app.rfq ADD COLUMN req_fx DECIMAL(14,6) NULL",
+                "ALTER TABLE cba_app.rfq ADD COLUMN q_delta DECIMAL(8,2) NULL",
+                "ALTER TABLE cba_app.rfq ADD COLUMN off_bid DECIMAL(12,4) NULL",
+                "ALTER TABLE cba_app.rfq ADD COLUMN off_ask DECIMAL(12,4) NULL",
+                "CREATE TABLE IF NOT EXISTS cba_app.rfq_bond_cfg (isin VARCHAR(20) PRIMARY KEY, short_name VARCHAR(64), tol DECIMAL(12,6) NULL, autopilot TINYINT NULL, updated_by VARCHAR(50), updated_at DATETIME)"):
                 try:
-                    rows = await asyncio.wait_for(
-                        run_in_threadpool(fetch_refinitiv, rics),
-                        timeout=(120 if _RD is None
-                                 else max(30, STATE["refreshSec"] * 4)))
-                    if not rows:
-                        STATE["_rfxEmpty"] = STATE.get("_rfxEmpty", 0) + 1
-                        err = ("Refinitiv returned no data "
-                               f"({STATE['_rfxEmpty']}x) - Workspace warming "
-                               "up or logged out on the server; retrying")
-                        if STATE["rfxErr"] != err:
-                            STATE["rfxErr"] = err
-                            await broadcast({"type": "rfxErr", "error": err})
-                        if STATE["_rfxEmpty"] == 5:
-                            logger.warning("5 empty Refinitiv responses - "
-                                           "one session reset")
-                            try:
-                                _RD.close_session()
-                            except Exception:
-                                pass
-                            _RD = None
-                            STATE["_rfxEmpty"] = 0
-                    else:
-                        STATE["_rfxEmpty"] = 0
-                        for r in rows:
-                            if r.get("ric"):
-                                STATE["rfx"][r["ric"]] = r
-                        STATE["rfxTs"] = datetime.now().strftime("%H:%M:%S")
-                        if STATE["rfxErr"]:
-                            STATE["rfxErr"] = None
-                        await broadcast({"type": "rfx", "rows": rows,
-                                        "ts": STATE["rfxTs"]})
-                except asyncio.TimeoutError:
-                    cooldown_until = asyncio.get_event_loop().time() + 60
-                    try:
-                        if _RD is not None:
-                            _RD.close_session()
-                    except Exception:
-                        pass
-                    _RD = None      # reopen fresh on the next attempt
-                    err = ("Refinitiv timed out - session discarded, will "
-                           "reopen fresh. Is Workspace running and logged "
-                           "in on the server machine? (retrying every 60s; "
-                           "click the stock band's \u21bb to retry now)")
-                    if STATE["rfxErr"] != err:
-                        STATE["rfxErr"] = err
-                        logger.error(err)
-                        await broadcast({"type": "rfxErr", "error": err})
-                except ImportError:
-                    err = "refinitiv-data not installed on the server"
-                    if STATE["rfxErr"] != err:
-                        STATE["rfxErr"] = err
-                        logger.error(err)
-                        await broadcast({"type": "rfxErr", "error": err})
-                except Exception as exc:
-                    err = f"Refinitiv fetch failed: {exc}"
-                    if STATE["rfxErr"] != err:
-                        STATE["rfxErr"] = err
-                        logger.error(err)
-                        await broadcast({"type": "rfxErr", "error": err})
-        except Exception as exc:
-            logger.error("poller loop error: %s", exc)
-        try:
-            await asyncio.wait_for(RFX_WAKE.wait(),
-                                   timeout=max(2, STATE["refreshSec"]))
-            cooldown_until = 0.0           # manual wake overrides backoff
-        except asyncio.TimeoutError:
-            pass
-        RFX_WAKE.clear()
+                    cur.execute(ddl)
+                except Exception:
+                    pass                       # column already there
+        conn.commit()
+        _RFQ_READY = True
+    finally:
+        conn.close()
 
 
-# ------------------------------------------------------------------
-# API models
-# ------------------------------------------------------------------
-class OverrideEntry(BaseModel):
-    secId: int
-    ovdSpot: float = 0.0
-    ovdCbFx: float = 0.0
-    ovdUndFx: float = 0.0
+RFQ_STALE_SEC = int(os.environ.get("RFQ_STALE_SEC", "120"))
+RFQ_SPOT_TOL_PCT = float(os.environ.get("RFQ_SPOT_TOL_PCT", "0.5"))
+RFQ_FX_TOL_PCT = float(os.environ.get("RFQ_FX_TOL_PCT", "0.25"))
+RFQ_PX_TOL = float(os.environ.get("RFQ_PX_TOL", "0.05"))
+RFQ_QUOTE_TTL = float(os.environ.get("RFQ_QUOTE_TTL", "600"))   # quote timeout s
 
 
-class NukeRequest(BaseModel):
-    entries: List[OverrideEntry]
-
-
-class RefRequest(BaseModel):
-    sec_ids: List[int]
-
-
-class RicRequest(BaseModel):
-    rics: List[str]
-
-
-class SaveRequest(BaseModel):
-    rows: List[Dict[str, Any]]
-    user: str = "anon"
-
-
-AUTOSAVE_WAKE: Optional[asyncio.Event] = None
-
-
-def server_rows_for_save() -> List[Dict[str, Any]]:
-    """Autosave snapshot from server-held state: user fields, overrides,
-    spreads, and the last-nuke block. Client-only columns (company/ric/
-    live/eod/stk/fx and theo) stay NULL - the manual Save to DB button
-    remains the full-fidelity snapshot."""
-    out = []
-    for sid in STATE["ids"]:
-        row = STATE["rows"].get(sid, {})
-        nk = STATE["nuke"].get(sid, {}) or {}
-        out.append({
-            "sec_id": sid,
-            "short_name": row.get("short_name"),
-            "und_fx": row.get("und_fx"),
-            "ovd_spot": row.get("ovdSpot"),
-            "ovd_cbfx": row.get("ovdCbFx"),
-            "ovd_undfx": row.get("ovdUndFx"),
-            "n_bid": nk.get("nBid"), "n_delta": nk.get("nDelta"),
-            "n_spread": nk.get("nSpread"), "n_spot": nk.get("nSpot"),
-            "n_spotfx": nk.get("nSpotFx"),
-            "ovd_bid": nk.get("ovdMktBid"), "ovd_ask": nk.get("ovdMktAsk"),
-            "x_bid": row.get("x_bid"), "x_ask": row.get("x_ask"),
-            "x_both": row.get("x_both"), "vol_flag": row.get("vol_flag"),
-            "bond_type": row.get("bond_type"),
-        })
-    return out
-
-
-def _fnum0(v):
+def _rfq_refdata(sec_id):
+    """One security's refdata row: ric / sec_fx (ccy) / und_fx / isin.
+    Uses the embedded Nuke's build_refdata; FILE fixture for tests."""
+    if os.environ.get("LAGRANGE_TEST_LIVE") == "FILE":
+        st = _rfq_state() or {}
+        d = st.get("refdata", {}) or {}
+        return d.get(str(sec_id)) or d.get(sec_id) or {}
     try:
-        n = float(str(v).replace(",", ""))
-        return n
+        if _NUKE_MOD and sec_id not in (None, ""):
+            rows, _err = _NUKE_MOD.build_refdata([int(sec_id)])
+            return rows[0] if rows else {}
+    except Exception:
+        pass
+    return {}
+
+
+def _rfq_stock_ric(st, sec_id, fallback=""):
+    """stock RIC lives in STATE['stockRics'], not the nuke entry."""
+    sr = (st or {}).get("stockRics", {}) or {}
+    return (sr.get(sec_id) or sr.get(str(sec_id)) or
+            (sr.get(int(sec_id)) if str(sec_id).isdigit() else None) or
+            fallback or "")
+
+
+def _rfq_state():
+    """Nuke shared state; LAGRANGE_TEST_LIVE=FILE reads a JSON fixture."""
+    if os.environ.get("LAGRANGE_TEST_LIVE") == "FILE":
+        try:
+            with open("/tmp/rfq_test_live.json") as fh:
+                return json.load(fh)
+        except Exception:
+            return None
+    try:
+        return _NUKE_MOD.STATE if _NUKE_MOD else None
+    except Exception:
+        return None
+
+
+def _fnum(v):
+    try:
+        if v is None or str(v).strip() == "":
+            return None
+        return float(v)
     except (TypeError, ValueError):
         return None
 
 
-def ensure_snap8():
-    conn = _db()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(f"""CREATE TABLE IF NOT EXISTS {APP_DB}.quote_snap8 (
-              snap_date DATE NOT NULL, sec_id BIGINT NOT NULL,
-              short_name VARCHAR(64) NULL,
-              quote_bid DECIMAL(18,6) NULL, quote_ask DECIMAL(18,6) NULL,
-              mid DECIMAL(18,6) NULL, snapped_at DATETIME NULL,
-              PRIMARY KEY (snap_date, sec_id))""")
-            for ddl in (
-                f"ALTER TABLE {APP_DB}.quote_snap8 ADD COLUMN IF NOT "
-                "EXISTS isin VARCHAR(12) NULL",
-                f"ALTER TABLE {APP_DB}.quote_snap8 ADD COLUMN IF NOT "
-                "EXISTS ovd_bid DECIMAL(18,6) NULL",
-                f"ALTER TABLE {APP_DB}.quote_snap8 ADD COLUMN IF NOT "
-                "EXISTS ovd_ask DECIMAL(18,6) NULL",
-                f"ALTER TABLE {APP_DB}.quote_snap8 ADD COLUMN IF NOT "
-                "EXISTS indic_ask DECIMAL(18,6) NULL",
-                f"ALTER TABLE {APP_DB}.quote_snap8 ADD COLUMN IF NOT "
-                "EXISTS vs_ref DECIMAL(18,6) NULL",
-                f"ALTER TABLE {APP_DB}.quote_snap8 ADD COLUMN IF NOT "
-                "EXISTS fx_ref DECIMAL(18,6) NULL",
-                f"ALTER TABLE {APP_DB}.quote_snap8 ADD COLUMN IF NOT "
-                "EXISTS vs_usd DECIMAL(18,6) NULL",
-                f"ALTER TABLE {APP_DB}.quote_snap8 ADD COLUMN IF NOT "
-                "EXISTS delta_pct DECIMAL(10,2) NULL",
-                f"ALTER TABLE {APP_DB}.quote_snap8 ADD COLUMN IF NOT "
-                "EXISTS qty DECIMAL(20,2) NULL"):
-                cur.execute(ddl)
-        conn.commit()
-    finally:
-        conn.close()
+_NUKE_PX = {}
 
 
-def compute_snap8() -> int:
-    """Store today's QuoteBid/QuoteAsk (= override result +/- X adj) per
-    security; replace-by-date so a rerun overwrites the day cleanly."""
-    ensure_snap8()
-    today = date.today()
-    try:
-        rd_rows, _ = build_refdata(list(STATE["ids"]))
-        ref = {r["secId"]: r for r in rd_rows}
-    except Exception:
-        ref = {}
-    recs = []
-    for sid in STATE["ids"]:
-        nk = STATE["nuke"].get(sid, {}) or {}
-        row = STATE["rows"].get(sid, {}) or {}
-        rf = ref.get(sid, {}) or {}
-        b = _fnum0(nk.get("ovdMktBid"))
-        a = _fnum0(nk.get("ovdMktAsk"))
-        if b is None and a is None:
-            continue
-        x2 = _fnum0(row.get("x_both")) or 0.0
-        qb = None if b is None else b + (_fnum0(row.get("x_bid")) or 0.0) + x2
-        qa = None if a is None else a + (_fnum0(row.get("x_ask")) or 0.0) + x2
-        mid = None
-        if qb is not None and qa is not None:
-            mid = (qb + qa) / 2.0
-        nsprd = _fnum0(nk.get("nSpread"))
-        indic = qa if qa is not None else (
-            None if qb is None else qb + (nsprd if nsprd is not None
-                                          else 1.0))
-        vs = _fnum0(row.get("ovdSpot"))
-        fx = _fnum0(row.get("ovdUndFx"))
-        vs_usd = (vs / fx) if (vs is not None and fx) else None
-        nd = _fnum0(nk.get("nDelta"))
-        recs.append((today, sid, (row.get("short_name") or "")[:64],
-                     qb, qa, mid,
-                     (rf.get("isin") or "")[:12] or None,
-                     qb, qa, indic, vs, fx, vs_usd,
-                     None if nd is None else round(nd * 100.0, 1),
-                     _fnum0(rf.get("quantity_live"))))
-    conn = _db()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(f"DELETE FROM {APP_DB}.quote_snap8 "
-                        "WHERE snap_date=%s", (today,))
-            if recs:
-                cur.executemany(
-                    f"INSERT INTO {APP_DB}.quote_snap8 (snap_date, sec_id, "
-                    "short_name, quote_bid, quote_ask, mid, isin, ovd_bid, "
-                    "ovd_ask, indic_ask, vs_ref, fx_ref, vs_usd, delta_pct, "
-                    "qty, snapped_at) VALUES "
-                    "(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())",
-                    recs)
-        conn.commit()
-    finally:
-        conn.close()
-    logger.info("8am snapshot: %d securities stored for %s",
-                len(recs), today.isoformat())
-    return len(recs)
-
-
-def fetch_snap8_mids(sec_ids: List[int]) -> Dict[int, float]:
-    if not sec_ids:
-        return {}
-    try:
-        ensure_snap8()
-        conn = _db()
-        try:
-            with conn.cursor() as cur:
-                ph = ", ".join(["%s"] * len(sec_ids))
-                cur.execute(f"SELECT sec_id, mid FROM {APP_DB}.quote_snap8 "
-                            f"WHERE snap_date=%s AND sec_id IN ({ph})",
-                            [date.today()] + list(sec_ids))
-                return {int(r[0]): float(r[1]) for r in cur.fetchall()
-                        if r[1] is not None}
-        finally:
-            conn.close()
-    except Exception:
-        return {}
-
-
-async def snap8_poller():
-    """Daily 08:00 local marking snapshot of QuoteBid/QuoteAsk."""
-    logger.info("8am snapshot poller started")
-    while True:
-        now = datetime.now()
-        target = now.replace(hour=8, minute=0, second=0, microsecond=0)
-        if target <= now:
-            target += timedelta(days=1)
-        await asyncio.sleep((target - now).total_seconds())
-        try:
-            await run_in_threadpool(compute_snap8)
-            if REFDATA_WAKE:
-                REFDATA_WAKE.set()
-        except Exception as exc:
-            logger.warning("8am snapshot failed: %s", exc)
-
-
-async def autosave_poller():
-    global AUTOSAVE_WAKE
-    AUTOSAVE_WAKE = asyncio.Event()
-    logger.info("autosave poller started (every %ss, 0=off)",
-                STATE["autosaveSec"])
-    while True:
-        sec = STATE["autosaveSec"]
-        try:
-            await asyncio.wait_for(AUTOSAVE_WAKE.wait(),
-                                   timeout=(sec if sec > 0 else 60))
-        except asyncio.TimeoutError:
-            pass
-        AUTOSAVE_WAKE.clear()
-        if STATE["autosaveSec"] <= 0:
-            continue
-        try:
-            rows = server_rows_for_save()
-            if rows:
-                n = await run_in_threadpool(save_rows, rows)
-                logger.info("autosave: %d rows -> %s.%s",
-                            n, APP_DB, APP_TABLE)
-        except Exception as exc:
-            logger.error("autosave failed: %s", exc)
-
-
-@asynccontextmanager
-async def _lifespan(_app: FastAPI):
-    await run_in_threadpool(load_persisted_state)
-    asyncio.create_task(rfx_poller())
-    asyncio.create_task(refdata_poller())
-    asyncio.create_task(autosave_poller())
-    asyncio.create_task(div_poller())
-    asyncio.create_task(snap8_poller())
-    asyncio.create_task(vol_poller())
-    if RFX_WAKE:
-        RFX_WAKE.set()   # restored rows carry und_fx: first poll now
-    logger.info("CB Nuke Station serving on http://%s:%s  (share with the desk)",
-                HOST, PORT)
-    yield
-
-
-app = FastAPI(title="CB Nuke Station", lifespan=_lifespan)
-
-
-_LP_META = {"checked": False, "cols": set(), "key": None, "ts": None}
-_DIV_CACHE = {"ts": 0.0, "map": {}}
-
-
-def fetch_lp_rows(sec_ids: List[int]) -> Dict[int, Dict[str, Any]]:
-    """years_to_call / credit_spread_used (+ years_to_put when the table
-    has it) from cbanalytics.lp_model_output, newest row per security.
-    Schema introspected once - key and time columns differ across builds."""
-    if not sec_ids:
-        return {}
-    conn = _db()
-    try:
-        with conn.cursor() as cur:
-            if not _LP_META["checked"]:
-                cur.execute("SHOW COLUMNS FROM cbanalytics.lp_model_output")
-                _LP_META["cols"] = {str(r[0]).lower() for r in cur.fetchall()}
-                _LP_META["key"] = ("sec_id" if "sec_id" in _LP_META["cols"]
-                                   else "security_id"
-                                   if "security_id" in _LP_META["cols"]
-                                   else None)
-                for t in ("snap_ts", "run_ts", "asof_ts", "asof",
-                          "created_at", "loaded_at", "id"):
-                    if t in _LP_META["cols"]:
-                        _LP_META["ts"] = t
-                        break
-                _LP_META["checked"] = True
-            key = _LP_META["key"]
-            if not key:
-                return {}
-            want = ["years_to_call", "credit_spread_used"]
-            for opt in ("years_to_put", "delta", "implied_vol",
-                        "conversion_price", "conversion_fixed_fx", "vega"):
-                if opt in _LP_META["cols"]:
-                    want.append(opt)
-            sel = ", ".join([key] + want)
-            order = f" ORDER BY {_LP_META['ts']} DESC" if _LP_META["ts"] else ""
-            ph = ", ".join(["%s"] * len(sec_ids))
-            cur.execute(f"SELECT {sel} FROM cbanalytics.lp_model_output "
-                        f"WHERE {key} IN ({ph}){order}", sec_ids)
-            out: Dict[int, Dict[str, Any]] = {}
-            for row in cur.fetchall():
-                sid = int(row[0])
-                if sid in out:
-                    continue
-                out[sid] = {w: ("" if v is None else str(v))
-                            for w, v in zip(want, row[1:])}
-            return out
-    finally:
-        conn.close()
-
-
-_DIV_CHILD = r"""
-import json, sys, os
-try:
-    import refinitiv.data as rd
-    rd.open_session()
-    rics = json.loads(sys.argv[1])
-    df = rd.get_data(universe=rics, fields=["TR.ExDividendDate"])
-    cols = {str(c).strip().lower(): c for c in df.columns}
-    inst = cols.get("instrument") or df.columns[0]
-    dcol = next((c for k, c in cols.items() if "dividend" in k), None)
-    if dcol is None:
-        dcol = next((c for c in df.columns if c != inst), None)
-    out = {}
-    if dcol is not None:
-        for _, r in df.iterrows():
-            v = r[dcol]
-            sv = "" if v is None else str(v)[:10]
-            if sv and sv.lower() not in ("nan", "nat", "<na>", "none"):
-                out[str(r[inst]).strip()] = sv
-    print("DIVJSON:" + json.dumps(out))
-except Exception as exc:
-    print("DIVJSON:{}")
-    print("child error: %s" % exc, file=sys.stderr)
-"""
-
-
-def fetch_div_dates_now(rics: List[str]) -> Dict[str, str]:
-    """Ex-dividend dates in a SEPARATE PROCESS with its own Refinitiv
-    session. The parent's realtime session is never touched, and a hang
-    is hard-killed by the subprocess timeout - worst case is blank DIV
-    flags, never a broken stock/fx feed."""
-    import subprocess, sys as _sys
-    try:
-        p = subprocess.run(
-            [_sys.executable, "-c", _DIV_CHILD,
-             json.dumps([r for r in rics if r])],
-            capture_output=True, text=True, timeout=90,
-            cwd=os.getcwd(), env=os.environ.copy())
-        for line in (p.stdout or "").splitlines():
-            if line.startswith("DIVJSON:"):
-                return json.loads(line[len("DIVJSON:"):])
-        if p.stderr:
-            logger.info("div child stderr: %s", p.stderr.strip()[:300])
-    except subprocess.TimeoutExpired:
-        logger.info("div child killed after 90s timeout")
-    except Exception as exc:
-        logger.info("div child failed: %s", exc)
-    return {}
-
-
-_VOL_CACHE = {"day": "", "map": {}}
-_VOL_CHILD = r"""
-import json, sys, os, time
-try:
-    import refinitiv.data as rd
-    rd.open_session()
-    rics = json.loads(sys.argv[1])
-    COUNT = int(os.environ.get("NUKE_VOL_COUNT", "280"))
-    print("child up: rd=%s py=%s rics=%d count=%d" % (
-        getattr(rd, "__version__", "?"), sys.version.split()[0],
-        len(rics), COUNT), file=sys.stderr)
-    T0 = time.monotonic()
-    out = {}
-    PREF = ["trdprc_1", "close", "off_close", "off_cl", "last"]
-
-    def px_of(col):
-        try:
-            vals = [float(v) for v in col.tolist()
-                    if v is not None and str(v).lower() not in
-                    ("nan", "nat", "<na>", "none")]
-            return vals if len(vals) >= 11 else None
-        except Exception:
-            return None
-
-    def eat_batched(df):
-        for c in list(df.columns):
-            ric = str(c[0]).strip() if isinstance(c, tuple) else str(c).strip()
-            px = px_of(df[c])
-            if ric and px:
-                out[ric] = px
-
-    def eat_single(df, ric):
-        cols = list(df.columns)
-        def nm(c):
-            return (str(c[-1]) if isinstance(c, tuple) else str(c)).lower()
-        ranked = sorted(cols, key=lambda c: PREF.index(nm(c))
-                        if nm(c) in PREF else 99)
-        for c in ranked:
-            if nm(c) not in PREF and len(cols) > 1:
-                continue          # never fall through to volume-like cols
-            px = px_of(df[c])
-            if px:
-                out[ric] = px
-                return
-
-    for cnt in (COUNT, 130):
-        try:
-            df = rd.get_history(universe=rics, fields=["TRDPRC_1"],
-                                interval="daily", count=cnt)
-            print("batched count=%d shape=%s" % (cnt,
-                  getattr(df, "shape", "?")), file=sys.stderr)
-            eat_batched(df)
-            if out:
-                break
-        except Exception as exc:
-            print("batched get_history count=%d failed: %s" % (cnt, exc),
-                  file=sys.stderr)
-    for ric in [r for r in rics if r not in out]:
-        if time.monotonic() - T0 > 150:
-            print("time budget reached, %d rics left" %
-                  len([r for r in rics if r not in out]), file=sys.stderr)
-            break
-        for cnt in (COUNT, 130):
-            try:                   # no field filter: some venues expose
-                eat_single(rd.get_history(universe=ric, interval="daily",
-                                          count=cnt), ric)  # CLOSE instead
-                if ric in out:
-                    break
-            except Exception as exc:
-                print("single %s count=%d failed: %s" % (ric, cnt, exc),
-                      file=sys.stderr)
-    print("VOLJSON:" + json.dumps(out))
-except Exception as exc:
-    print("VOLJSON:{}")
-    print("vol child error: %s" % exc, file=sys.stderr)
-"""
-
-
-def fetch_vol_history_now(rics: List[str]) -> Dict[str, list]:
-    """Daily close history in a SEPARATE PROCESS with its own session -
-    identical isolation to the div fetch; a hang is hard-killed and the
-    realtime feed can never be touched."""
-    import subprocess, sys as _sys
-    try:
-        if (__import__("time").time()
-                - globals().get("_SESS_OPEN_TS", 0)) < 90:
-            logger.info("vol child deferred: main session "
-                        "reopened <90s ago - retrying next hour")
-            return {}
-        p = subprocess.run(
-            [_sys.executable, "-c", _VOL_CHILD,
-             json.dumps([r for r in rics if r])],
-            capture_output=True, text=True, timeout=210,
-            cwd=os.getcwd(), env=os.environ.copy())
-        out = None
-        for line in (p.stdout or "").splitlines():
-            if line.startswith("VOLJSON:"):
-                out = json.loads(line[len("VOLJSON:"):])
-                break
-        if p.stderr and (out is None or len(out) < len(rics)):
-            for ln in p.stderr.strip().splitlines()[-12:]:
-                logger.info("vol child | %s", ln.strip()[:220])
-        if out is not None:
-            logger.info("vol child: %d/%d rics with history",
-                        len(out), len(rics))
-            return out
-    except subprocess.TimeoutExpired:
-        logger.info("vol child killed after 120s timeout")
-    except Exception as exc:
-        logger.info("vol child failed: %s", exc)
-    return {}
-
-
-async def vol_poller():
-    """Daily-close history for realised vol. Opt-out via NUKE_VOL_FETCH=0.
-    One fetch per day per ric set; vols themselves are computed client-side
-    from this cached series, so the page never waits on Refinitiv."""
-    if os.environ.get("NUKE_VOL_FETCH", "1") != "1":
-        logger.info("vol poller disabled (NUKE_VOL_FETCH=0)")
+def _nuke_px_prime(reqs):
+    """One batched pricing call primes _NUKE_PX for a whole list
+    pass - kills the serial cold-start cost."""
+    if os.environ.get("LAGRANGE_TEST_LIVE") == "FILE" or \
+            not _NUKE_MOD or not reqs:
         return
-    delay = int(os.environ.get("NUKE_VOL_DELAY", "120"))
-    logger.info("vol poller started (first fetch in %ss, then hourly "
-                "check, once per day)", delay)
-    await asyncio.sleep(delay)
-    while True:
-        try:
-            rics = sorted({r for r in STATE["stockRics"].values() if r})
-            today = date.today().isoformat()
-            if rics and (_VOL_CACHE["day"] != today or
-                         any(r not in _VOL_CACHE["map"] for r in rics)):
-                out = await run_in_threadpool(fetch_vol_history_now, rics)
-                if not out:
-                    logger.warning("vol child returned no data for %d rics "
-                                   "- Workspace get_history entitlement? "
-                                   "retrying next hour", len(rics))
-                if out:
-                    _VOL_CACHE["map"].update(out)
-                    _VOL_CACHE["day"] = today
-                    logger.info("vol history refreshed for %d rics",
-                                len(out))
-                    if REFDATA_WAKE:
-                        REFDATA_WAKE.set()
-        except Exception as exc:
-            logger.info("vol poll skipped: %s", exc)
-        await asyncio.sleep(3600)
-
-
-async def div_poller():
-    """Opt-in (NUKE_DIV_FETCH=1). Runs every 30 min with a hard timeout,
-    updates the cache, then nudges refdata so DIV flags repaint."""
-    if os.environ.get("NUKE_DIV_FETCH", "0") != "1":
-        logger.info("div poller disabled (NUKE_DIV_FETCH!=1) - DIV flags "
-                    "stay blank")
+    now = time.time()
+    ents, keys = [], []
+    for sid, spot, fx, cbfx in reqs:
+        if spot is None:
+            continue
+        key = (int(sid), round(float(spot), 6),
+               None if fx is None else round(float(fx), 6))
+        hit = _NUKE_PX.get(key)
+        if hit and now - hit["ts"] < 45:
+            continue
+        ents.append({"secId": int(sid), "ovdSpot": float(spot),
+                     "ovdCbFx": float(cbfx or 0),
+                     "ovdUndFx": float(fx or 0)})
+        keys.append(key)
+    if not ents:
         return
-    await asyncio.sleep(
-        int(os.environ.get("NUKE_DIV_DELAY", "90")))   # realtime first
-    while True:
-        try:
-            rics = sorted({r for r in STATE["stockRics"].values() if r})
-            if rics:
-                out = await run_in_threadpool(fetch_div_dates_now, rics)
-                _DIV_CACHE["map"] = out
-                _DIV_CACHE["ts"] = asyncio.get_event_loop().time()
-                logger.info("div dates refreshed for %d rics", len(out))
-                if REFDATA_WAKE:
-                    REFDATA_WAKE.set()
-        except Exception as exc:
-            logger.info("div poll skipped: %s", exc)
-        await asyncio.sleep(1800)
-
-
-
-def build_refdata(sec_ids: List[int]):
-    """Compose one refdata row per security from cbanalytics + eqrms + prefs."""
-    sec_ids = sorted(set(sec_ids))
-    errors = []
     try:
-        rows = fetch_ref_rows(sec_ids)
-    except Exception as exc:
-        logger.error("cbanalytics lookup failed: %s", exc)
-        rows, errors = [], [f"cbanalytics lookup failed: {exc}"]
-    try:
-        rics = fetch_ric_map(sec_ids)
-    except Exception as exc:
-        logger.error("eqrms RIC lookup failed: %s", exc)
-        rics = {}
-        errors.append(f"RIC lookup failed: {exc}")
-    prefs = fetch_saved_prefs(sec_ids)
-    try:
-        lp = fetch_lp_rows(sec_ids)
-    except Exception as exc:
-        lp = {}
-        logger.info("lp_model_output lookup skipped: %s", exc)
-    _snap_mids = fetch_snap8_mids(sec_ids)
-
-    by_id = {r["secId"]: r for r in rows}
-    for sid in sec_ids:
-        rec = by_id.setdefault(sid, {"secId": sid, "company_name": "",
-                                     "expiry_date": "", "isin": ""})
-        extra = rics.get(sid, {})
-        pref = prefs.get(sid, {})
-        rec["ric"] = extra.get("ric", "")
-        rec["sec_fx"] = extra.get("ccy", "")
-        rec["quantity_live"] = extra.get("qty", "")
-        rec["usd_qty_live"] = extra.get("usd", "")
-        rec["short_name"] = pref.get("short_name", "")
-        rec["und_fx"] = pref.get("und_fx") or default_fx_ric(extra.get("ccy", ""))
-        lrow = lp.get(sid, {})
-        rec["snap8_mid"] = _snap_mids.get(sid, "")
-        rec["lp_delta"] = lrow.get("delta", "")
-        rec["implied_vol"] = lrow.get("implied_vol", "")
-        rec["lp_conversion_price"] = lrow.get("conversion_price", "")
-        rec["conversion_fixed_fx"] = lrow.get("conversion_fixed_fx", "")
-        rec["vega"] = lrow.get("vega", "")
-        rec["px_hist"] = _VOL_CACHE["map"].get(rec.get("ric", ""), [])
-        rec["years_to_call"] = lrow.get("years_to_call", "")
-        rec["credit_spread_used"] = lrow.get("credit_spread_used", "")
-        rec["years_to_put"] = lrow.get("years_to_put", "")
-    divs = _DIV_CACHE["map"]           # background-filled; empty when off
-    for r in by_id.values():
-        r["next_div_date"] = divs.get(r.get("ric", ""), "")
-    return list(by_id.values()), ("; ".join(errors) if errors else None)
-
-
-@app.post("/api/refdata")
-def api_refdata(req: RefRequest):
-    rows, error = build_refdata(req.sec_ids)
-    return {"rows": rows, "error": error}
-
-
-async def refdata_poller():
-    """Re-fetch eqrms/cbanalytics reference data periodically and broadcast,
-    so qty/usd/ric/sec_fx track fresh snaps without anyone reloading."""
-    global REFDATA_WAKE
-    REFDATA_WAKE = asyncio.Event()
-    logger.info("refdata poller started (every %ss)", STATE["refdataSec"])
-    while True:
-        try:
-            ids = list(STATE["ids"])
-            if ids:
-                rows, error = await run_in_threadpool(build_refdata, ids)
-                if error:
-                    if STATE["refErr"] != error:
-                        STATE["refErr"] = error
-                        logger.error("refdata refresh: %s", error)
-                        await broadcast({"type": "refErr", "error": error})
-                else:
-                    if STATE["refErr"]:
-                        STATE["refErr"] = None
-                    prev = {v for v in STATE["stockRics"].values() if v}
-                    STATE["stockRics"] = {r["secId"]: r.get("ric", "")
-                                          for r in rows}
-                    now = {v for v in STATE["stockRics"].values() if v}
-                    if now - prev and RFX_WAKE:
-                        RFX_WAKE.set()   # new rics: retry realtime now
-                    await broadcast({"type": "refdata", "rows": rows,
-                                     "ts": datetime.now().strftime("%H:%M:%S")})
-                    if RFX_WAKE: RFX_WAKE.set()   # ric set may have changed
-        except Exception as exc:
-            logger.error("refdata poller loop error: %s", exc)
-        try:
-            await asyncio.wait_for(REFDATA_WAKE.wait(),
-                                   timeout=max(30, STATE["refdataSec"]))
-        except asyncio.TimeoutError:
-            pass
-        REFDATA_WAKE.clear()
-
-
-@app.get("/api/snap8")
-def api_snap8(d: str = ""):
-    try:
-        ensure_snap8()
-        conn = _db()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(f"SELECT DISTINCT snap_date FROM "
-                            f"{APP_DB}.quote_snap8 ORDER BY snap_date DESC "
-                            "LIMIT 15")
-                dates = [r[0].isoformat() for r in cur.fetchall()]
-                pick = d if d in dates else (dates[0] if dates else "")
-                rows = []
-                if pick:
-                    cur.execute(
-                        f"SELECT sec_id, short_name, quote_bid, quote_ask, "
-                        f"mid, snapped_at, isin, ovd_bid, ovd_ask, "
-                        f"indic_ask, vs_ref, fx_ref, vs_usd, delta_pct, qty "
-                        f"FROM {APP_DB}.quote_snap8 "
-                        "WHERE snap_date=%s ORDER BY short_name", (pick,))
-                    def _f(v):
-                        return None if v is None else float(v)
-                    rows = [{"sec_id": r[0], "short_name": r[1] or "",
-                             "quote_bid": _f(r[2]), "quote_ask": _f(r[3]),
-                             "mid": _f(r[4]), "snapped_at": str(r[5] or ""),
-                             "isin": r[6] or "",
-                             "ovd_bid": _f(r[7]), "ovd_ask": _f(r[8]),
-                             "indic_ask": _f(r[9]), "vs_ref": _f(r[10]),
-                             "fx_ref": _f(r[11]), "vs_usd": _f(r[12]),
-                             "delta_pct": _f(r[13]), "qty": _f(r[14])}
-                            for r in cur.fetchall()]
-            return {"ok": True, "dates": dates, "date": pick, "rows": rows}
-        finally:
-            conn.close()
-    except Exception as exc:
-        return JSONResponse(status_code=500,
-                            content={"ok": False, "error": str(exc)})
-
-
-@app.post("/api/vol/run")
-async def api_vol_run():
-    try:
-        rics = sorted({r for r in STATE["stockRics"].values() if r})
-        if not rics:
-            return {"ok": False, "error": "no stock rics yet"}
-        out = await run_in_threadpool(fetch_vol_history_now, rics)
-        if out:
-            _VOL_CACHE["map"].update(out)
-            _VOL_CACHE["day"] = date.today().isoformat()
-            if REFDATA_WAKE:
-                REFDATA_WAKE.set()
-        return {"ok": True, "rics": len(out)}
-    except Exception as exc:
-        return JSONResponse(status_code=500,
-                            content={"ok": False, "error": str(exc)})
-
-
-@app.get("/api/logs")
-def api_logs(n: int = 300):
-    lines = list(LOG_RING)[-max(1, min(n, 800)):]
-    return {"ok": True, "lines": lines}
-
-
-@app.post("/api/snap8/run")
-async def api_snap8_run():
-    try:
-        n = await run_in_threadpool(compute_snap8)
-        if REFDATA_WAKE:
-            REFDATA_WAKE.set()
-        return {"ok": True, "stored": n}
-    except Exception as exc:
-        return JSONResponse(status_code=500,
-                            content={"ok": False, "error": str(exc)})
-
-
-@app.post("/api/save")
-
-@app.post("/api/save")
-def api_save(req: SaveRequest):
-    if not req.rows:
-        return JSONResponse({"error": "Nothing to save."}, status_code=400)
-    try:
-        n = save_rows(req.rows)
-    except Exception as exc:
-        logger.error("Save failed: %s", exc)
-        return JSONResponse({"error": f"Save failed: {exc}"}, status_code=500)
-    logger.info("save by %s: %d rows -> %s.%s", req.user, n, APP_DB, APP_TABLE)
-    db_log(req.user, "save", {"n": n})
-    return {"saved": n, "table": f"{APP_DB}.{APP_TABLE}"}
-
-
-def run_nuke_batches(entries: List[Dict[str, Any]]) -> Dict[str, Any]:
-    all_rows: List[Dict[str, Any]] = []
-    hosts, total_elapsed = [], 0.0
-    for i in range(0, len(entries), BATCH_SIZE):
-        out = call_nuked_api(entries[i:i + BATCH_SIZE])
-        hosts.append(out["host"])
-        total_elapsed += out["elapsed"]
-        all_rows.extend(out["rows"])
-    requested = {e["secId"] for e in entries}
-    returned = {r.get("secId") for r in all_rows}
-    return {"rows": all_rows,
-            "host": ", ".join(sorted(set(hosts))),
-            "elapsed": round(total_elapsed, 3),
-            "requested": len(requested), "returned": len(all_rows),
-            "missing": sorted(requested - returned),
-            "secIds": sorted(requested)}
-
-
-@app.post("/api/borrow/ingest")
-async def api_borrow_ingest(request: Request):
-    """Feed door for the borrow band. Body: {sec_id: {bw_*: v}}
-    e.g. {"60426052": {"bw_brw": "1.35", "bw_src": "F",
-    "bw_lo": "1.1", "bw_hi": "1.6"}}. Writes state, persists,
-    broadcasts to every open window."""
-    try:
-        body = await request.json()
+        out = _NUKE_MOD.call_nuked_api(ents)
+        by_sid = {r.get("secId"): r for r in out.get("rows", [])}
+        for ent, key in zip(ents, keys):
+            r = by_sid.get(ent["secId"]) or {}
+            b = _fnum(r.get("ovdMktBid"))
+            a = _fnum(r.get("ovdMktAsk"))
+            _NUKE_PX[key] = {"ts": now, "v": None if (b is None
+                and a is None) else (b, a)}
     except Exception:
-        return {"ok": False, "error": "bad json"}
-    changed = []
-    for sid_s, kv in (body or {}).items():
-        try:
-            sid = int(sid_s)
-        except (TypeError, ValueError):
-            continue
-        fields = {k: str(v) for k, v in (kv or {}).items()
-                  if k in BW_FIELDS}
-        if not fields:
-            continue
-        row = STATE["rows"].setdefault(sid, _blank_row())
-        row.update(fields)
-        changed.append(sid)
-        await run_in_threadpool(db_upsert_state_fields, sid,
-                                row, "borrow-feed",
-                                list(fields.keys()))
-    if changed:
-        await broadcast({"type": "snapshot",
-                         "state": snapshot(),
-                         "online": len(CLIENTS)})
-    return {"ok": True, "rows": len(changed)}
-
-
-@app.websocket("/ws")
-async def ws_endpoint(ws: WebSocket):
-    global MAIN_LOOP
-    import asyncio as _aio
-    MAIN_LOOP = _aio.get_running_loop()
-    await ws.accept()
-    CLIENTS.add(ws)
-    CLIENT_LOCKS[ws] = asyncio.Lock()
-    user = "anon"
-    try:
-        while True:
-            try:
-                msg = json.loads(await ws.receive_text())
-            except json.JSONDecodeError:
-                continue
-            t = msg.get("type")
-
-            if t == "cfg":
-                u2 = (str(msg.get("user") or user or "anon"))[:32]
-                k2 = str(msg.get("key") or "")[:48]
-                if k2:
-                    STATE.setdefault("userCfg", {}).setdefault(
-                        u2, {})[k2] = msg.get("val")
-                    await broadcast({"type": "cfg", "by": u2,
-                        "key": k2, "val": msg.get("val")},
-                        skip=ws)
-                continue
-            if t == "hello":
-                user = (str(msg.get("user") or "anon"))[:32]
-                CLIENT_NAMES[ws] = user
-                await ws.send_text(json.dumps(
-                    {"type": "snapshot", "state": snapshot(),
-                     "you": user, "online": len(CLIENTS)}))
-                await broadcast({"type": "online", "n": len(CLIENTS),
-                                 "note": f"{user} joined"}, skip=ws)
-                logger.info("ws hello: %s (online=%d)", user, len(CLIENTS))
-                await run_in_threadpool(db_log, user, "connect", {})
-
-            elif t == "ping":
-                await ws.send_text('{"type":"pong"}')
-
-            elif t == "ids":
-                ids = [int(i) for i in msg.get("ids", []) if str(i).isdigit()]
-                seen, uniq = set(), []
-                for i in ids:
-                    if i not in seen:
-                        seen.add(i); uniq.append(i)
-                STATE["ids"] = uniq
-                for sid in uniq:
-                    STATE["rows"].setdefault(sid, _blank_row())
-                STATE["version"] += 1
-                await run_in_threadpool(refresh_stock_rics)
-                if REFDATA_WAKE: REFDATA_WAKE.set()
-                await run_in_threadpool(db_meta_set, "sec_ids", uniq)
-                await run_in_threadpool(db_log, user, "ids", {"n": len(uniq)})
-                await broadcast({"type": "ids", "ids": uniq,
-                                 "rows": STATE["rows"], "by": user,
-                                 "v": STATE["version"]})
-                if RFX_WAKE: RFX_WAKE.set()
-                logger.info("ids set by %s: %d securities", user, len(uniq))
-
-            elif t in ("row", "rows"):
-                items = msg.get("list") if t == "rows" else [msg]
-                changed = []
-                for it in items or []:
-                    try:
-                        sid = int(it.get("secId"))
-                    except (TypeError, ValueError):
-                        continue
-                    row = STATE["rows"].setdefault(sid, _blank_row())
-                    touched = [f for f in USER_FIELDS + OVD_FIELDS
-                               if f in it]
-                    for f in touched:
-                        row[f] = str(it.get(f) or "")
-                    if _van_mirror(row) and \
-                            "ovdCbFx" not in touched:
-                        touched.append("ovdCbFx")
-                    changed.append(sid)
-                    asyncio.create_task(          # persist off hot path
-                        run_in_threadpool(db_upsert_state_fields,
-                                          sid, row, user, touched))
-                if changed:
-                    if any("und_fx" in it for it in items or []) \
-                            and RFX_WAKE:
-                        RFX_WAKE.set()   # fx rics changed: poll now
-                    STATE["version"] += 1
-                    await broadcast({"type": "rows", "by": user,
-                                     "v": STATE["version"],
-                                     "list": [{"secId": sid, **STATE["rows"][sid]}
-                                              for sid in changed]}, skip=ws)
-                    if RFX_WAKE: RFX_WAKE.set()   # und_fx may have changed
-                    logger.info("rows updated by %s: %s", user, changed[:20])
-                    _ovd_sids = sorted({int(it.get("secId"))
-                        for it in (items or [])
-                        if str(it.get("secId") or "").isdigit()
-                        and any(f in it for f in OVD_FIELDS)})
-                    if _ovd_sids:
-                        async def _auto_nuke(sids=_ovd_sids, u=user):
-                            try:
-                                await asyncio.wait_for(
-                                    _nlock().acquire(), timeout=15)
-                            except Exception:
-                                return   # lock unavailable -
-                                # skip this auto-nuke silently
-                            try:
-                                ents = []
-                                for s2 in sids:
-                                    rw = STATE["rows"].get(s2, {})
-                                    def nm(v):
-                                        try:
-                                            return float(str(v)
-                                                .replace(",", "") or 0)
-                                        except ValueError:
-                                            return 0.0
-                                    ents.append({"secId": s2,
-                                        "ovdSpot": nm(rw.get("ovdSpot")),
-                                        "ovdCbFx": nm(rw.get("ovdCbFx")),
-                                        "ovdUndFx": nm(rw.get(
-                                            "ovdUndFx"))})
-                                data = await run_in_threadpool(
-                                    run_nuke_batches, ents)
-                                for r2 in data.get("rows", []):
-                                    s3 = r2.get("secId")
-                                    if s3 is not None:
-                                        STATE["nuke"][int(s3)] = r2
-                                STATE["nukeMeta"] = {
-                                    "host": data.get("host", ""),
-                                    "elapsed": data.get("elapsed",
-                                                        0),
-                                    "by": u + " (auto)",
-                                    "ts": datetime.now().strftime(
-                                        "%H:%M:%S"),
-                                    "missing": data.get("missing",
-                                                        [])}
-                                STATE["version"] += 1
-                                data["by"] = u + " (auto)"
-                                await broadcast({"type": "nuke",
-                                    "data": data,
-                                    "v": STATE["version"]})
-                                logger.info("auto-nuke by %s: %d "
-                                    "rics on ovd edit", u, len(ents))
-                            except Exception as exc:
-                                logger.info("auto-nuke failed: %s",
-                                            exc)
-                            finally:
-                                if _nlock().locked():
-                                    _nlock().release()
-                        asyncio.create_task(_auto_nuke())
-
-            elif t == "nuke":
-                sec_ids = [int(i) for i in msg.get("secIds", [])
-                           if str(i).isdigit()]
-                if not sec_ids:
-                    continue
-                entries = []
-                for sid in sec_ids:
-                    row = STATE["rows"].get(sid, _blank_row())
-                    def num(v):
-                        try:
-                            return float(str(v).replace(",", "") or 0)
-                        except ValueError:
-                            return 0.0
-                    entries.append({"secId": sid,
-                                    "ovdSpot": num(row.get("ovdSpot")),
-                                    "ovdCbFx": num(row.get("ovdCbFx")),
-                                    "ovdUndFx": num(row.get("ovdUndFx"))})
-                await broadcast({"type": "nukeStart", "by": user,
-                                 "n": len(entries)})
-                try:
-                    await asyncio.wait_for(_nlock().acquire(), timeout=15)
-                except asyncio.TimeoutError:
-                    await broadcast({"type": "nukeErr", "by": user,
-                                     "error": "Pricing engine busy for 15s "
-                                     "- previous nuke still running; retry"})
-                    continue
-                try:
-                    try:
-                        data = await asyncio.wait_for(
-                            run_in_threadpool(run_nuke_batches, entries),
-                            timeout=int(os.environ.get(
-                                "NUKE_PRICE_TIMEOUT", "45")))
-                    except asyncio.TimeoutError as exc:
-                        logger.error("nuke by %s timed out", user)
-                        await broadcast({"type": "nukeErr", "by": user,
-                                         "error": "Pricing timed out - "
-                                         "engine unresponsive"})
-                        continue
-                    except requests.RequestException as exc:
-                        logger.error("nuke by %s failed: %s", user, exc)
-                        await broadcast({"type": "nukeErr",
-                                         "error": f"Upstream call failed: {exc}",
-                                         "by": user})
-                        await run_in_threadpool(db_log, user, "nuke_error",
-                                                {"error": str(exc)[:500]})
-                        continue
-                finally:
-                    if _nlock().locked():
-                        _nlock().release()
-                for r in data["rows"]:
-                    if r.get("secId") is not None:
-                        STATE["nuke"][int(r["secId"])] = r
-                STATE["nukeMeta"] = {"host": data["host"],
-                                     "elapsed": data["elapsed"],
-                                     "by": user,
-                                     "ts": datetime.now().strftime("%H:%M:%S"),
-                                     "missing": data["missing"]}
-                STATE["version"] += 1
-                data["by"] = user
-                await broadcast({"type": "nuke", "data": data,
-                                 "v": STATE["version"]})
-                await run_in_threadpool(db_log, user, "nuke",
-                                        {"n": len(entries),
-                                         "returned": data["returned"],
-                                         "elapsed": data["elapsed"],
-                                         "host": data["host"]})
-                logger.info("nuke by %s: %d req, %d returned, %.2fs on %s",
-                            user, len(entries), data["returned"],
-                            data["elapsed"], data["host"])
-
-            elif t == "refresh":
-                sec = max(2, int(msg.get("sec") or RFX_REFRESH_DEFAULT))
-                STATE["refreshSec"] = sec
-                db_meta_set("refreshSec", sec)
-                await broadcast({"type": "cfg", "refreshSec": sec, "by": user})
-                if RFX_WAKE: RFX_WAKE.set()
-                logger.info("refresh interval set to %ss by %s", sec, user)
-
-            elif t == "autosave":
-                sec = max(0, int(msg.get("sec") or 0))
-                STATE["autosaveSec"] = sec
-                db_meta_set("autosaveSec", sec)
-                await broadcast({"type": "cfg", "autosaveSec": sec,
-                                 "by": user})
-                if AUTOSAVE_WAKE: AUTOSAVE_WAKE.set()
-                logger.info("autosave interval set to %ss by %s", sec, user)
-
-            elif t == "refInt":
-                sec = max(30, int(msg.get("sec") or REFDATA_REFRESH_DEFAULT))
-                STATE["refdataSec"] = sec
-                db_meta_set("refdataSec", sec)
-                await broadcast({"type": "cfg", "refdataSec": sec, "by": user})
-                if REFDATA_WAKE: REFDATA_WAKE.set()
-                logger.info("refdata interval set to %ss by %s", sec, user)
-
-            elif t == "flagTh":
-                th = dict(STATE["flagTh"])
-                for k, lo in (("staleSpot", 0.01), ("staleFx", 0.01),
-                              ("moveStk", 0.1), ("moveFx", 1.0)):
-                    if msg.get(k) is not None:
-                        try:
-                            th[k] = max(lo, float(msg[k]))
-                        except (TypeError, ValueError):
-                            pass
-                STATE["flagTh"] = th
-                db_meta_set("flagTh", th)
-                await broadcast({"type": "cfg", "flagTh": th, "by": user})
-                logger.info("flag thresholds set by %s: %s", user, th)
-
-            elif t == "rfxNow":
-                if RFX_WAKE: RFX_WAKE.set()
-
-    except WebSocketDisconnect:
         pass
-    except Exception as exc:
-        logger.warning("ws loop ended for %s: %s", user, exc)
-    finally:
-        CLIENTS.discard(ws)
-        CLIENT_NAMES.pop(ws, None)
-        await broadcast({"type": "online", "n": len(CLIENTS),
-                         "note": f"{user} left"})
-        logger.info("ws bye: %s (online=%d)", user, len(CLIENTS))
+
+
+def _nuke_px(sid, spot, fx, cbfx):
+    """TRUE nuke price at arbitrary refs via the same CB pricing
+    service the Nuke button uses (call_nuked_api). 45s memo per
+    (sid, spot, fx). None -> caller falls back to the delta/gamma
+    expansion (flagged est)."""
+    if os.environ.get("LAGRANGE_TEST_LIVE") == "FILE" or \
+            not _NUKE_MOD or spot is None:
+        return None
+    key = (int(sid), round(float(spot), 6),
+           None if fx is None else round(float(fx), 6))
+    now = time.time()
+    hit = _NUKE_PX.get(key)
+    if hit and now - hit["ts"] < 45:
+        return hit["v"]
+    try:
+        out = _NUKE_MOD.call_nuked_api([{
+            "secId": int(sid), "ovdSpot": float(spot),
+            "ovdCbFx": float(cbfx or 0),
+            "ovdUndFx": float(fx or 0)}])
+        row = (out.get("rows") or [{}])[0]
+        b = _fnum(row.get("ovdMktBid") if "ovdMktBid" in row
+                  else row.get("ovd_bid"))
+        a = _fnum(row.get("ovdMktAsk") if "ovdMktAsk" in row
+                  else row.get("ovd_ask"))
+        v = None if (b is None and a is None) else (b, a)
+    except Exception:
+        v = None
+    _NUKE_PX[key] = {"ts": now, "v": v}
+    if len(_NUKE_PX) > 4000:
+        _NUKE_PX.clear()
+    return v
+
+
+def _rfq_live(sec_id, style, ovd_spot=None, ovd_delta=None,
+              ovd_fx=None):
+    """Nuke QuoteBid/QuoteAsk, server-side, priced at the caller's
+    refs. theo = nBid + (nD/100)*m + 0.5*(gamma/100)*m^2 with
+    m = 100*(und - nSpot)/nSpot; und = ovd_spot > nuke-row ovdSpot >
+    rfx last > liveSpot; nD = ovd_delta > nDelta*100. bid = theo,
+    ask = theo + nSpread; outright adds or_bid/ask_sprd; ALL styles
+    then add x_bid / x_ask / x_both (QuoteBid/QuoteAsk parity)."""
+    st = _rfq_state()
+    if not st or sec_id in (None, ""):
+        return {}
+    def pick(d, k):
+        if not isinstance(d, dict):
+            return None
+        return d.get(k) if k in d else d.get(str(k)) if str(k) in d \
+            else d.get(int(k)) if str(k).isdigit() and int(k) in d else None
+    try:
+        sid = int(sec_id)
+    except (TypeError, ValueError):
+        sid = sec_id
+    nk = pick(st.get("nuke", {}), sid) or {}
+    row = pick(st.get("rows", {}), sid) or {}
+    rfx = st.get("rfx", {}) or {}
+    n_bid, n_delta = _fnum(nk.get("nBid")), _fnum(nk.get("nDelta"))
+    n_spot = _fnum(nk.get("nSpot"))
+    out = {"ts": st.get("rfxTs") or ""}
+    ric = _rfq_stock_ric(st, sid, nk.get("ric") or "")
+    fx_ric = (row.get("und_fx") or "").strip()
+    fx_live = _fnum((rfx.get(fx_ric) or {}).get("last")) if fx_ric else None
+    out["fx"] = fx_live
+    out["fx_nuke"] = _fnum(nk.get("nSpotFx"))
+    und = ovd_spot if ovd_spot is not None \
+        else _fnum(row.get("ovdSpot"))
+    if und is None and ric:
+        und = _fnum((rfx.get(ric) or {}).get("last"))
+    if und is None:
+        und = _fnum(nk.get("liveSpot"))
+    out["spot"] = und
+    if None in (n_bid, n_delta, n_spot) or not n_spot or und is None:
+        return out
+    m = 100.0 * (und - n_spot) / n_spot
+    g = _fnum(row.get("n_gamma"))
+    nD = ovd_delta if ovd_delta is not None else n_delta * 100.0
+    theo = n_bid + (nD / 100.0) * m + (0.5 * (g / 100.0) * m * m
+                                       if g is not None else 0.0)
+    spread = _fnum(nk.get("nSpread")) or 0.0
+    bid, ask = theo, theo + spread
+    out["und"] = und
+    out["src"] = "est"
+    if ovd_spot is not None:
+        _sv = _nuke_px(sid, ovd_spot,
+                       ovd_fx if ovd_fx is not None else
+                       _fnum(row.get("ovdUndFx")),
+                       _fnum(row.get("ovdCbFx")))
+        if _sv:
+            _sb, _sa = _sv
+            if _sb is not None:
+                bid = _sb
+            if _sa is not None:
+                ask = _sa
+            elif _sb is not None:
+                ask = _sb + spread
+            out["src"] = "nuke-svc"
+    x2 = _fnum(row.get("x_both")) or 0.0
+    bid += (_fnum(row.get("x_bid")) or 0.0) + x2
+    ask += (_fnum(row.get("x_ask")) or 0.0) + x2
+    out["bid"], out["ask"] = round(bid, 4), round(ask, 4)
+    _mb = _fnum(nk.get("ovdMktBid"))
+    _ma = _fnum(nk.get("ovdMktAsk"))
+    _xb = (_fnum(row.get("x_bid")) or 0.0) + x2
+    _xa = (_fnum(row.get("x_ask")) or 0.0) + x2
+    out["nqb"] = None if _mb is None else round(_mb + _xb, 4)
+    out["nqa"] = None if _ma is None else round(_ma + _xa, 4)
+    _ndraw = None
+    _nkkey = None
+    for _src in (nk, row):
+        for _k in ("n_delta", "nDeltaPct", "nDelta", "delta",
+                   "m_delta"):
+            _v = _src.get(_k)
+            if _v not in (None, ""):
+                _ndraw = _v
+                _nkkey = _k
+                break
+        if _ndraw not in (None, ""):
+            break
+    out["nd"] = (_fnum(str(_ndraw).replace("%", "").strip())
+                 if _ndraw not in (None, "") else None)
+    # n_delta is stored as a fraction (0.56 = 56%): scale to
+    # percent, magnitude-guarded so an already-percent value is
+    # never double-scaled.
+    if (_nkkey in ("n_delta", "nDelta") and out["nd"] is not None
+            and abs(out["nd"]) <= 1.5):
+        out["nd"] = round(out["nd"] * 100.0, 2)
+    out["sn"] = str(row.get("short_name") or "").strip()
+    out["xb"] = _fnum(row.get("x_bid"))
+    out["xa"] = _fnum(row.get("x_ask"))
+    out["x2"] = _fnum(row.get("x_both"))
+    out["orb"] = _fnum(row.get("or_bid_sprd"))
+    out["ora"] = _fnum(row.get("or_ask_sprd"))
+    out["nvs"] = _fnum(row.get("ovdSpot"))
+    out["nfx"] = _fnum(row.get("ovdUndFx"))
+    out["trace"] = (("[" + out.get("src", "est") + "] ") if
+                    ovd_spot is not None else "") + ("nBid %.4f + d %.2f%%*m %.3f%% (%.4f) + "
+                    ".5g %s*m^2 (%s) | sprd %.2f "
+                    "x(%s/%s/%s) und %.4f nSpot %.4f") % (
+        n_bid, nD, m, (nD / 100.0) * m,
+        "%.3f" % g if g is not None else "-",
+        "%.4f" % (0.5 * (g / 100.0) * m * m) if g is not None
+        else "-", spread,
+        row.get("x_bid") or 0, row.get("x_ask") or 0, x2,
+        und, n_spot)
+    if style == "outright":
+        _ob3 = out.get("orb") or 0.0
+        _oa3 = out.get("ora") or 0.0
+        for _kk, _vv in (("nqb", _ob3), ("nqa", _oa3),
+                         ("bid", _ob3), ("ask", _oa3)):
+            if out.get(_kk) is not None:
+                out[_kk] = round(out[_kk] + _vv, 4)
+    return out
+
+
+def _rfq_qty_map(sec_ids):
+    """Live position quantity per sec_id - eqrms via the embedded
+    Nuke's fetch_ric_map, ONE batched query per /list poll.
+    FILE fixture: refdata[sid][quantity_live]."""
+    ids = sorted({int(s) for s in sec_ids
+                  if str(s or "").strip().isdigit()})
+    if not ids:
+        return {}
+    if os.environ.get("LAGRANGE_TEST_LIVE") == "FILE":
+        st = _rfq_state() or {}
+        d = st.get("refdata", {}) or {}
+        out = {}
+        for s in ids:
+            r = d.get(str(s)) or d.get(s) or {}
+            q = _fnum(r.get("quantity_live"))
+            if q is not None:
+                out[s] = q
+        return out
+    import time as _t
+    key = tuple(ids)
+    if (_RFQ_QTY_CACHE["key"] == key and
+            _t.time() - _RFQ_QTY_CACHE["ts"] < 60):
+        return _RFQ_QTY_CACHE["map"]
+    try:
+        if _NUKE_MOD:
+            m = _NUKE_MOD.fetch_ric_map(ids)
+            out = {sid: v.get("qty") for sid, v in m.items()
+                   if v.get("qty") is not None}
+            _RFQ_QTY_CACHE.update(ts=_t.time(), key=key, map=out)
+            return out
+    except Exception:
+        pass
+    return {}
+
+
+_RFQ_QTY_CACHE = {"ts": 0.0, "key": None, "map": {}}
+
+
+def _rfq_flag(r, calc):
+    """Is the STANDING quote good to trade?
+    NO QUOTE  - nothing confirmed yet (press Q)
+    GOOD      - standing bid/ask within RFQ_PX_TOL of the model now
+    REQUOTE   - drifted; press Q again (old quote goes to history)."""
+    qb, qa = _fnum(r.get("bid_px")), _fnum(r.get("ask_px"))
+    _t = _fnum(r.get("tol"))
+    tol = _t if (_t is not None and _t > 0) else RFQ_PX_TOL
+    if qb is None and qa is None:
+        if r.get("off_flag") and r.get("status") == "REQUESTED":
+            auto = r.get("off_flag") == "auto"
+            _by = r.get("off_by") or ""
+            _at = str(r.get("off_at") or "")[11:16]
+            return {"txt": "OFF >tol" if auto else "OFF",
+                    "cls": "fl-moved",
+                    "title": (("auto-offed: model moved beyond the tol " if auto else f"offed by {_by} ")
+                        + f"at {_at} - trader is adjusting; Q re-quotes")}
+        if r.get("status") == "QUOTED":
+            return {"txt": "PULL", "cls": "fl-moved",
+                    "title": "standing quote lost (empty px) - auto-off will move this to ADJUSTING; Q re-quotes"}
+        return {"txt": "NO QUOTE", "cls": "fl-none",
+                "title": "no standing quote - press Q to send rev 1"}
+    rev = r.get("q_rev") or "1"
+    at = str(r.get("bid_at") or r.get("ask_at") or "")[11:16]
+    if calc.get("bid") is None and calc.get("ask") is None:
+        return {"txt": f"GOOD r{rev}", "cls": "fl-ok",
+                "title": f"standing quote rev {rev} \u00b7 {at} \u00b7 no model to compare"}
+    if (r.get("style") or "") == "outright":
+        # DIRECTIONAL slippage: +ve = client dealing through your
+        # standing quote is better-than-model FOR YOU.
+        #   bid_slip = model bid - your bid (you buy below fair)
+        #   ask_slip = your ask - model ask (you sell above fair)
+        slips = []
+        if qb is not None and calc.get("bid") is not None:
+            slips.append(("bid", calc["bid"] - qb))
+        if qa is not None and calc.get("ask") is not None:
+            slips.append(("ask", qa - calc["ask"]))
+        stxt = " / ".join(f"{s}{v:+.2f}" for s, v in slips)
+        bad = [s for s, v in slips if v < -tol]
+        if bad:
+            return {"txt": "PULL", "cls": "fl-moved",
+                    "title": f"rev {rev} slippage {stxt} - "
+                             f"{'/'.join(bad)} side(s) beyond "
+                             f"-{tol:.2f}: off the quote "
+                             "(\u2a2f in the cell) or refresh "
+                             "(\u27f3 / Q)"}
+        return {"txt": f"GOOD r{rev}", "cls": "fl-ok",
+                "title": f"rev {rev} \u00b7 {at} \u00b7 slippage "
+                         f"{stxt or 'n/a'} - favorable or within "
+                         f"{tol:.2f}"}
+    drift = 0.0
+    for q, c in ((qb, calc.get("bid")), (qa, calc.get("ask"))):
+        if q is not None and c is not None:
+            drift = max(drift, abs(q - c))
+    if drift > tol:
+        return {"txt": "REQUOTE", "cls": "fl-moved",
+                "title": f"standing rev {rev} off model by {drift:.2f} "
+                         f"(tol {tol:.2f}) - press Q; rev {rev} "
+                         "is kept in history"}
+    return {"txt": f"GOOD r{rev}", "cls": "fl-ok",
+            "title": f"standing quote rev {rev} \u00b7 {at} \u00b7 "
+                     f"within {tol:.2f} of model - good to trade"}
+
+
+@app.get("/api/rfq/secs")
+def api_rfq_secs():
+    """RFQ security universe = the Nuke Station book: sec_id +
+    short_name from shared state, ISIN / company from refdata.
+    The entry box matches on either short name or ISIN.
+    (This route was referenced by the page but never existed -
+    the picker has been silently empty until now.)"""
+    try:
+        st = _rfq_state() or {}
+        ids = st.get("ids") or sorted(
+            (st.get("rows") or {}).keys(), key=str)
+        out = []
+        for sid in ids:
+            rows = st.get("rows") or {}
+            row = rows.get(str(sid)) or rows.get(sid) or {}
+            try:
+                rd = _rfq_refdata(sid) or {}
+            except Exception:
+                rd = {}
+            out.append({"sec_id": str(sid),
+                        "short_name": (row.get("short_name") or
+                                       rd.get("short_name") or ""),
+                        "isin": rd.get("isin") or "",
+                        "company": rd.get("company_name") or ""})
+        return {"ok": True, "secs": out}
+    except Exception as e:
+        return JSONResponse(status_code=500,
+                            content={"ok": False, "error": str(e)})
+
+
+@app.get("/api/rfq/list")
+def api_rfq_list(_bg: int = 0):
+    try:
+        now = time.time()
+        if not _bg and RFQ_SNAP["data"] is not None:
+            fresh = now - RFQ_SNAP["ts"] < RFQ_LIST_TTL
+            if not fresh and not RFQ_SNAP.get("busy"):
+                RFQ_SNAP["busy"] = True
+                def _rebuild():
+                    try:
+                        api_rfq_list(_bg=1)
+                        RFQ_SNAP["err"] = None
+                    except Exception as _e1:
+                        RFQ_SNAP["err"] = str(_e1)
+                    finally:
+                        RFQ_SNAP["busy"] = False
+                threading.Thread(target=_rebuild,
+                                 daemon=True).start()
+            return RFQ_SNAP["data"]   # instant: stale-while-revalidate
+        if not _bg and RFQ_SNAP["data"] is None:
+            # cold start: answer NOW, build behind the paint
+            if not RFQ_SNAP.get("busy"):
+                RFQ_SNAP["busy"] = True
+                def _rb0():
+                    try:
+                        api_rfq_list(_bg=1)
+                        RFQ_SNAP["err"] = None
+                    except Exception as _e0:
+                        RFQ_SNAP["err"] = str(_e0)
+                    finally:
+                        RFQ_SNAP["busy"] = False
+                threading.Thread(target=_rb0,
+                                 daemon=True).start()
+            return {"ok": True, "rows": [], "cold": 1,
+                    "err": RFQ_SNAP.get("err"),
+                    "ms": 0, "qttl": RFQ_QUOTE_TTL,
+                    "editable": sorted(RFQ_EDITABLE)}
+        _t0 = time.time()
+        _ensure_rfq()
+        conn = rc.connect()
         try:
-            await run_in_threadpool(db_log, user, "disconnect", {})
-        except Exception:
-            pass
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT rfq_id, created_at, trade_date, created_by, sec_id, "
+                    "short_name, isin, ric, und_fx, sec_fx, fx_ref, ccy, "
+                    "style, sides, hit, qty, client, "
+                    "bid_px, ask_px, bid_at, ask_at, q_spot, q_fx, "
+                    "stock_ref, delta, notes, status, ack_by, ack_at, q_rev, "
+                    "refresh_by, refresh_at, tol, off_flag, off_by, off_at, "
+                    "req_vs, req_fx, q_delta, ord_side, ord_level, ord_level2, adj_req, auto_q, off_bid, off_ask, "
+                    "last_updated, updated_by, row_version "
+                    "FROM cba_app.rfq ORDER BY rfq_id DESC LIMIT 200")
+                cols = [d[0] for d in cur.description]
+                _did_off = False
+                rows = [{c: ("" if v is None else str(v))
+                         for c, v in zip(cols, r)} for r in cur.fetchall()]
+            qmap = _rfq_qty_map([r.get("sec_id") for r in rows])
+            _pr = []
+            for _r0 in rows:
+                _ps = _fnum(_r0.get("stock_ref"))
+                if _ps is not None and _r0.get("status") not in\
+                        ("DONE", "CANCELLED"):
+                    _st2 = _rfq_state() or {}
+                    _rw2 = (_st2.get("rows") or {}).get(
+                        int(_r0.get("sec_id") or 0), {}) or {}
+                    _pr.append((_r0.get("sec_id"), _ps,
+                        _fnum(_r0.get("fx_ref")) if
+                        _fnum(_r0.get("fx_ref")) is not None else
+                        _fnum(_rw2.get("ovdUndFx")),
+                        _fnum(_rw2.get("ovdCbFx"))))
+            # true-pricing service is ALWAYS async, single-flight:
+            # a pass never waits on the nuke wire; rows use the
+            # last completed prime (45s memo) and the trace names
+            # the source.
+            if _pr and not RFQ_SNAP.get("pbusy"):
+                RFQ_SNAP["pbusy"] = True
+                def _pw(_p=_pr):
+                    try:
+                        _nuke_px_prime(_p)
+                    except Exception:
+                        pass
+                    finally:
+                        RFQ_SNAP["pbusy"] = False
+                threading.Thread(target=_pw, daemon=True).start()
+            conn2 = rc.connect()
+            cur2 = conn2.cursor()
+            for r in rows:
+                r["_tok"] = r["row_version"]
+                _s = str(r.get("sec_id") or "")
+                _q = qmap.get(int(_s)) if _s.isdigit() else None
+                r["live_qty"] = "" if _q is None else f"{_q:,.0f}"
+                frozen = r.get("status") == "CANCELLED"
+                hit_watch = r.get("status") == "HIT"
+                ovd_s = _fnum(r.get("stock_ref"))
+                if ovd_s is None:
+                    ovd_s = _fnum(r.get("req_vs"))
+                ovd_d = _fnum(r.get("delta"))
+                ovd_f = _fnum(r.get("fx_ref"))
+                if ovd_f is None:
+                    ovd_f = _fnum(r.get("req_fx"))
+                if frozen:
+                    live = {}
+                    trk = {"stock_ref": None, "fx_ref": None,
+                           "delta": None}
+                else:
+                    trk = _rfq_track(r.get("sec_id"), r.get("ric"),
+                                     r.get("und_fx"))
+                    live = _rfq_live(r.get("sec_id"), r.get("style"))
+                    q = live if (ovd_s is None and ovd_d is None) \
+                        else _rfq_live(r.get("sec_id"),
+                                       r.get("style"),
+                                       ovd_spot=ovd_s,
+                                       ovd_delta=ovd_d,
+                                       ovd_fx=ovd_f)
+                    r["calc_bid"] = "" if q.get("bid") is None \
+                        else f"{q['bid']:.2f}"
+                    r["calc_ask"] = "" if q.get("ask") is None \
+                        else f"{q['ask']:.2f}"
+                    _qb = _fnum(r.get("bid_px"))
+                    _qa = _fnum(r.get("ask_px"))
+                    r["slip_bid"] = "" \
+                        if (_qb is None or q.get("bid") is None) \
+                        else f"{q['bid'] - _qb:+.2f}"
+                    r["slip_ask"] = "" \
+                        if (_qa is None or q.get("ask") is None) \
+                        else f"{_qa - q['ask']:+.2f}"
+                _nvs = live.get("nvs")
+                r["live_spot"] = (f"{_nvs:g}" if _nvs is not None
+                    else "" if trk["stock_ref"] is None
+                    else f"{trk['stock_ref']:g}")
+                _nfx = live.get("nfx")
+                r["live_und"] = (f"{_nfx:g}" if _nfx is not None
+                    else "" if trk["fx_ref"] is None
+                    else f"{trk['fx_ref']:g}")
+                r["live_delta"] = "" if trk["delta"] is None \
+                    else f"{trk['delta']:g}"
+                _qb2 = live.get("nqb")
+                _qb2 = live.get("bid") if _qb2 is None else _qb2
+                _qa2 = live.get("nqa")
+                _qa2 = live.get("ask") if _qa2 is None else _qa2
+                r["live_bid"] = "" if _qb2 is None \
+                    else f"{_qb2:.2f}"
+                r["live_ask"] = "" if _qa2 is None \
+                    else f"{_qa2:.2f}"
+                r["live_ts"] = live.get("ts") or ""
+                _sn2 = (live.get("sn") or "").strip()
+                if _sn2:
+                    r["short_name"] = _sn2
+                _nd = live.get("nd")
+                r["live_delta"] = "" if _nd is None \
+                    else "%.0f %%" % _nd
+                _qbF = _fnum(r.get("bid_px"))
+                _qaF = _fnum(r.get("ask_px"))
+                _lbF = _fnum(r.get("live_bid"))
+                _laF = _fnum(r.get("live_ask"))
+                r["pd_bid"] = ("" if (_qbF is None or not _lbF)
+                    else "%+.2f%%" % ((_qbF - _lbF) / _lbF * 100))
+                r["pd_ask"] = ("" if (_qaF is None or not _laF)
+                    else "%+.2f%%" % ((_qaF - _laF) / _laF * 100))
+                r["nk_xb"] = "" if live.get("xb") is None else str(live["xb"])
+                r["nk_xa"] = "" if live.get("xa") is None else str(live["xa"])
+                r["nk_x"] = "" if live.get("x2") is None else str(live["x2"])
+                r["orb"] = "" if live.get("orb") is None else str(live["orb"])
+                r["ora"] = "" if live.get("ora") is None else str(live["ora"])
+                qb, qa = r.get("bid_at"), r.get("ask_at")
+                r["quoted"] = max([t for t in (qb, qa) if t], default="")
+                if hit_watch:
+                    r["flag"] = ("HIT " + str(r.get("hit") or "").upper()).strip()
+                    r["flag_cls"] = "fl-moved"
+                    r["flag_title"] = ("client dealt - awaiting "
+                                       "trader ACK / REJ; quote "
+                                       "frozen at the deal, live "
+                                       "still tracking")
+                elif frozen:
+                    r["flag"] = "DONE" if r["status"] == "DONE" \
+                        else "CXL"
+                    r["flag_cls"] = "fl-none"
+                    r["flag_title"] = ("updates stopped - refs "
+                                       "frozen at status change")
+                else:
+                    if r.get("status") == "QUOTED":
+                        try:
+                            import datetime as _dt2
+                            _qt = (r.get("bid_at") or
+                                   r.get("ask_at") or "")[:19]
+                            _age = ((_dt2.datetime.now() -
+                                _dt2.datetime.strptime(_qt,
+                                "%Y-%m-%d %H:%M:%S"))
+                                .total_seconds()) if _qt else 0
+                            if _age > RFQ_QUOTE_TTL:
+                                _rvE = int(r.get("row_version") or 0)
+                                _revE = int(r.get("q_rev") or 0) + 1
+                                cur2.execute(
+                                    "UPDATE cba_app.rfq SET "
+                                    "bid_px=NULL, ask_px=NULL, "
+                                    "q_rev=%s, status="
+                                    "'REQUESTED', "
+                                    "off_flag='expired', "
+                                    "off_by='timeout', "
+                                    "off_at=NOW(), off_bid=%s, "
+                                    "off_ask=%s, "
+                                    "last_updated=NOW(), "
+                                    "updated_by='timeout', "
+                                    "row_version=row_version+1 "
+                                    "WHERE rfq_id=%s AND "
+                                    "row_version=%s",
+                                    (_revE,
+                                     _fnum(r.get("bid_px")),
+                                     _fnum(r.get("ask_px")),
+                                     r["rfq_id"], _rvE))
+                                if cur2.rowcount:
+                                    cur2.execute(
+                                        "INSERT INTO cba_app.rfq_quote_hist (rfq_id, rev, bid, ask, quoted_by, quoted_at, action) VALUES (%s,%s,NULL,NULL,'timeout',NOW(),'expired')",
+                                        (r["rfq_id"], _revE))
+                                    _did_off = True
+                                    r.update(status="REQUESTED",
+                                        off_flag="expired",
+                                        bid_px="", ask_px="",
+                                        q_rev=str(_revE),
+                                        row_version=str(_rvE+1),
+                                        _tok=str(_rvE+1))
+                        except Exception:
+                            pass
+                    q2 = {"bid": _fnum(r.get("live_bid")),
+                          "ask": _fnum(r.get("live_ask"))}
+                    if q2["bid"] is None and q2["ask"] is None:
+                        q2 = q
+                    fl = _rfq_flag(r, q2)
+                    if (fl["txt"] == "PULL"
+                            and str(r.get("auto_q") or "") in
+                            ("2", "2.0")
+                            and r.get("status") in ("QUOTED",
+                                                    "WORKING")):
+                        try:
+                            cbf = q2["bid"]
+                            caf = q2["ask"]
+                            _rvf = int(r.get("row_version") or 0)
+                            _revf = int(r.get("q_rev") or 0) + 1
+                            if cbf is None and caf is None:
+                                raise Exception(
+                                    "no live to follow")
+                            nbf = None if cbf is None else \
+                                round(round(cbf / 0.05) * 0.05, 2)
+                            naf = None if caf is None else \
+                                round(round(caf / 0.05) * 0.05, 2)
+                            cur2.execute(
+                                "UPDATE cba_app.rfq SET "
+                                "bid_px=COALESCE(%s, bid_px), "
+                                "ask_px=COALESCE(%s, ask_px), "
+                                "bid_at=NOW(), "
+                                "ask_at=NOW(), q_spot=%s, q_fx=%s, q_delta=%s, "
+                                "stock_ref=COALESCE(%s, stock_ref), "
+                                "fx_ref=COALESCE(%s, fx_ref), "
+                                "delta=COALESCE(%s, delta), "
+                                "q_rev=%s, last_updated=NOW(), "
+                                "updated_by='autopilot', "
+                                "row_version=row_version+1 "
+                                "WHERE rfq_id=%s AND row_version=%s",
+                                (nbf, naf,
+                                 _fnum(r.get("live_spot")),
+                                 _fnum(r.get("live_und")),
+                                 live.get("nd"),
+                                 _fnum(r.get("live_spot")),
+                                 _fnum(r.get("live_und")),
+                                 live.get("nd"),
+                                 _revf, r["rfq_id"], _rvf))
+                            if cur2.rowcount:
+                                cur2.execute(
+                                    "INSERT INTO cba_app.rfq_quote_hist (rfq_id, rev, bid, ask, spot, fx, delta, quoted_by, quoted_at, action) VALUES (%s,%s,%s,%s,%s,%s,%s,'autopilot',NOW(),'auto-follow')",
+                                    (r["rfq_id"], _revf, nbf, naf,
+                                     _fnum(r.get("live_spot")),
+                                     _fnum(r.get("live_und")),
+                                     _fnum(r.get("delta"))))
+                                _did_off = True
+                                r.update(bid_px="" if nbf is None else "%.2f" % nbf,
+                                    ask_px="" if naf is None else "%.2f" % naf,
+                                    q_rev=str(_revf),
+                                    row_version=str(_rvf + 1),
+                                    _tok=str(_rvf + 1))
+                                fl = _rfq_flag(r, q2)
+                        except Exception as _e2:
+                            fl["txt"] += " \u26a0"
+                            fl["title"] = (fl.get("title") or ""
+                                ) + " [follow err: %s]" % _e2
+                    elif (fl["txt"] == "PULL"
+                            and str(r.get("auto_q") or "") in
+                            ("1", "1.0")
+                            and r.get("status") in ("QUOTED",
+                                                    "WORKING")):
+                        try:
+                            _rv = int(r.get("row_version") or 0)
+                            _rev = int(r.get("q_rev") or 0) + 1
+                            _ob = _fnum(r.get("bid_px"))
+                            _oa = _fnum(r.get("ask_px"))
+                            cur2.execute(
+                                "UPDATE cba_app.rfq SET "
+                                "bid_px=NULL, ask_px=NULL, "
+                                "bid_at=NULL, ask_at=NULL, "
+                                "q_rev=%s, status=%s, "
+                                "off_flag='auto', "
+                                "off_by='auto-tol', "
+                                "off_at=NOW(), "
+                                "off_bid=%s, off_ask=%s, "
+                                "refresh_by=NULL, refresh_at=NULL, "
+                                "last_updated=NOW(), "
+                                "updated_by='auto-tol', "
+                                "row_version=row_version+1 "
+                                "WHERE rfq_id=%s AND "
+                                "row_version=%s",
+                                (_rev, "REQUESTED", _ob, _oa,
+                                 r["rfq_id"], _rv))
+                            if not cur2.rowcount:
+                                fl["txt"] += " \u26a0"
+                                fl["title"] = (fl.get("title") or "") + " [auto-off skipped: version race]"
+                            if cur2.rowcount:
+                                cur2.execute(
+                                    "INSERT INTO cba_app.rfq_quote_hist (rfq_id, rev, bid, ask, "
+                                    "spot, fx, delta, quoted_by, quoted_at, action) VALUES "
+                                    "(%s,%s,%s,%s,%s,%s,%s,"
+                                    "'auto-tol',NOW(),'auto-off')",
+                                    (r["rfq_id"], _rev, _ob, _oa,
+                                     _fnum(r.get("stock_ref")),
+                                     _fnum(r.get("fx_ref")),
+                                     _fnum(r.get("delta"))))
+                                cur2.execute(
+                                    "INSERT INTO cba_app.rfq_log (rfq_id, field_name, old_value, "
+                                    "new_value, changed_by, changed_at) VALUES "
+                                    "(%s,'auto-off',%s,%s,"
+                                    "'auto-tol',NOW())",
+                                    (r["rfq_id"],
+                                     fl["title"][:180],
+                                     "breach -> quote OFF \u00b7 ADJUSTING"))
+                                _did_off = True
+                                r["status"] = "REQUESTED"
+                                r["off_flag"] = "auto"
+                                r["off_by"] = "auto-tol"
+                                r["bid_px"] = r["ask_px"] = ""
+                                r["bid_at"] = r["ask_at"] = ""
+                                r["q_rev"] = str(_rev)
+                                r["row_version"] = str(_rv + 1)
+                                r["_tok"] = str(_rv + 1)
+                                fl = _rfq_flag(r, q)
+                        except Exception:
+                            pass
+                    if (_fnum(r.get("bid_px")) is None
+                            and _fnum(r.get("ask_px")) is None
+                            and r.get("off_flag") != "expired"
+                            and str(r.get("auto_q") or "") in
+                            ("1", "1.0", "True")):
+                        try:
+                            lb2 = q2["bid"]
+                            la2 = q2["ask"]
+                            cb2 = _fnum(r.get("calc_bid"))
+                            ca2 = _fnum(r.get("calc_ask"))
+                            _t2 = _fnum(r.get("tol"))
+                            tl = _t2 if (_t2 and _t2 > 0) else RFQ_PX_TOL
+                            back = all(
+                                abs(x - y) <= tl for x, y in
+                                ((cb2, lb2), (ca2, la2))
+                                if x is not None and y is not None) and ((cb2 is not None and lb2 is not None) or (ca2 is not None and la2 is not None))
+                            if back:
+                                _rv2 = int(r.get("row_version") or 0)
+                                _rev2 = int(r.get("q_rev") or 0) + 1
+                                nb2 = None if cb2 is None else round(round(cb2 / 0.05) * 0.05, 2)
+                                na2 = None if ca2 is None else round(round(ca2 / 0.05) * 0.05, 2)
+                                cur2.execute(
+                                    "UPDATE cba_app.rfq SET "
+                                    "bid_px=%s, ask_px=%s, "
+                                    "bid_at=NOW(), ask_at=NOW(), "
+                                    "q_spot=%s, q_fx=%s, "
+                                    "q_rev=%s, status=%s, "
+                                    "off_flag=NULL, off_by=NULL, "
+                                    "off_at=NULL, off_bid=NULL, "
+                                    "off_ask=NULL, "
+                                    "last_updated=NOW(), "
+                                    "updated_by='autopilot', "
+                                    "row_version=row_version+1 "
+                                    "WHERE rfq_id=%s AND "
+                                    "row_version=%s",
+                                    (nb2, na2,
+                                     _fnum(r.get("live_spot")),
+                                     _fnum(r.get("live_und")),
+                                     _rev2,
+                                     "WORKING" if r.get("ord_side") else "QUOTED",
+                                     r["rfq_id"], _rv2))
+                                if cur2.rowcount:
+                                    cur2.execute(
+                                        "INSERT INTO cba_app.rfq_quote_hist (rfq_id, rev, bid, ask, spot, fx, delta, quoted_by, quoted_at, action) VALUES (%s,%s,%s,%s,%s,%s,%s,'autopilot',NOW(),'auto-restore')",
+                                        (r["rfq_id"], _rev2, nb2, na2,
+                                         _fnum(r.get("live_spot")),
+                                         _fnum(r.get("live_und")),
+                                         _fnum(r.get("delta"))))
+                                    _did_off = True
+                                    r.update(status=("WORKING" if r.get("ord_side") else "QUOTED"),
+                                        off_flag="", off_by="",
+                                        bid_px="" if nb2 is None else "%.2f" % nb2,
+                                        ask_px="" if na2 is None else "%.2f" % na2,
+                                        q_rev=str(_rev2),
+                                        row_version=str(_rv2 + 1), _tok=str(_rv2 + 1))
+                                    fl = _rfq_flag(r, q2)
+                        except Exception as _e:
+                            fl["txt"] += " \u26a0"
+                            fl["title"] = (fl.get("title") or ""
+                                ) + " [autopilot err: %s]" % _e
+                    _aq = str(r.get("auto_q") or "")
+                    _mode = ("FOLW(2)" if _aq in ("2", "2.0")
+                             else "TOL(1)" if _aq in
+                             ("1", "1.0", "True") else "manual")
+                    r["flag"], r["flag_cls"] = fl["txt"], fl["cls"]
+                    r["flag_title"] = (fl["title"] or "") + \
+                        " \u00b7 algo: " + _mode
+            try:
+                if _did_off:
+                    conn2.commit()
+            finally:
+                try:
+                    cur2.close()
+                    conn2.close()
+                except Exception:
+                    pass
+            payload = {"ok": True, "rows": rows,
+                       "ms": int((time.time() - _t0) * 1000),
+                       "qttl": RFQ_QUOTE_TTL,
+                       "build": "r79",
+                       "editable": sorted(RFQ_EDITABLE)}
+            RFQ_SNAP["data"] = payload
+            RFQ_SNAP["ts"] = time.time()
+            return payload
+        finally:
+            conn.close()
+    except Exception as e:
+        return JSONResponse(status_code=500,
+                            content={"ok": False, "error": str(e)})
 
 
-PAGE = """<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>CB nuke station</title>
+class RfqCreate(BaseModel):
+    sec_id: str = ""
+    short_name: str = ""
+    style: str = "outright"
+    sides: str = "two_way"
+    qty: str = ""
+    client: str = ""
+    user: str = "lagrange"
+    ord_side: str = ""      # "", buy, sell, two -> working order
+    ord_level: str = ""
+    ord_level2: str = ""   # ask-side level for two-way orders
+    vs: str = ""            # stock ref (required for versus orders)
+    fx: str = ""
+    delta: str = ""
+
+
+@app.post("/api/rfq/create")
+def api_rfq_create(req: RfqCreate, request: Request):
+    if req.style not in RFQ_STYLES:
+        return JSONResponse(status_code=400, content={
+            "ok": False, "error": "style must be outright, vs or working"})
+    if req.sides not in RFQ_SIDES:
+        return JSONResponse(status_code=400, content={
+            "ok": False, "error": "sides must be two_way, bid or ask"})
+    user = ((getattr(request.state, "auth", None) or {}).get("user")
+            or (req.user or "lagrange").strip()[:50] or "lagrange")
+    try:
+        _ensure_rfq()
+        qty = None
+        if str(req.qty).strip():
+            try:
+                qty = _Dec(str(req.qty).replace(",", ""))
+            except _DecErr:
+                return JSONResponse(status_code=400, content={
+                    "ok": False, "error": f"Invalid number: {req.qty!r}"})
+        conn = rc.connect()
+        try:
+            with conn.cursor() as cur:
+                # identifier mapping at submission - refdata is the
+                # authority (ric / sec_fx=ccy / und_fx / isin), latest
+                # cb_nuke batch is the fallback
+                m_isin = m_ric = m_undfx = m_secfx = None
+                if req.sec_id:
+                    rd = _rfq_refdata(req.sec_id)
+                    m_isin = (rd.get("isin") or "").strip() or None
+                    m_ric = (rd.get("ric") or "").strip() or None
+                    m_undfx = (rd.get("und_fx") or "").strip() or None
+                    m_secfx = (rd.get("sec_fx") or "").strip() or None
+                    if not (m_isin and m_ric and m_undfx):
+                        try:
+                            cur.execute(
+                                "SELECT isin, ric, und_fx FROM "
+                                "cba_app.cb_nuke WHERE sec_id=%s AND "
+                                "saved_at=(SELECT MAX(saved_at) FROM "
+                                "cba_app.cb_nuke) LIMIT 1", (req.sec_id,))
+                            hit = cur.fetchone()
+                            if hit:
+                                m_isin = m_isin or hit[0]
+                                m_ric = m_ric or hit[1]
+                                m_undfx = m_undfx or hit[2]
+                        except Exception:
+                            pass
+                    st = _rfq_state() or {}
+                    m_ric = _rfq_stock_ric(st, req.sec_id, m_ric)
+                    def _pk(d, k):
+                        return (d.get(k) or d.get(str(k)) or
+                                (d.get(int(k)) if str(k).isdigit() else None))
+                    row = _pk(st.get("rows", {}) or {}, req.sec_id) or {}
+                    m_undfx = (row.get("und_fx") or m_undfx or None)
+                _ords = (req.ord_side or "").strip().lower()
+                if _ords not in ("buy", "sell", "two"):
+                    _ords = ""
+                # order direction never forces the side: the
+                # side stays as chosen (two-way / bid / ask);
+                # client BUYS only makes the bid level compulsory,
+                # client SELLS the ask level.
+                _sides = req.sides
+                _st0 = "REQUESTED"   # orders show ORD REQ until quoted
+                def _cn(x):
+                    return _fnum(str(x or "").replace("%", "")
+                                 .replace(",", ""))
+                _lvl = _cn(req.ord_level)
+                _lvl2 = _cn(req.ord_level2)
+                _vs = _cn(req.vs)
+                _fx = _cn(req.fx)
+                _dl = _cn(req.delta)
+                _btol = _baq = None
+                if m_isin:
+                    try:
+                        cur.execute("SELECT tol, autopilot FROM "
+                                    "cba_app.rfq_bond_cfg "
+                                    "WHERE isin=%s", (m_isin,))
+                        _h2 = cur.fetchone()
+                        if _h2:
+                            _btol = _h2[0]
+                            _baq = int(_h2[1]) if _h2[1] else None
+                    except Exception:
+                        pass
+                if _ords:
+                    if _ords in ("buy", "two") and _lvl is None:
+                        raise BLVal("client BUYS: bid level is compulsory")
+                    if _ords in ("sell", "two") and _lvl2 is None:
+                        raise BLVal("client SELLS: ask level is compulsory")
+                cur.execute(
+                    "INSERT INTO cba_app.rfq (created_at, trade_date, created_by, "
+                    "sec_id, short_name, isin, ric, und_fx, sec_fx, ccy, "
+                    "style, sides, qty, client, ord_side, ord_level, ord_level2, "
+                    "req_vs, req_fx, delta, tol, auto_q, "
+                    "status, updated_by, row_version) VALUES "
+                    "(NOW(), CURDATE(), %s, %s, %s, %s, %s, %s, %s, %s, %s, "
+                    "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 0)",
+                    (user, req.sec_id or None, req.short_name[:64],
+                     m_isin, m_ric,
+                     (m_undfx or "")[:24] or None,
+                     (m_secfx or "")[:10] or None,
+                     (m_secfx or "")[:10] or None,
+                     req.style, _sides, qty,
+                     (req.client or "").strip()[:100] or None,
+                     _ords or None, _lvl, _lvl2, _vs, _fx, _dl,
+                     _btol, _baq,
+                     _st0, user))
+                rid = cur.lastrowid
+                cur.execute(
+                    "INSERT INTO cba_app.rfq_log (rfq_id, field_name, "
+                    "old_value, new_value, changed_by, changed_at) "
+                    "VALUES (%s,'created','',%s,%s,NOW())",
+                    (rid, (f"{req.style}/{_sides} qty "
+                           f"{req.qty or '-'} "
+                           + (f"ORDER client {_ords} @ {req.ord_level or '-'} "
+                              if _ords else "")
+                           + f"{req.short_name}")[:200], user))
+            conn.commit()
+            return {"ok": True, "rfq_id": rid}
+        finally:
+            conn.close()
+    except Exception as e:
+        return JSONResponse(status_code=500,
+                            content={"ok": False, "error": str(e)})
+
+
+class RfqEdit(BaseModel):
+    rfq_id: int
+    field: str
+    value: str = ""
+    token: str = "0"
+    user: str = "lagrange"
+
+
+@app.post("/api/rfq/edit")
+def api_rfq_edit(req: RfqEdit, request: Request):
+    f = req.field
+    if f not in RFQ_EDITABLE:
+        return JSONResponse(status_code=400, content={
+            "ok": False, "error": f"Field '{f}' is not editable."})
+    user = ((getattr(request.state, "auth", None) or {}).get("user")
+            or (req.user or "lagrange").strip()[:50] or "lagrange")
+    v = req.value.strip()
+    try:
+        if f == "hit" and v not in ("", "bid", "ask"):
+            raise BLVal("hit must be blank, bid or ask")
+        if f == "status" and v not in RFQ_STATUS:
+            raise BLVal("Status must be REQUESTED, QUOTED, WORKING, HIT, DONE or CANCELLED.")
+        if f == "style" and v not in RFQ_STYLES:
+            raise BLVal("style must be outright, vs or working")
+        if f == "sides" and v not in RFQ_SIDES:
+            raise BLVal("sides must be two_way, bid or ask")
+        if f == "isin" and v and len(v) != 12:
+            raise BLVal("ISIN must be exactly 12 characters (or blank).")
+        if f == "trade_date" and v:
+            try:
+                _dt.strptime(v, "%Y-%m-%d")
+            except ValueError:
+                raise BLVal("trade_date must be YYYY-MM-DD.")
+        val = v or None
+        if f in ("qty", "stock_ref", "fx_ref", "delta") and v:
+            try:
+                val = _Dec(v.replace(",", ""))
+            except _DecErr:
+                raise BLVal(f"Invalid number: {v!r}")
+            if f == "delta" and not (_Dec("0") <= val <= _Dec("100")):
+                raise BLVal("Delta must be between 0 and 100 (percent).")
+            if f == "qty" and val < 0:
+                raise BLVal("Quantity must be >= 0.")
+        _ensure_rfq()
+        conn = rc.connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT `%s`, row_version, sec_id, style "
+                            "FROM cba_app.rfq "
+                            "WHERE rfq_id=%%s FOR UPDATE" % f,
+                            (req.rfq_id,))
+                hit = cur.fetchone()
+                if not hit:
+                    conn.rollback()
+                    return JSONResponse(status_code=404, content={
+                        "ok": False, "error": "rfq not found"})
+                old, rv, r_sec, r_style = hit
+                _LWW = ("tol", "auto_q", "notes", "client",
+                        "qty", "ord_level", "ord_level2",
+                        "req_vs", "req_fx", "q_delta", "db1", "db1s",
+                        "db2", "db2s", "da1", "da1s",
+                        "da2", "da2s",
+                        "stock_ref", "fx_ref", "delta")
+                if f not in _LWW and \
+                        int(rv or 0) != int(req.token or 0):
+                    conn.rollback()
+                    return JSONResponse(status_code=409, content={
+                        "ok": False,
+                        "error": "Row changed underneath you (someone else "
+                                 "edited it) - refreshing; please re-apply."})
+                extra_sql, extra_vals = "", []
+                if f == "hit":
+                    cur.execute("SELECT status, bid_px, ask_px, "
+                                "ric, und_fx, stock_ref, fx_ref, "
+                                "delta, ord_side FROM cba_app.rfq "
+                                "WHERE rfq_id=%s", (req.rfq_id,))
+                    (h_st, h_pb, h_pa, h_ric, h_ufx, h_os, h_of,
+                     h_od, h_ord) = cur.fetchone()
+                    if v in ("bid", "ask"):
+                        if h_st in ("DONE", "CANCELLED"):
+                            raise BLVal("Line is booked / "
+                                        "cancelled - hit is "
+                                        "locked.")
+                        if h_st not in ("QUOTED", "WORKING",
+                                        "HIT"):
+                            raise BLVal("Client can only deal on "
+                                        "a standing quote - "
+                                        "status must be QUOTED "
+                                        "or WORKING (press Q "
+                                        "first).")
+                        px = h_pb if v == "bid" else h_pa
+                        if _fnum(px) is None:
+                            raise BLVal(f"No standing {v} to "
+                                        "deal on - quote that "
+                                        "side first.")
+                        trk = _rfq_track(r_sec, h_ric, h_ufx)
+                        eff = {
+                            "stock_ref": _fnum(h_os)
+                            if _fnum(h_os) is not None
+                            else trk["stock_ref"],
+                            "fx_ref": _fnum(h_of)
+                            if _fnum(h_of) is not None
+                            else trk["fx_ref"],
+                            "delta": _fnum(h_od)
+                            if _fnum(h_od) is not None
+                            else trk["delta"]}
+                        for col in ("stock_ref", "fx_ref",
+                                    "delta"):
+                            if eff[col] is not None:
+                                extra_sql += f", `{col}`=%s"
+                                extra_vals.append(eff[col])
+                        extra_sql += (", status='HIT', "
+                                      "refresh_by=NULL, "
+                                      "refresh_at=NULL, "
+                                      "q_spot=%s, q_fx=%s")
+                        extra_vals += [eff["stock_ref"],
+                                       eff["fx_ref"]]
+                    elif v == "" and h_st == "HIT":
+                        rev_st = "WORKING" if (r_style ==
+                            "working" or h_ord) else (
+                            "QUOTED" if (_fnum(h_pb) is not None
+                                         or _fnum(h_pa)
+                                         is not None)
+                            else "REQUESTED")
+                        extra_sql += ", status=%s"
+                        extra_vals.append(rev_st)
+                if f == "status" and v in ("DONE", "CANCELLED"):
+                    cur.execute("SELECT sec_id, ric, und_fx, stock_ref, "
+                                "fx_ref, delta, style FROM cba_app.rfq "
+                                "WHERE rfq_id=%s", (req.rfq_id,))
+                    (fs, fric, fufx, fo_s, fo_f, fo_d,
+                     fsty) = cur.fetchone()
+                    trk = _rfq_track(fs, fric, fufx)
+                    # trader overrides win; live only fills blanks
+                    eff = {
+                        "stock_ref": _fnum(fo_s)
+                        if _fnum(fo_s) is not None
+                        else trk["stock_ref"],
+                        "fx_ref": _fnum(fo_f)
+                        if _fnum(fo_f) is not None
+                        else trk["fx_ref"],
+                        "delta": _fnum(fo_d)
+                        if _fnum(fo_d) is not None
+                        else trk["delta"]}
+                    frz = []
+                    for col, oldv in (("stock_ref", fo_s),
+                                      ("fx_ref", fo_f),
+                                      ("delta", fo_d)):
+                        if eff[col] is not None:
+                            extra_sql += f", `{col}`=%s"
+                            extra_vals.append(eff[col])
+                            if str(oldv) != str(eff[col]):
+                                frz.append((col, oldv, eff[col]))
+                    cur.execute("SELECT bid_px, ask_px FROM "
+                                "cba_app.rfq WHERE rfq_id=%s",
+                                (req.rfq_id,))
+                    _qb, _qa = cur.fetchone()
+                    lvq = _rfq_live(fs, fsty,
+                                    ovd_spot=eff["stock_ref"],
+                                    ovd_delta=eff["delta"])
+                    for col, cur_v, pv in (
+                            ("bid_px", _qb, lvq.get("bid")),
+                            ("ask_px", _qa, lvq.get("ask"))):
+                        if _fnum(cur_v) is None and pv is not None:
+                            extra_sql += f", `{col}`=%s"
+                            extra_vals.append(pv)
+                    extra_sql += (", bid_at=NOW(), ask_at=NOW(), "
+                                  "q_spot=%s, q_fx=%s")
+                    extra_vals += [eff["stock_ref"], eff["fx_ref"]]
+                cur.execute(
+                    ("UPDATE cba_app.rfq SET `%s`=%%s" % f) + extra_sql +
+                    ", last_updated=NOW(), updated_by=%s, "
+                    "row_version=row_version+1 "
+                    "WHERE rfq_id=%s AND row_version=%s",
+                    [val] + extra_vals + [user, req.rfq_id, rv])
+                cur.execute(
+                    "INSERT INTO cba_app.rfq_log (rfq_id, field_name, "
+                    "old_value, new_value, changed_by, changed_at) "
+                    "VALUES (%s,%s,%s,%s,%s,NOW())",
+                    (req.rfq_id, f,
+                     None if old is None else str(old),
+                     None if val is None else str(val), user))
+                if f == "status" and v in ("DONE", "CANCELLED"):
+                    for col, oldv, newv in frz:
+                        cur.execute(
+                            "INSERT INTO cba_app.rfq_log (rfq_id, "
+                            "field_name, old_value, new_value, changed_by, "
+                            "changed_at) VALUES (%s,%s,%s,%s,%s,NOW())",
+                            (req.rfq_id, col,
+                             None if oldv is None else str(oldv),
+                             str(newv), user))
+            conn.commit()
+            if f == "hit" and v:
+                if True:   # side-consistency: ALL roles
+                    with conn.cursor() as c5:
+                        c5.execute("SELECT sides FROM cba_app.rfq "
+                                   "WHERE rfq_id=%s",
+                                   (req.rfq_id,))
+                        _sd = ((c5.fetchone() or ["two_way"])[0]
+                               or "two_way")
+                    _okb = _sd in ("two_way", "bid")
+                    _oka = _sd in ("two_way", "ask", "offer")
+                    if ((v == "bid" and not _okb)
+                            or (v == "ask" and not _oka)):
+                        return JSONResponse(status_code=409,
+                            content={"ok": False, "error":
+                            "side is '%s' - only the %s can be hit on this trade" % (_sd, "bid" if _okb else "ask")})
+            if f == "auto_q" and (_fnum(v) or 0) in (1, 2):
+                with conn.cursor() as c4:
+                    c4.execute("SELECT tol FROM cba_app.rfq "
+                               "WHERE rfq_id=%s", (req.rfq_id,))
+                    _ht = c4.fetchone()
+                if not _ht or _ht[0] is None:
+                    return JSONResponse(status_code=409,
+                        content={"ok": False, "error":
+                        "arming TOL/FOLW needs a Tol value "
+                        "on the row first"})
+            if f in ("tol", "auto_q"):
+                try:
+                    with conn.cursor() as c3:
+                        c3.execute("SELECT isin, short_name FROM "
+                                   "cba_app.rfq WHERE rfq_id=%s",
+                                   (req.rfq_id,))
+                        _bi = c3.fetchone()
+                        if _bi and (_bi[0] or "").strip():
+                            _col = ("tol" if f == "tol" else
+                                    "autopilot")
+                            c3.execute(
+                                "INSERT INTO cba_app.rfq_bond_cfg (isin, short_name, " + _col + ", updated_by, updated_at) VALUES (%s,%s,%s,%s,NOW()) ON DUPLICATE KEY UPDATE " + _col +
+                                "=VALUES(" + _col + "), updated_by=VALUES(updated_by), updated_at=NOW()",
+                                (_bi[0].strip().upper()[:20],
+                                 (_bi[1] or "")[:64],
+                                 _fnum(v) if f == "tol" else
+                                 (int(_fnum(v) or 0) or None),
+                                 user))
+                    conn.commit()
+                except Exception:
+                    pass
+            return {"ok": True, "token": str(int(rv or 0) + 1),
+                    "value": "" if val is None else str(val)}
+        finally:
+            conn.close()
+    except BLVal as e:
+        return JSONResponse(status_code=400,
+                            content={"ok": False, "error": str(e)})
+    except Exception as e:
+        return JSONResponse(status_code=500,
+                            content={"ok": False, "error": str(e)})
+
+
+def _rfq_track(sec_id, r_ric="", r_undfx=""):
+    """Live-tracked refs: stock_ref <- override spot chain, fx_ref <-
+    override und-fx chain, delta <- nDelta*100. Pure computation - never
+    writes, never bumps row_version."""
+    st = _rfq_state() or {}
+    def _pk(d, k):
+        return (d.get(k) or d.get(str(k)) or
+                (d.get(int(k)) if str(k).isdigit() else None))
+    row = _pk(st.get("rows", {}) or {}, sec_id) or {}
+    nk = _pk(st.get("nuke", {}) or {}, sec_id) or {}
+    rfx = st.get("rfx", {}) or {}
+    ric = _rfq_stock_ric(st, sec_id, nk.get("ric") or r_ric or "")
+    fxric = (row.get("und_fx") or r_undfx or "")
+    sref = _fnum(row.get("ovdSpot"))
+    if sref is None and ric:
+        sref = _fnum((rfx.get(ric) or {}).get("last"))
+    if sref is None:
+        sref = _fnum(nk.get("liveSpot"))
+    fref = _fnum(row.get("ovdUndFx"))
+    if fref is None and fxric:
+        fref = _fnum((rfx.get(fxric) or {}).get("last"))
+    if fref is None:
+        fref = _fnum(nk.get("nSpotFx"))
+    nd = _fnum(nk.get("nDelta"))
+    return {"stock_ref": sref, "fx_ref": fref,
+            "delta": None if nd is None else round(nd * 100.0, 2)}
+
+
+class RfqQuote(BaseModel):
+    rfq_id: int
+    token: str = "0"
+    user: str = "lagrange"
+    side: str = "both"
+
+
+@app.post("/api/rfq/quote")
+def api_rfq_quote(req: RfqQuote, request: Request):
+    """Confirm the current computed Bid/Ask as the STANDING client
+    quote: snap to the 0.05 grid, bump q_rev, stamp q_spot/q_fx/
+    bid_at/ask_at, append to rfq_quote_hist, and auto-advance
+    REQUESTED -> QUOTED. The previous standing quote survives in
+    history."""
+    user = ((getattr(request.state, "auth", None) or {}).get("user")
+            or (req.user or "lagrange").strip()[:50] or "lagrange")
+    try:
+        if os.environ.get("LAGRANGE_TEST_LIVE") != "FILE":
+            _c0 = rc.connect()
+            try:
+                with _c0.cursor() as _k0:
+                    _k0.execute("SELECT stock_ref, fx_ref FROM "
+                                "cba_app.rfq WHERE rfq_id=%s",
+                                (req.rfq_id,))
+                    _h0 = _k0.fetchone()
+                if _h0 and (_h0[0] is None or _h0[1] is None):
+                    return JSONResponse(status_code=400, content={
+                        "ok": False, "error": "cannot quote: "
+                        "OvdSpot and OvdFx are required"})
+            finally:
+                _c0.close()
+        _ensure_rfq()
+        conn = rc.connect()
+        try:
+            with conn.cursor() as cur:
+                if req.side not in ("both", "bid", "ask"):
+                    raise BLVal("side must be both, bid or ask")
+                cur.execute("SELECT status, style, sec_id, ric, "
+                            "und_fx, stock_ref, fx_ref, delta, "
+                            "q_rev, row_version, bid_px, ask_px, "
+                            "ord_side FROM cba_app.rfq "
+                            "WHERE rfq_id=%s FOR UPDATE",
+                            (req.rfq_id,))
+                r = cur.fetchone()
+                if not r:
+                    conn.rollback()
+                    return JSONResponse(status_code=404, content={
+                        "ok": False, "error": "rfq not found"})
+                (status, style, sec_id, ric, undfx, o_s, o_f, o_d,
+                 q_rev, rv, cur_b, cur_a, q_ord) = r
+                if int(rv or 0) != int(req.token or 0):
+                    conn.rollback()
+                    return JSONResponse(status_code=409, content={
+                        "ok": False,
+                        "error": "Row changed underneath you - "
+                                 "refreshing; please re-quote."})
+                if status in ("HIT", "DONE", "CANCELLED"):
+                    raise BLVal("Frozen line - cannot requote a "
+                                "HIT / DONE / CANCELLED RFQ.")
+                trk = _rfq_track(sec_id, ric, undfx)
+                eff_s = _fnum(o_s) if _fnum(o_s) is not None \
+                    else trk["stock_ref"]
+                eff_f = _fnum(o_f) if _fnum(o_f) is not None \
+                    else trk["fx_ref"]
+                eff_d = _fnum(o_d) if _fnum(o_d) is not None \
+                    else trk["delta"]
+                lv = _rfq_live(sec_id, style, ovd_fx=eff_f,
+                               ovd_spot=eff_s,
+                               ovd_delta=eff_d)
+                if lv.get("bid") is None and lv.get("ask") is None:
+                    raise BLVal("No model quote - nuke this "
+                                "security first.")
+                def grid(x):
+                    return None if x is None else \
+                        round(round(x / 0.05) * 0.05, 2)
+                qb = grid(lv.get("bid")) if req.side in \
+                    ("both", "bid") else _fnum(cur_b)
+                qa = grid(lv.get("ask")) if req.side in \
+                    ("both", "ask") else _fnum(cur_a)
+                if req.side == "bid" and grid(lv.get("bid")) \
+                        is None:
+                    raise BLVal("No model bid to refresh to.")
+                if req.side == "ask" and grid(lv.get("ask")) \
+                        is None:
+                    raise BLVal("No model ask to refresh to.")
+                if qb is None and qa is None:
+                    raise BLVal("cannot quote: no model prices "
+                                "to confirm (both sides empty)")
+                rev = int(q_rev or 0) + 1
+                new_status = (("WORKING" if q_ord else "QUOTED")
+                              if status in ("REQUESTED",
+                                            "IMPROVE")
+                              else status)
+                cur.execute(
+                    "UPDATE cba_app.rfq SET bid_px=%s, ask_px=%s, "
+                    "q_spot=%s, q_fx=%s, "
+                    "refresh_by=NULL, refresh_at=NULL, "
+                    "off_flag=NULL, off_by=NULL, off_at=NULL, "
+                    + ("bid_at=NOW(), " if req.side in
+                       ("both", "bid") else "")
+                    + ("ask_at=NOW(), " if req.side in
+                       ("both", "ask") else "")
+                    + "q_rev=%s, status=%s, q_delta=%s, "
+                    "adj_req=NULL, "
+                    "last_updated=NOW(), updated_by=%s, "
+                    "row_version=row_version+1 "
+                    "WHERE rfq_id=%s AND row_version=%s",
+                    (qb, qa, eff_s, eff_f, rev, new_status,
+                     (eff_d if eff_d is not None
+                      else lv.get("nd")), user,
+                     req.rfq_id, rv))
+                cur.execute(
+                    "INSERT INTO cba_app.rfq_quote_hist (rfq_id, "
+                    "rev, bid, ask, spot, fx, delta, quoted_by, "
+                    "quoted_at, action) VALUES "
+                    "(%s,%s,%s,%s,%s,%s,%s,%s,NOW(),%s)",
+                    (req.rfq_id, rev, qb, qa, eff_s, eff_f, eff_d,
+                     user, req.side))
+                cur.execute(
+                    "INSERT INTO cba_app.rfq_log (rfq_id, "
+                    "field_name, old_value, new_value, changed_by,"
+                    " changed_at) VALUES "
+                    "(%s,'quote',%s,%s,%s,NOW())",
+                    (req.rfq_id, f"rev {rev - 1}",
+                     f"rev {rev}: {qb} / {qa}", user))
+            conn.commit()
+            return {"ok": True, "token": str(int(rv or 0) + 1),
+                    "rev": rev, "bid": qb, "ask": qa,
+                    "status": new_status}
+        finally:
+            conn.close()
+    except BLVal as e:
+        return JSONResponse(status_code=400,
+                            content={"ok": False, "error": str(e)})
+    except Exception as e:
+        return JSONResponse(status_code=500,
+                            content={"ok": False, "error": str(e)})
+
+
+class RfqRefresh(BaseModel):
+    rfq_id: int
+    token: str = "0"
+    user: str = "lagrange"
+
+
+@app.post("/api/rfq/refresh")
+def api_rfq_refresh(req: RfqRefresh, request: Request):
+    """Sales asks the trader to refresh the quote: stamps
+    refresh_by / refresh_at on an active line. Cleared
+    automatically by any trader quote op (Q / side refresh /
+    pull)."""
+    user = ((getattr(request.state, "auth", None) or {}).get("user")
+            or (req.user or "lagrange").strip()[:50] or "lagrange")
+    try:
+        _ensure_rfq()
+        conn = rc.connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT status, refresh_by, row_version "
+                            "FROM cba_app.rfq WHERE rfq_id=%s "
+                            "FOR UPDATE", (req.rfq_id,))
+                r = cur.fetchone()
+                if not r:
+                    conn.rollback()
+                    return JSONResponse(status_code=404, content={
+                        "ok": False, "error": "rfq not found"})
+                status, old_rf, rv = r
+                if int(rv or 0) != int(req.token or 0):
+                    conn.rollback()
+                    return JSONResponse(status_code=409, content={
+                        "ok": False,
+                        "error": "Row changed underneath you - "
+                                 "refreshing; please retry."})
+                if status in ("HIT", "DONE", "CANCELLED"):
+                    raise BLVal("Frozen line - nothing to refresh.")
+                cur.execute(
+                    "UPDATE cba_app.rfq SET refresh_by=%s, "
+                    "refresh_at=NOW(), last_updated=NOW(), "
+                    "updated_by=%s, row_version=row_version+1 "
+                    "WHERE rfq_id=%s AND row_version=%s",
+                    (user, user, req.rfq_id, rv))
+                cur.execute(
+                    "INSERT INTO cba_app.rfq_log (rfq_id, "
+                    "field_name, old_value, new_value, changed_by,"
+                    " changed_at) VALUES "
+                    "(%s,'refresh',%s,%s,%s,NOW())",
+                    (req.rfq_id, old_rf or "", user, user))
+            conn.commit()
+            return {"ok": True, "token": str(int(rv or 0) + 1),
+                    "refresh_by": user}
+        finally:
+            conn.close()
+    except BLVal as e:
+        return JSONResponse(status_code=400,
+                            content={"ok": False, "error": str(e)})
+    except Exception as e:
+        return JSONResponse(status_code=500,
+                            content={"ok": False, "error": str(e)})
+
+
+class RfqPull(BaseModel):
+    rfq_id: int
+    token: str = "0"
+    user: str = "lagrange"
+    side: str = "both"
+
+
+@app.post("/api/rfq/pull")
+def api_rfq_pull(req: RfqPull, request: Request):
+    """OFF the quote: clear the standing bid / ask / both. Pulling
+    the last standing side reverts QUOTED -> REQUESTED. Logged as
+    a revision (action pull*) so the withdrawal is auditable."""
+    user = ((getattr(request.state, "auth", None) or {}).get("user")
+            or (req.user or "lagrange").strip()[:50] or "lagrange")
+    try:
+        if req.side not in ("both", "bid", "ask"):
+            raise BLVal("side must be both, bid or ask")
+        _ensure_rfq()
+        conn = rc.connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT status, bid_px, ask_px, q_rev, "
+                            "stock_ref, fx_ref, delta, row_version "
+                            "FROM cba_app.rfq WHERE rfq_id=%s "
+                            "FOR UPDATE", (req.rfq_id,))
+                r = cur.fetchone()
+                if not r:
+                    conn.rollback()
+                    return JSONResponse(status_code=404, content={
+                        "ok": False, "error": "rfq not found"})
+                (status, cur_b, cur_a, q_rev, o_s, o_f, o_d,
+                 rv) = r
+                if int(rv or 0) != int(req.token or 0):
+                    conn.rollback()
+                    return JSONResponse(status_code=409, content={
+                        "ok": False,
+                        "error": "Row changed underneath you - "
+                                 "refreshing; please retry."})
+                if status in ("HIT", "DONE", "CANCELLED"):
+                    raise BLVal("Frozen line - nothing to pull.")
+                pull_b = req.side in ("both", "bid")
+                pull_a = req.side in ("both", "ask")
+                if pull_b and pull_a and _fnum(cur_b) is None \
+                        and _fnum(cur_a) is None:
+                    raise BLVal("No standing quote to pull.")
+                if req.side == "bid" and _fnum(cur_b) is None:
+                    raise BLVal("No standing bid to pull.")
+                if req.side == "ask" and _fnum(cur_a) is None:
+                    raise BLVal("No standing ask to pull.")
+                nb = None if pull_b else _fnum(cur_b)
+                na = None if pull_a else _fnum(cur_a)
+                rev = int(q_rev or 0) + 1
+                _pulled_all = nb is None and na is None
+                new_status = "REQUESTED" if (_pulled_all and
+                    status == "QUOTED") else status
+                _off = _pulled_all and status in ("QUOTED",
+                                                 "WORKING")
+                cur.execute(
+                    "UPDATE cba_app.rfq SET bid_px=%s, ask_px=%s, "
+                    "refresh_by=NULL, refresh_at=NULL, "
+                    + ("off_flag='manual', off_by=%s, "
+                       "off_at=NOW(), " if _off else "")
+                    + "q_rev=%s, status=%s, last_updated=NOW(), "
+                    "updated_by=%s, row_version=row_version+1 "
+                    "WHERE rfq_id=%s AND row_version=%s",
+                    ([nb, na] + ([user] if _off else [])
+                     + [rev, new_status, user, req.rfq_id,
+                        rv]))
+                act = "pull" if req.side == "both" \
+                    else "pull_" + req.side
+                cur.execute(
+                    "INSERT INTO cba_app.rfq_quote_hist (rfq_id, "
+                    "rev, bid, ask, spot, fx, delta, quoted_by, "
+                    "quoted_at, action) VALUES "
+                    "(%s,%s,%s,%s,%s,%s,%s,%s,NOW(),%s)",
+                    (req.rfq_id, rev, nb, na, _fnum(o_s),
+                     _fnum(o_f), _fnum(o_d), user, act))
+                cur.execute(
+                    "INSERT INTO cba_app.rfq_log (rfq_id, "
+                    "field_name, old_value, new_value, changed_by,"
+                    " changed_at) VALUES "
+                    "(%s,'quote',%s,%s,%s,NOW())",
+                    (req.rfq_id, f"rev {rev - 1}",
+                     f"rev {rev}: {act}", user))
+            conn.commit()
+            return {"ok": True, "token": str(int(rv or 0) + 1),
+                    "rev": rev, "status": new_status}
+        finally:
+            conn.close()
+    except BLVal as e:
+        return JSONResponse(status_code=400,
+                            content={"ok": False, "error": str(e)})
+    except Exception as e:
+        return JSONResponse(status_code=500,
+                            content={"ok": False, "error": str(e)})
+
+
+@app.get("/api/rfq/history")
+def api_rfq_history(rfq_id: int = 0):
+    """Quoting history for one RFQ, newest first, for the side
+    panel."""
+    try:
+        _ensure_rfq()
+        conn = rc.connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT rev, action, bid, ask, spot, fx, delta, "
+                    "quoted_by, quoted_at FROM "
+                    "cba_app.rfq_quote_hist WHERE rfq_id=%s "
+                    "ORDER BY rev DESC LIMIT 100", (rfq_id,))
+                cols = ["rev", "action", "bid", "ask", "spot", "fx",
+                        "delta", "quoted_by", "quoted_at"]
+                rows = [{c: ("" if v is None else str(v))
+                         for c, v in zip(cols, rr)}
+                        for rr in cur.fetchall()]
+                cur.execute(
+                    "SELECT field_name, old_value, new_value, "
+                    "changed_by, changed_at FROM cba_app.rfq_log "
+                    "WHERE rfq_id=%s ORDER BY log_id DESC "
+                    "LIMIT 120", (rfq_id,))
+                ecols = ["field", "old", "new", "by", "at"]
+                events = [{c: ("" if v is None else str(v))
+                           for c, v in zip(ecols, rr)}
+                          for rr in cur.fetchall()]
+            return {"ok": True, "rows": rows, "events": events}
+        finally:
+            conn.close()
+    except Exception as e:
+        return JSONResponse(status_code=500,
+                            content={"ok": False, "error": str(e)})
+
+
+class RfqAck(BaseModel):
+    rfq_id: int
+    token: str = "0"
+    user: str = "lagrange"
+
+
+@app.post("/api/rfq/ack")
+def api_rfq_ack(req: RfqAck, request: Request):
+    """Trader acknowledgment of a hit & done trade: stamps ack_by /
+    ack_at. Requires status DONE and a hit side; optimistic lock;
+    logged to rfq_log."""
+    user = ((getattr(request.state, "auth", None) or {}).get("user")
+            or (req.user or "lagrange").strip()[:50] or "lagrange")
+    try:
+        _ensure_rfq()
+        conn = rc.connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT status, hit, ack_by, row_version "
+                            "FROM cba_app.rfq WHERE rfq_id=%s "
+                            "FOR UPDATE", (req.rfq_id,))
+                r = cur.fetchone()
+                if not r:
+                    conn.rollback()
+                    return JSONResponse(status_code=404, content={
+                        "ok": False, "error": "rfq not found"})
+                status, hitside, old_ack, rv = r
+                if int(rv or 0) != int(req.token or 0):
+                    conn.rollback()
+                    return JSONResponse(status_code=409, content={
+                        "ok": False,
+                        "error": "Row changed underneath you - "
+                                 "refreshing; please re-ack."})
+                if status not in ("HIT", "DONE"):
+                    raise BLVal("Only HIT (client-dealt) trades "
+                                "can be acknowledged.")
+                if hitside not in ("bid", "ask"):
+                    raise BLVal("Set Hit (bid or ask) first - ack "
+                                "confirms the dealt side.")
+                cur.execute("UPDATE cba_app.rfq SET ack_by=%s, "
+                            "ack_at=NOW(), status='DONE', "
+                            "last_updated=NOW(), "
+                            "updated_by=%s, "
+                            "row_version=row_version+1 "
+                            "WHERE rfq_id=%s AND row_version=%s",
+                            (user, user, req.rfq_id, rv))
+                cur.execute("INSERT INTO cba_app.rfq_log (rfq_id, "
+                            "field_name, old_value, new_value, "
+                            "changed_by, changed_at) VALUES "
+                            "(%s,'ack',%s,%s,%s,NOW())",
+                            (req.rfq_id, old_ack, user, user))
+            conn.commit()
+            return {"ok": True, "token": str(int(rv or 0) + 1),
+                    "ack_by": user}
+        finally:
+            conn.close()
+    except BLVal as e:
+        return JSONResponse(status_code=400,
+                            content={"ok": False, "error": str(e)})
+    except Exception as e:
+        return JSONResponse(status_code=500,
+                            content={"ok": False, "error": str(e)})
+
+
+RFQ_UPLOAD_ENABLED = False        # flip to True to write trade_blotter
+
+
+class RfqUpload(BaseModel):
+    rfq_id: int
+    user: str = "lagrange"
+
+
+class RfqReject(BaseModel):
+    rfq_id: int
+    token: str = ""
+    user: str = ""
+
+
+@app.post("/api/rfq/reject")
+def api_rfq_reject(req: RfqReject, request: Request):
+    """Trader busts a HIT: back to the pre-hit state, hit
+    cleared, audited as 'reject'."""
+    try:
+        _ensure_rfq()
+        user = ((getattr(request.state, "auth", None) or {}).get("user")
+                or (req.user or "lagrange").strip()[:50] or "lagrange")
+        conn = rc.connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT status, hit, bid_px, ask_px, "
+                            "style, row_version, q_rev, stock_ref, "
+                            "fx_ref, delta, ord_side FROM cba_app.rfq "
+                            "WHERE rfq_id=%s", (req.rfq_id,))
+                row = cur.fetchone()
+                if not row:
+                    raise BLVal("RFQ not found.")
+                (status, hitside, pb, pa, style, rv, qrev,
+                 s_ref, f_ref, dlt, r_ord) = row
+                if status != "HIT":
+                    raise BLVal("Only HIT (client-dealt) lines "
+                                "can be rejected.")
+                if req.token and str(rv) != str(req.token):
+                    return JSONResponse(status_code=409, content={
+                        "ok": False, "error": "Row changed elsewhere - refreshed."})
+                rev_st = "REQUESTED"
+                # bust kills the quote; an ORDER row keeps
+                # ord_side and shows ORD REQ until re-quoted
+                cur.execute("UPDATE cba_app.rfq SET "
+                            "status=%s, "
+                            "hit=NULL, bid_px=NULL, ask_px=NULL, "
+                            "bid_at=NULL, ask_at=NULL, "
+                            "q_rev=q_rev+1, refresh_by=NULL, "
+                            "refresh_at=NULL, "
+                            "last_updated=NOW(), "
+                            "updated_by=%s, "
+                            "row_version=row_version+1 "
+                            "WHERE rfq_id=%s AND row_version=%s",
+                            (rev_st, user, req.rfq_id, rv))
+                # (rev_st already order-aware)
+                if cur.rowcount == 0:
+                    return JSONResponse(status_code=409, content={
+                        "ok": False, "error": "Row changed elsewhere - refreshed."})
+                cur.execute(
+                    "INSERT INTO cba_app.rfq_quote_hist (rfq_id, "
+                    "rev, bid, ask, spot, fx, delta, quoted_by, "
+                    "quoted_at, action) VALUES "
+                    "(%s,%s,%s,%s,%s,%s,%s,%s,NOW(),'reject')",
+                    (req.rfq_id, (qrev or 0) + 1, _fnum(pb),
+                     _fnum(pa), _fnum(s_ref), _fnum(f_ref),
+                     _fnum(dlt), user))
+                cur.execute(
+                    "INSERT INTO cba_app.rfq_log (rfq_id, field_name, "
+                    "old_value, new_value, changed_by, changed_at) "
+                    "VALUES (%s,'reject',%s,%s,%s,NOW())",
+                    (req.rfq_id, f"hit {hitside or '-'}",
+                     "busted -> REQUESTED \u00b7 quote pulled", user))
+            conn.commit()
+            return {"ok": True, "status": rev_st,
+                    "token": str(rv + 1)}
+        finally:
+            conn.close()
+    except BLVal as e:
+        return JSONResponse(status_code=400,
+                            content={"ok": False, "error": str(e)})
+    except Exception as e:
+        return JSONResponse(status_code=500,
+                            content={"ok": False, "error": str(e)})
+
+
+@app.post("/api/rfq/upload")
+def api_rfq_upload(req: RfqUpload, request: Request):
+    """Builds the exact trade_blotter row a DONE RFQ maps to. The INSERT is
+    fully implemented below but gated off (RFQ_UPLOAD_ENABLED=False) per
+    the current no-connection requirement - flipping the flag arms it."""
+    try:
+        _ensure_rfq()
+        conn = rc.connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT short_name, isin, ccy, style, sides, hit, qty, "
+                    "sec_fx, fx_ref, "
+                    "client, bid_px, ask_px, stock_ref, delta, status, ack_by "
+                    "FROM cba_app.rfq WHERE rfq_id=%s", (req.rfq_id,))
+                r = cur.fetchone()
+                if not r:
+                    return JSONResponse(status_code=404, content={
+                        "ok": False, "error": "rfq not found"})
+                (short_name, isin, ccy, style, sides, hitside, qty,
+                 sec_fx, fx_ref, client,
+                 bid_px, ask_px, stock_ref, delta, status,
+                 ack_by) = r
+                if status != "DONE":
+                    raise BLVal("Only DONE RFQs can be staged for upload.")
+                if hitside not in ("bid", "ask"):
+                    raise BLVal("Set Hit (bid or ask) first - it decides "
+                                "client side and price.")
+                if not ack_by:
+                    raise BLVal("Trader ack required before upload - "
+                                "click ACK on the line first.")
+                px = bid_px if hitside == "bid" else ask_px
+                if px is None:
+                    raise BLVal(f"No {hitside} px on this RFQ.")
+                if not client:
+                    raise BLVal("Client is required before upload.")
+                # our bid dealt -> client SELLS to us; our ask -> client BUYS
+                side = "SELL" if hitside == "bid" else "BUY"
+                b_isin, b_type, b_ccy, b_fx = isin, None, ccy, None
+                cur.execute(
+                    f"SELECT isin, bond_type, bond_currency, fx_rate "
+                    f"FROM {BLOTTER_DB}.bond_mappings "
+                    f"WHERE bond_name=%s LIMIT 1", (short_name,))
+                mrow = cur.fetchone()
+                if mrow:
+                    b_isin = b_isin or mrow[0]
+                    b_type = mrow[1]
+                    b_ccy = b_ccy or mrow[2]
+                    b_fx = mrow[3]
+            blotter_row = {
+                "trade_date": _date.today().isoformat(),
+                "client_side": side, "isin": b_isin or "",
+                "bond_name": short_name, "bond_type": b_type or "",
+                "bond_currency": b_ccy or sec_fx or "",
+                "fx_rate": "" if b_fx is None else str(b_fx),
+                "quantity": "" if qty is None else str(qty),
+                "price": str(px), "client_name": client,
+                "trade_type": style,          # blotter vocabulary already
+                "stock_ref": "" if stock_ref is None else str(stock_ref),
+                "fx_ref": "" if fx_ref is None else str(fx_ref),
+                "delta": "" if delta is None else str(delta),
+                "booked": "0",
+            }
+            if RFQ_UPLOAD_ENABLED:
+                cols = ", ".join(f"`{k}`" for k in blotter_row)
+                ph = ", ".join(["%s"] * len(blotter_row))
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"INSERT INTO {BLOTTER_DB}.{BLOTTER_TABLE} "
+                        f"({cols}, updated_by, row_version) "
+                        f"VALUES ({ph}, %s, 0)",
+                        list(blotter_row.values()) +
+                        [((getattr(request.state, "auth", None) or {})
+                          .get("user") or req.user)])
+                conn.commit()
+                _bl_notify()
+                return {"ok": True, "uploaded": True,
+                        "blotter_row": blotter_row}
+            return {"ok": True, "staged": True, "uploaded": False,
+                    "blotter_row": blotter_row,
+                    "note": "trade_blotter connection disabled "
+                            "(RFQ_UPLOAD_ENABLED=False) - row shown is "
+                            "exactly what will be inserted"}
+        finally:
+            conn.close()
+    except BLVal as e:
+        return JSONResponse(status_code=400,
+                            content={"ok": False, "error": str(e)})
+    except Exception as e:
+        return JSONResponse(status_code=500,
+                            content={"ok": False, "error": str(e)})
+
+
+# ----------------------------------------------------------------------
+# BAU task checklist (cba_app.bau_task / bau_task_log)
+# ----------------------------------------------------------------------
+_BAU_READY = False
+
+
+def _bau_conn():
+    return rc.connect()
+
+
+def _ensure_bau_schema():
+    global _BAU_READY
+    if _BAU_READY:
+        return
+    conn = _bau_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("CREATE DATABASE IF NOT EXISTS cba_app")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS cba_app.bau_task (
+                  task_id     INT AUTO_INCREMENT PRIMARY KEY,
+                  task_name   VARCHAR(200) NOT NULL,
+                  sched_time  TIME NULL,
+                  category    VARCHAR(50) NULL,
+                  notes       VARCHAR(500) NULL,
+                  sort_order  INT NOT NULL DEFAULT 100,
+                  is_active   TINYINT(1) NOT NULL DEFAULT 1,
+                  created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                  updated_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                              ON UPDATE CURRENT_TIMESTAMP
+                )""")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS cba_app.bau_task_log (
+                  task_id    INT NOT NULL,
+                  task_date  DATE NOT NULL,
+                  done       TINYINT(1) NOT NULL DEFAULT 0,
+                  done_at    DATETIME NULL,
+                  comment    VARCHAR(300) NULL,
+                  PRIMARY KEY (task_id, task_date)
+                )""")
+            cur.execute("SELECT COUNT(*) FROM cba_app.bau_task")
+            if cur.fetchone()[0] == 0:
+                cur.executemany(
+                    "INSERT INTO cba_app.bau_task "
+                    "(task_name, sched_time, category, sort_order) "
+                    "VALUES (%s, %s, %s, %s)",
+                    [("Export EQRMS Trade History txt + Refresh recon",
+                      "08:45:00", "AM", 10),
+                     ("Update cbanalytics DB + Delta & Price check",
+                      "09:15:00", "AM", 20),
+                     ("Send Trade Booking Recon email",
+                      "17:30:00", "EOD", 30)])
+        conn.commit()
+        _BAU_READY = True
+    finally:
+        conn.close()
+
+
+class BauLogReq(BaseModel):
+    task_id: int
+    date: str
+    done: Optional[bool] = None
+    comment: Optional[str] = None
+
+
+class BauTaskReq(BaseModel):
+    task_id: Optional[int] = None
+    task_name: str = ""
+    sched_time: Optional[str] = None    # "HH:MM"
+    category: Optional[str] = None
+    notes: Optional[str] = None
+    sort_order: int = 100
+    is_active: bool = True
+
+
+@app.get("/api/bau/list")
+def api_bau_list(date: str, include_inactive: bool = False):
+    _ensure_bau_schema()
+    day = rc.parse_date(date)
+    conn = _bau_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT t.task_id, t.task_name, t.sched_time, t.category, "
+                "       t.notes, t.sort_order, t.is_active, "
+                "       COALESCE(l.done, 0), l.done_at, l.comment "
+                "FROM cba_app.bau_task t "
+                "LEFT JOIN cba_app.bau_task_log l "
+                "  ON l.task_id = t.task_id AND l.task_date = %s "
+                + ("" if include_inactive else "WHERE t.is_active = 1 ")
+                + "ORDER BY t.sort_order, t.sched_time IS NULL, "
+                  "t.sched_time, t.task_id", (day,))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    out = []
+    for (tid, name, st, cat, notes, so, act, done, dat, com) in rows:
+        if isinstance(st, dt.timedelta):
+            tot = int(st.total_seconds())
+            st_str = "%02d:%02d" % (tot // 3600, (tot % 3600) // 60)
+        elif st is not None:
+            st_str = str(st)[:5]
+        else:
+            st_str = None
+        out.append(dict(
+            task_id=tid, task_name=name,
+            sched_time=st_str,
+            category=cat, notes=notes, sort_order=so,
+            is_active=bool(act), done=bool(done),
+            done_at=str(dat)[:16] if dat else None,
+            comment=com))
+    n_done = sum(1 for r in out if r["done"] and r["is_active"])
+    n_act = sum(1 for r in out if r["is_active"])
+    return {"ok": True, "date": str(day), "tasks": out,
+            "done": n_done, "total": n_act}
+
+
+@app.post("/api/bau/log")
+def api_bau_log(req: BauLogReq):
+    _ensure_bau_schema()
+    day = rc.parse_date(req.date)
+    conn = _bau_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("INSERT IGNORE INTO cba_app.bau_task_log "
+                        "(task_id, task_date) VALUES (%s, %s)",
+                        (req.task_id, day))
+            if req.done is not None:
+                cur.execute(
+                    "UPDATE cba_app.bau_task_log "
+                    "SET done=%s, done_at=%s "
+                    "WHERE task_id=%s AND task_date=%s",
+                    (1 if req.done else 0,
+                     dt.datetime.now().replace(microsecond=0)
+                     if req.done else None,
+                     req.task_id, day))
+            if req.comment is not None:
+                cur.execute(
+                    "UPDATE cba_app.bau_task_log SET comment=%s "
+                    "WHERE task_id=%s AND task_date=%s",
+                    (req.comment.strip()[:300] or None, req.task_id, day))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"ok": True}
+
+
+@app.post("/api/bau/task")
+def api_bau_task(req: BauTaskReq):
+    _ensure_bau_schema()
+    name = (req.task_name or "").strip()
+    if not name:
+        return JSONResponse(status_code=400,
+                            content={"ok": False, "error": "task_name required"})
+    st = (req.sched_time or "").strip() or None
+    conn = _bau_conn()
+    try:
+        with conn.cursor() as cur:
+            if req.task_id:
+                cur.execute(
+                    "UPDATE cba_app.bau_task SET task_name=%s, sched_time=%s, "
+                    "category=%s, notes=%s, sort_order=%s, is_active=%s "
+                    "WHERE task_id=%s",
+                    (name, st, req.category, req.notes, req.sort_order,
+                     1 if req.is_active else 0, req.task_id))
+            else:
+                cur.execute(
+                    "INSERT INTO cba_app.bau_task "
+                    "(task_name, sched_time, category, notes, sort_order, "
+                    " is_active) VALUES (%s, %s, %s, %s, %s, %s)",
+                    (name, st, req.category, req.notes, req.sort_order,
+                     1 if req.is_active else 0))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"ok": True}
+
+
+class BauDeleteReq(BaseModel):
+    task_id: int
+
+
+@app.post("/api/bau/delete")
+def api_bau_delete(req: BauDeleteReq):
+    """Hard delete: removes the task AND every daily record for it.
+    Archive is the safe alternative that keeps history."""
+    _ensure_bau_schema()
+    conn = _bau_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM cba_app.bau_task_log WHERE task_id=%s",
+                        (req.task_id,))
+            logs_deleted = cur.rowcount
+            cur.execute("DELETE FROM cba_app.bau_task WHERE task_id=%s",
+                        (req.task_id,))
+            task_deleted = cur.rowcount
+        conn.commit()
+    finally:
+        conn.close()
+    if not task_deleted:
+        return JSONResponse(status_code=404,
+                            content={"ok": False, "error": "task not found"})
+    return {"ok": True, "logs_deleted": logs_deleted}
+
+
+class BauArchiveReq(BaseModel):
+    task_id: int
+    is_active: bool = False
+
+
+@app.post("/api/bau/archive")
+def api_bau_archive(req: BauArchiveReq):
+    _ensure_bau_schema()
+    conn = _bau_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE cba_app.bau_task SET is_active=%s "
+                        "WHERE task_id=%s",
+                        (1 if req.is_active else 0, req.task_id))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"ok": True}
+
+
+# ----------------------------------------------------------------------
+# UI (single embedded page, no external assets)
+# ----------------------------------------------------------------------
+PAGE = r"""<!doctype html>
+<html><head><meta charset="utf-8"><title>Lagrange</title>
 <style>
-td[data-c="m_delta"],td[data-c="x_bid"]{min-width:52px}
-:root{
-  --bg:#ffffff; --panel:#f2f3f5; --panel2:#f7f8f9; --row:#f7f8fa; --hover:#eef0f3;
-  --rowsel:#e8eef7; --border:#e3e6ea; --border2:#c9ced4;
-  --text:#16181d; --muted:#5a6068; --faint:#8b919a;
-  --amber:#8a5b00; --amber-dim:#f7f1e2; --green:#106b3f; --red:#a8231b;
-  --blue:#274f8f; --teal:#0b6e66; --teal-dim:rgba(11,110,102,.08);
-  --selbg:rgba(39,79,143,.10); --selbg2:rgba(39,79,143,.18);
-  --mono:'Consolas','JetBrains Mono',monospace;
-}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--text);
-  font:12px/1.35 var(--mono)}
-header{display:flex;align-items:center;gap:10px;
-  padding:5px 12px;border-bottom:1px solid var(--border2);
-  background:var(--panel)}
-header h1{font-size:12px;font-weight:700;margin:0;letter-spacing:1.5px;
-  text-transform:uppercase}
-header span.sub{color:var(--faint);font-size:10px;font-family:var(--mono)}
-.conn{font-size:10px;line-height:1}
-td.gwarn{color:var(--amber)}
-.conn.ok{color:var(--green)} .conn.warn{color:var(--amber)} .conn.err{color:var(--red)}
-.tabs{margin-left:auto;display:flex;gap:0}
-.tabs button{padding:3px 11px;border-radius:0;font-size:10.5px;
-  letter-spacing:.6px;text-transform:uppercase}
-.tabs button.active{background:var(--text);border-color:var(--text);
-  color:#ffffff;font-weight:700}
-.layout{display:grid;grid-template-columns:172px 1fr;min-height:calc(100vh - 29px)}
-.side{border-right:1px solid var(--border);padding:8px;background:var(--panel2);
-  position:relative}
-#siderz{position:absolute;top:0;right:-3px;width:6px;height:100%;
-  cursor:col-resize;z-index:7}
-#siderz:hover{background:var(--amber);opacity:.4}
-.side.collapsed{padding:0}
-.side.collapsed label,.side.collapsed textarea,
-.side.collapsed button:not(#sidecol),.side.collapsed #siderz{display:none}
-#sidecol{position:absolute;top:1px;right:3px;width:auto;margin:0;
-  padding:0 3px;border:none;background:transparent;color:var(--faint);
-  font:11px var(--mono);cursor:pointer;z-index:8}
-#sidecol:hover{color:var(--amber);border:none;background:transparent}
-.side label{display:block;font-size:9px;color:var(--muted);margin-bottom:4px;
-  text-transform:uppercase;letter-spacing:.6px}
-.side textarea{width:100%;height:300px;resize:vertical;background:var(--bg);
-  color:var(--text);border:1px solid var(--border);border-radius:0;
-  padding:5px;font:11px var(--mono)}
-.side button{width:100%;margin-top:6px}
-main{padding:6px 8px;overflow-x:auto}
-button{background:var(--bg);color:var(--text);border:1px solid var(--border2);
-  border-radius:0;padding:3px 9px;font:11px var(--mono);cursor:pointer}
-button:hover{border-color:var(--text)}
-button:disabled{opacity:.4;cursor:default}
-button.primary{background:var(--text);border-color:var(--text);color:#ffffff;font-weight:700}
-button.primary:disabled{opacity:.5;cursor:wait}
-button.b-a{border-color:var(--border2);color:var(--amber)}
-button.b-a:hover{border-color:var(--amber);background:var(--amber-dim);color:var(--amber)}
-button.b-e{border-color:var(--border2);color:var(--blue);
-  box-shadow:inset 0 -2px 0 var(--teal)}
-button.b-e:hover{border-color:var(--blue);background:var(--rowsel);color:var(--blue)}
-button.b-t{border-color:var(--border2);color:var(--teal)}
-button.b-t:hover{border-color:var(--teal);background:var(--teal-dim);color:var(--teal)}
-button.b-g{border-color:var(--border2);color:var(--green)}
-button.b-g:hover{border-color:var(--green);background:#e9f5ee;color:var(--green)}
-button.b-r{border-color:var(--border2);color:var(--red)}
-button.b-r:hover{border-color:var(--red);background:#f9ebe9;color:var(--red)}
-.toprow{display:flex;align-items:baseline;gap:10px;margin:0 0 4px}
-.namebox{margin-left:auto;font:10px var(--mono);color:var(--muted);
-  background:var(--panel2);border:1px solid var(--border);border-radius:0;
-  padding:1px 8px;min-width:120px;text-align:center}
-.tablewrap{position:relative;border:1px solid var(--border2);border-radius:0;
-  overflow:auto;max-height:calc(100vh - 130px)}
-table{border-collapse:separate;border-spacing:0;font-family:var(--mono);
-  font-size:11.5px;white-space:nowrap;width:max-content}
-th,td{padding:2px 7px;border-bottom:1px solid var(--border);text-align:right;
-  background:var(--bg)}
-tr:nth-child(even) td{background:var(--row)}
-tr td.gM{background:#eef6f0} tr:nth-child(even) td.gM{background:#e8f1ea}
-tr td.gO{background:#f8f3e6} tr:nth-child(even) td.gO{background:#f3edda}
-tr td.gL{background:#edf3fb} tr:nth-child(even) td.gL{background:#e7eef8}
-tr td.gE{background:#f0f1f4} tr:nth-child(even) td.gE{background:#eaecf0}
-tr.rowsel td{background:var(--rowsel);
-  border-top:1px solid #0b6e66 !important;
-  border-bottom:1px solid #0b6e66 !important}
-tr.rowsel td:first-child{border-left:4px solid #0b6e66 !important}
-tr.rowsel td.stick1{font-weight:700;color:#0b6e66}
-tbody tr:hover td{background:var(--hover)}
-th{color:var(--muted);font-weight:700;font-size:9.5px;letter-spacing:.4px;
-  text-transform:uppercase;position:sticky;top:0;z-index:3;
-  background:var(--panel)!important;border-bottom:1px solid var(--text)}
-tr.band td{position:sticky;top:0;z-index:3;background:var(--panel)!important;
-  border-bottom:none;padding:3px 7px 0;color:var(--faint);
-  font-size:9px;text-transform:uppercase;letter-spacing:.7px;text-align:left}
-tr.band ~ tr th{top:16px}
-tr.band td.in{color:var(--amber)}
-tr.band td.gm{color:var(--green)}
-tr.band td.go{color:var(--amber)}
-tr.band td.gl{color:var(--blue)}
-tr.band td.ge{color:var(--muted);cursor:pointer}
-tr.band td.uin{color:var(--teal)}
-tr.band td.rfx{color:var(--blue);cursor:pointer}
-tr.band td.fxx{color:var(--teal);cursor:pointer}
-td.ref,th.ref{text-align:left;color:var(--muted)}
-td.co{max-width:180px;overflow:hidden;text-overflow:ellipsis}
-td.rf,th.rf{color:var(--blue)}
-td.fx,th.fx{color:var(--teal)}
-.stick0{position:sticky;left:0;z-index:2;min-width:28px;max-width:28px;
-  text-align:center!important;padding:2px 5px}
-.stick1{position:sticky;left:28px;z-index:2;min-width:97px;max-width:97px;
-  text-align:left}
-.stick2{position:sticky;left:125px;z-index:2;min-width:180px;max-width:180px}
-.stick3{position:sticky;left:305px;z-index:2;border-right:1px solid var(--border2)}
-th.stick0,th.stick1,th.stick2,th.stick3,tr.band td.stick0,tr.band td.stick3{z-index:4}
-.stick0 input[type=checkbox]{accent-color:var(--text);width:12px;height:12px;
+ body{margin:0;font:13px 'Segoe UI',Consolas,sans-serif;background:#f4f4f4;color:#1c1c1c}
+ header{background:#f0f0f0;border-bottom:1px solid #d8d8d8;padding:12px 18px;
+        font-weight:700;letter-spacing:2px}
+ header small{color:#6e6a63;font-weight:400;letter-spacing:0;margin-left:12px}
+ #tabs{display:flex;background:#fafafa;border-bottom:1px solid #d8d8d8}
+ .tab{padding:9px 18px;cursor:pointer;color:#6e6a63;border-bottom:3px solid transparent;
+      letter-spacing:1px;font-weight:700;user-select:none}
+ .tab.active{color:#1c1c1c;border-bottom-color:#0a7f45;background:#fff}
+ .bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;
+      padding:10px 18px;background:#fafafa;border-bottom:1px solid #d8d8d8}
+ select,input,button{font:13px 'Segoe UI',Consolas,sans-serif;padding:5px 8px;
+      border:1px solid #c9c9c9;background:#fff}
+ button{cursor:pointer}
+ .refresh{background:#0a7f45;color:#fff;border-color:#0a7f45;font-weight:700}
+ .sendnow{background:#8f5f00;color:#fff;border-color:#8f5f00;font-weight:700}
+ button:disabled{opacity:.45;cursor:not-allowed}
+ .status{padding:7px 18px;color:#6e6a63;background:#fff;
+         border-bottom:1px solid #e5e5e5;white-space:pre-wrap}
+ .status.err{color:#b3261e}
+ .status.ok{color:#0a7f45}
+ iframe{width:100%;height:calc(100vh - 205px);border:0;background:#fff}
+ label{color:#6e6a63}
+ .hide{display:none}
+/* ---- Trade Blotter: visual clone of the CB Trade Blotter app ---- */
+.blgrid{border-collapse:collapse;font:12px 'Segoe UI',Consolas,sans-serif;
+  white-space:nowrap;width:max-content}
+.blgrid th,.blgrid td{border:1px solid #d5d9d5;padding:2px 7px;
+  text-align:left;background:#fff}
+.blgrid th{background:#f2f3f2;position:sticky;top:0;z-index:2;
+  font-weight:600;color:#333;border-bottom:2px solid #c3c7c3}
+.blgrid tr.bdone td{background:#e7f4ea}
+.blgrid tr:hover td{background:#dcefe1}
+.blgrid tr.bunb:hover td{background:#f0f0f0}
+.blgrid td.bnum{text-align:right}
+.blgrid td.bst{font-weight:600;color:#1d7a3d}
+.blgrid tr.bunb td.bst{color:#c62828}
+.blgrid .dot{display:inline-block;width:8px;height:8px;border-radius:50%;
+  margin-right:5px;vertical-align:1px}
+.blgrid .dot.dg{background:#2e9e53} .blgrid .dot.dr{background:#d43a3a}
+.blgrid td.bck{text-align:center}
+.blgrid .cb{display:inline-block;width:13px;height:13px;
+  border:1px solid #9aa0a6;border-radius:2px;background:#fff;
+  font:11px/13px sans-serif;color:#fff;text-align:center}
+.blgrid .cb.on{background:#1a73e8;border-color:#1a73e8}
+.blgrid td.bna{color:#9aa0a6;text-align:center}
+.blgrid td.hd{color:#1d7a3d;font-weight:600;text-align:center}
+.blgrid td.ho{color:#b26a00;font-weight:700;text-align:center;background:#fdf3e0}
+.blgrid .dot.dy{background:#e0a100}
+.blgrid tr.bhedge td.bst{color:#b26a00}
+.blgrid th{position:relative}
+.blgrid .blh{cursor:pointer;user-select:none}
+.blgrid .blh:hover{color:#000}
+.blgrid .blrz{position:absolute;right:-3px;top:0;width:7px;height:100%;
+  cursor:col-resize;z-index:3}
+.blgrid .blrz:hover{background:#8a5b00;opacity:.4}
+.blgrid tr.blfr th{top:25px;padding:0;background:#fafbfa}
+.blgrid .blf{width:100%;border:0;background:transparent;padding:1px 6px;
+  font:11px 'Segoe UI',Consolas,sans-serif;outline:none;color:#444}
+.blgrid .blf:focus{background:#fff;box-shadow:inset 0 0 0 1px #8a5b00}
+.blgrid td.rq-open{color:#8a5b00} .blgrid td.rq-quoted{color:#274f8f}
+.blgrid td.rq-done{color:#1d7a3d}
+.blgrid td.rq-cxl{color:#9aa0a6;text-decoration:line-through}
+.blgrid td.rq-chip{color:#444}
+.blgrid td.rq-live{text-align:right}
+.blgrid td.rq-q{text-align:right}
+.blgrid td.rq-dp{text-align:right}
+.blgrid td.rq-dn{text-align:right}
+
+#rfq_tbl td.bed input[data-rf="trade_date"]{text-align:left;width:88px}
+#rfq_hist{position:fixed;top:52px;right:0;width:360px;bottom:0;
+  transform:translateX(105%);
+  background:var(--bg);border-left:1px solid var(--border2);z-index:60;
+  box-shadow:-4px 0 14px rgba(0,0,0,.18);padding:10px 12px;
+  overflow:auto;transition:transform .18s ease}
+#rfq_hist.on{transform:none}
+#rh_rz{position:absolute;left:0;top:0;bottom:0;width:6px;
+  cursor:ew-resize}
+#rh_rz:hover{background:rgba(28,28,28,.10)}
+.rh-sub{margin:14px 0 4px;font-weight:700;font-size:10px;
+  letter-spacing:1px;text-transform:uppercase;
+  border-bottom:1px solid var(--text);padding-bottom:3px}
+.rh-sub small{color:var(--faint);font-weight:400;letter-spacing:.2px;
+  text-transform:none;margin-left:6px}
+#rh_ev{border:1px solid var(--border2);width:100%}
+#rh_ev th{background:var(--panel);color:var(--muted);
+  font-weight:700;font-size:9.5px;letter-spacing:.4px;
+  text-transform:uppercase;border:none;
+  border-bottom:1px solid var(--text)}
+#rh_ev td{border:none;border-bottom:1px solid var(--border);
+  font-size:11px}
+#rh_ev th,#rh_ev td{padding:2px 6px;text-align:left}
+#rh_ev tbody tr:nth-child(even) td{background:var(--row)}
+#rh_ev td.rh-st{font-weight:700}
+#rf_cfg{font-size:13px}
+#rf_cfgp{position:fixed;top:84px;right:14px;z-index:65;
+  background:var(--bg);border:1px solid var(--border2);
+  border-top:2px solid var(--text);
+  box-shadow:0 6px 18px rgba(0,0,0,.12);
+  font:11px var(--mono);padding:10px 12px;width:200px}
+#rf_cfgp.hide{display:none}
+#rf_cfgp .cfg-t{font-weight:700;letter-spacing:1px;font-size:11px;
+  display:flex;justify-content:space-between;margin-bottom:6px}
+#rf_cfg_x{cursor:pointer;color:#a8231b}
+#rf_cfgp .cfg-s{color:var(--muted);font-size:9.5px;letter-spacing:.6px;
+  text-transform:uppercase;margin:8px 0 3px;border-bottom:1px
+  solid #efede7}
+#rf_cfgp label{display:inline-block;margin:1px 8px 1px 0;
   cursor:pointer}
-td.rowclick{cursor:pointer}
-.grp{border-left:1px solid var(--border2)}
-td.gc{padding:0;position:relative}
-td.gc input{width:100%;height:100%;background:transparent;border:1px solid transparent;
-  border-radius:0;padding:2px 7px;font:11.5px var(--mono);outline:none;
-  cursor:cell;user-select:none}
-td.gc input.editing{cursor:text;user-select:text}
-tbody tr:hover td.gc input{border-color:var(--border2)}
-td.inp input{color:var(--amber);text-align:right}
-td.inp input:not(:placeholder-shown){background:var(--amber-dim)}
-td.uinp input{color:var(--teal);text-align:left}
-td.uinp input:not(:placeholder-shown){background:var(--teal-dim)}
-td.gc.sel input{background:var(--selbg)!important}
-td.gc.sel input:not(:placeholder-shown){background:var(--selbg2)!important}
-td.gc.active input{box-shadow:inset 0 0 0 1px var(--amber)}
-td.uinp.active input{box-shadow:inset 0 0 0 1px var(--teal)}
-td.gc.fillprev input{box-shadow:inset 0 0 0 1px var(--amber);
-  background:rgba(138,91,0,.07)!important}
-td.gc input.justset{box-shadow:inset 0 0 0 1px var(--green)}
-.chips{position:absolute;left:1px;top:50%;transform:translateY(-50%);
-  display:none;gap:1px;z-index:1}
-td.inp:hover .chips,td.inp.active .chips{display:flex}
-.chips b{font:8px/1 var(--mono);font-weight:700;padding:1px 2px;
-  border:1px solid var(--border2);border-radius:0;color:var(--muted);
+#cfg_cols label{display:inline-block;width:60px}
+#cfg_reset,#cf_clear{margin-top:6px;width:100%;font:inherit;
+  border:1px solid var(--border2);background:var(--panel);
+  cursor:pointer;padding:3px}
+#cfg_reset:hover,#cf_clear:hover{border-color:var(--text)}
+#rf_cfgp .cf-row{display:flex;align-items:center;
+  justify-content:space-between;margin:3px 0}
+#rf_cfgp .cf-row span{color:var(--muted);font-size:10.5px}
+#rf_cfgp .cf-row input[type=color]{width:34px;height:18px;
+  padding:0;border:1px solid var(--border2)}
+#cf_fgx,#cf_bgx{cursor:pointer;color:#a8231b;padding:0 3px}
+#cf_w{font:inherit;border:1px solid var(--border2);padding:1px 4px;
+  width:52px;text-align:right}
+#rf_cfgp .cf-note{color:var(--faint);font-size:10px;margin:6px 0 2px}
+#rfq_hist .rh-head{display:flex;justify-content:space-between;
+  font-weight:700;font-size:13px;margin-bottom:4px}
+#rh_close{cursor:pointer;color:#a8231b;padding:0 4px}
+#rh_close:hover{background:#a8231b;color:#fff}
+#rfq_hist .rh-meta{color:var(--muted);font-size:11px;margin-bottom:8px}
+#rh_tbl th,#rh_tbl td{padding:2px 6px;font-size:11.5px;text-align:right}
+#rh_tbl th:nth-child(-n+3),#rh_tbl td:nth-child(-n+3){text-align:left}
+.blgrid td.rq-qd{font-style:italic;text-align:right}
+/* ---- RFQ: Nuke Station design system ---- */
+#tab-rfq{--bg:#ffffff;--panel:#f2f3f5;--panel2:#f7f8f9;
+  --row:#f7f8fa;--hover:#eef0f3;--border:#e3e6ea;
+  --border2:#c9ced4;--text:#16181d;--muted:#5a6068;
+  --faint:#8b919a;--amber:#8a5b00;--amber-dim:#f7f1e2;
+  --green:#106b3f;--red:#a8231b;--blue:#274f8f;--teal:#0b6e66;
+  --mono:'Consolas','JetBrains Mono',monospace}
+#tab-rfq .bar button{background:var(--bg);color:var(--text);
+  border:1px solid var(--border2);border-radius:0;
+  padding:3px 9px;font:11px var(--mono);cursor:pointer}
+#tab-rfq .bar button:hover{border-color:var(--text)}
+#tab-rfq .bar button#rf_send{background:var(--text);
+  border-color:var(--text);color:#fff;font-weight:700}
+#tab-rfq .bar input,#tab-rfq .bar select{
+  font:11px var(--mono);border:1px solid var(--border2);
+  border-radius:0;padding:3px 6px;background:var(--bg);
+  color:var(--text)}
+#tab-rfq .bar input:focus,#tab-rfq .bar select:focus{
+  outline:none;border-color:var(--text)}
+#tab-rfq .status{font:11px var(--mono);color:var(--muted)}
+/* ---- RFQ neat theme (Runs-style) ---- */
+#rf_cap{font:12px var(--mono);margin:10px 0 6px;
+  font-weight:700;letter-spacing:1.5px;color:var(--text);
+  text-transform:uppercase}
+#rf_cap small{color:var(--faint);font-weight:400;letter-spacing:.2px;
+  margin-left:10px;text-transform:none;font-size:10px}
+#rfq_tbl{font:11.5px var(--mono);border-collapse:separate;
+  border-spacing:0;border:1px solid var(--border2);
+  background:var(--bg)}
+#rfq_tbl.fs-s{font-size:10.5px}
+#rfq_tbl.fs-l{font-size:12.5px}
+#rfq_tbl select.rq-sel,#rfq_tbl td.bed input{
+  font:11.5px var(--mono)}
+#rfq_tbl.fs-s select.rq-sel,#rfq_tbl.fs-s td.bed input{
+  font-size:10.5px}
+#rfq_tbl.fs-l select.rq-sel,#rfq_tbl.fs-l td.bed input{
+  font-size:12.5px}
+#rfq_tbl th{background:var(--panel);color:var(--muted);
+  font-weight:700;font-size:9.5px;letter-spacing:.4px;
+  text-transform:uppercase;padding:2px 5px;border:none;
+  border-bottom:1px solid var(--text)}
+#rfq_tbl th.rq-band{color:var(--faint);font-size:9px;
+  letter-spacing:.7px;text-align:left;border-bottom:none;
+  padding:3px 7px 0}
+#rfq_tbl th.gsep,#rfq_tbl thead tr:last-child th.gsep{
+  border-left:1px solid var(--border2)}
+#rfq_tbl th.rq-band{border-bottom:none;color:#e8eaee;
+  background:#2b3038;font-weight:700;font-size:8.5px;
+  letter-spacing:1.8px;padding:3px 9px}
+#rfq_tbl th.bd-T{box-shadow:inset 0 -2px 0 #8b919a}
+#rfq_tbl th.bd-Q{box-shadow:inset 0 -2px 0 #4d79c7}
+#rfq_tbl th.bd-M{box-shadow:inset 0 -2px 0 #17a091}
+#rfq_tbl th.bd-C{box-shadow:inset 0 -2px 0 #c99420}
+#rfq_tbl th.bd-X{box-shadow:inset 0 -2px 0 #9d7ad8}
+#rfq_tbl th.bd-F{box-shadow:inset 0 -2px 0 #8b919a}
+#rfq_tbl thead tr:last-child th{background:var(--panel)}
+#rfq_tbl thead tr:last-child th.g-Q{box-shadow:inset 0 -2px 0 #4d79c7}
+#rfq_tbl thead tr:last-child th.g-M{box-shadow:inset 0 -2px 0 #17a091}
+#rfq_tbl thead tr:last-child th.g-C{box-shadow:inset 0 -2px 0 #c99420}
+#rfq_tbl thead tr:last-child th.g-X{box-shadow:inset 0 -2px 0 #9d7ad8}
+#rfq_tbl td,#rfq_tbl td.bed input,#rfq_tbl td select,#rfq_tbl .rq-num{color:#000}
+#rfq_tbl td{border:none;border-bottom:1px solid var(--border);
+  padding:3px 7px}
+#rfq_tbl.den-c td{padding:2px 4px}
+#rfq_tbl.den-c th{padding:2px 4px}
+#rfq_tbl tbody tr:nth-child(even) td{background:var(--row)}
+#rfq_tbl tbody tr:hover td{background:var(--hover) !important}
+#rfq_tbl tr.bdone td{background:#b9e2c1 !important}
+#rfq_tbl tr.bdone:hover td{background:#a9d9b3 !important}
+#rfq_tbl tr.bwork td{background:#b8ded6 !important}
+#rfq_tbl tr.bwork:hover td{background:#a9d5cb !important}
+#rfq_tbl tr.bnack td{background:#f8cf9a !important}
+#rfq_tbl tr.bnack:hover td{background:#f5c384 !important}
+#rfq_tbl tr.breq td{background:#d4bcee !important}
+#rfq_tbl tr.breq:hover td{background:#c8ace8 !important}
+#rfq_tbl tr.badj td{background:#f6d3ce !important}
+#rfq_tbl tr.badj:hover td{background:#f0c2bb !important}
+#rfq_tbl tr.bqtd td{background:#dfeafc !important}
+#rfq_tbl tr.bqtd:hover td{background:#d2e2f9 !important}
+#rfq_tbl tr.bcxl td{background:#d9dce2 !important}
+#rfq_tbl tr.bcxl:hover td{background:#ccd0d8 !important}
+#rfq_tbl td.bed{background:transparent;padding:0}
+#rfq_tbl td.bed input{padding:2px 4px;width:58px;
+  background:transparent;border:1px solid transparent;
+  color:var(--text);text-align:right}
+#rfq_tbl td.bed input::placeholder{color:var(--faint);
+  font-style:italic}
+#rfq_tbl tbody tr:hover td.bed input{border-color:var(--border2)}
+#rfq_tbl td.bed input:focus{border-color:var(--amber);
+  background:var(--bg)}
+#rfq_tbl.den-c td.bed input{padding:2px 4px}
+#rfq_tbl td.bed input[data-rf="qty"]{width:66px}
+#rfq_tbl td.bed input[data-rf="client"],
+#rfq_tbl td.bed input[data-rf="notes"],
+#rfq_tbl td.bed input[data-rf="trade_date"],
+#rfq_tbl td.bed input[data-rf="isin"]{color:var(--text);
+  text-align:left}
+#rfq_tbl td.bed input[data-rf="client"],
+#rfq_tbl td.bed input[data-rf="notes"],
+#rfq_tbl td.bed input[data-rf="isin"]{width:72px}
+#rfq_tbl td.bed input[data-rf="trade_date"]{width:70px}
+#rfq_tbl select.rq-sel{border:1px solid transparent;
+  background:transparent;padding:2px 1px;
+  max-width:160px}
+#rfq_tbl select.rq-sel:hover{border-color:var(--border2);
+  background:var(--bg)}
+#rfq_tbl select.rq-sel.rq-open{color:#7b5cc4}
+#rfq_tbl select.rq-sel.rq-quoted{color:var(--blue)}
+#rfq_tbl select.rq-sel.rq-work{color:var(--teal)}
+#rfq_tbl select.rq-sel.rq-hit{color:#b26a00}
+#rfq_tbl select.rq-sel.rq-done{color:var(--green)}
+#rfq_tbl select.rq-sel.rq-cxl{color:var(--faint)}
+#rfq_tbl select.rq-sel.rq-rfsh{color:var(--blue)}
+#rfq_tbl .rq-st{font:inherit;letter-spacing:.2px}
+#rfq_tbl .rq-st.rq-open{color:#7b5cc4}
+#rfq_tbl .rq-st.rq-quoted{color:var(--blue)}
+#rfq_tbl .rq-st.rq-work{color:var(--teal)}
+#rfq_tbl .rq-st.rq-hit{color:#b26a00}
+#rfq_tbl .rq-st.rq-done{color:var(--green)}
+#rfq_tbl .rq-st.rq-cxl{color:var(--faint)}
+#rfq_tbl .rq-st.rq-rfsh{color:var(--blue)}
+#rfq_tbl .rq-st.rq-adj{color:var(--red)}
+#rfq_tbl td.rq-ordc{white-space:nowrap}
+.rq-ap{cursor:pointer;border:1px solid var(--border2);padding:0 4px;font-weight:700;font-size:9.5px;color:var(--muted)}
+.rq-ap.on{background:#106b3f;color:#fff;border-color:#106b3f}
+.rq-tag{display:inline-block;border:1px solid var(--border2);
+  padding:0 3px;margin:0 1px;font-size:8px;font-weight:700;
+  color:var(--muted);letter-spacing:.3px}
+.rq-tag.t-tol{cursor:pointer}
+.rq-tag.t-tol.on{background:#c99420;color:#fff;border-color:#c99420}
+.rq-tag.t-tol.fw{background:#0b6e66;color:#fff;border-color:#0b6e66}
+.rq-adjb{font-size:8.5px;border:1px solid #b34700;color:#b34700;background:#fff;cursor:pointer;padding:0 4px}
+.rq-adjb.on{background:#b34700;color:#fff}
+tr.bimp td{background:#fdf3d7}
+.rq-mtb{font-size:8.5px;border:1px solid #106b3f;color:#106b3f;background:#fff;cursor:pointer;padding:0 4px}
+.rq-mtb:hover{background:#106b3f;color:#fff}
+.missb{border:2px solid #b3261e !important;background:#fde7e5 !important}
+#rfq_tbl input[data-rf="stock_ref"],#rfq_tbl input[data-rf="fx_ref"]{color:#000;font-style:normal}
+#rfq_tbl input[data-rf="stock_ref"]::placeholder,#rfq_tbl input[data-rf="fx_ref"]::placeholder{color:#000;opacity:1;font-style:normal}
+.rq-st.rq-adjrq{color:#b34700}
+#rfq_tbl td.rq-algos{white-space:nowrap}
+.twnew{color:#8a5b00;background:#f7f1e2;border:1px solid #8a5b00;font-size:8.5px;padding:1px 4px;letter-spacing:.5px}
+#rfq_tbl td[class*="fl-"]{text-align:center;letter-spacing:.4px}
+#rfq_tbl td.fl-ok{color:#106b3f}
+#rfq_tbl td.rq-tbtn{white-space:nowrap;text-align:center;
+  padding-left:1px;padding-right:1px}
+#rfq_tbl .rq-qb,#rfq_tbl .rq-h,#rfq_tbl .rq-cp,#rfq_tbl .rq-x,
+#rfq_tbl .rq-pb,#rfq_tbl .rq-lv,
+#rfq_tbl .rq-ab{display:inline-block;line-height:15px;
+  min-width:16px;text-align:center;vertical-align:middle}
+#rfq_tbl .rq-qb,#rfq_tbl .rq-h,#rfq_tbl .rq-cp,#rfq_tbl .rq-x,
+#rfq_tbl .rq-pb,#rfq_tbl .rq-lv{
+  cursor:pointer;border:1px solid var(--border2);
+  background:var(--bg);color:var(--muted);font-weight:700;
+  font-size:9.5px;padding:0 3px;margin:0;border-radius:0}
+#rfq_tbl .rq-qb{color:#274f8f}
+#rfq_tbl .rq-qb:hover{background:#274f8f;border-color:#274f8f;
+  color:#fff}
+#rfq_tbl .rq-h:hover,#rfq_tbl .rq-cp:hover{background:var(--text);
+  border-color:var(--text);color:#fff}
+#rfq_tbl .rq-x{color:#a8231b}
+#rfq_tbl .rq-x:hover{background:#a8231b;border-color:#a8231b;
+  color:#fff}
+#rfq_tbl .rq-pb{color:#a8231b}
+#rfq_tbl .rq-pb:hover{background:#a8231b;border-color:#a8231b;
+  color:#fff}
+#rfq_tbl .rq-lv{color:#0b6e66}
+#rfq_scroll{overflow:auto;max-height:calc(100vh - 148px)}
+#rfq_tbl{font-size:10px;line-height:1.15}
+#rfq_tbl th{font-size:8.5px;padding:2px 3px;letter-spacing:.4px}
+#rfq_tbl td{padding:1px 3px}
+#rfq_tbl input,#rfq_tbl select{font-size:10px;padding:0 2px}
+#rfq_tbl input[data-rf="stock_ref"],#rfq_tbl input[data-rf="fx_ref"]{width:50px !important}
+#rfq_tbl input.nkv{width:36px}
+#rfq_tbl .rq-hb,#rfq_tbl .rq-pb,#rfq_tbl .rq-lv,#rfq_tbl .rq-qb,#rfq_tbl .rq-cp,#rfq_tbl .rq-x,#rfq_tbl .rq-mtb{font-size:8.5px;padding:0 3px}
+#rfq_tbl .rq-lv:hover{background:#0b6e66;border-color:#0b6e66;
+  color:#fff}
+#rfq_tbl td.rq-qcell{position:relative}
+#rfq_tbl .qc{position:absolute;left:2px;top:50%;
+  transform:translateY(-50%);display:none;gap:1px}
+#rfq_tbl td.rq-qcell:hover .qc{display:inline-flex}
+#rfq_tbl .qc.qr{left:auto;right:2px}
+#rfq_tbl .qc b.qc-l{color:#0b6e66}
+#rfq_tbl .qc b.qc-l:hover{background:#0b6e66;color:#fff;
+  border-color:#0b6e66}
+#rfq_tbl .qc b{font:8px/1 var(--mono);font-weight:700;
+  padding:1px 2px;border:1px solid var(--border2);
+  background:var(--bg);cursor:pointer;color:var(--blue)}
+#rfq_tbl .qc b.qc-r:hover{background:#274f8f;color:#fff;
+  border-color:#274f8f}
+#rfq_tbl .qc b.qc-x{color:#a8231b}
+#rfq_tbl .qc b.qc-x:hover{background:#a8231b;color:#fff;
+  border-color:#a8231b}
+#rfq_tbl td.rq-hitc{text-align:center;white-space:nowrap}
+.rq-hb{display:inline-block;min-width:16px;text-align:center;
+  cursor:pointer;border:1px solid var(--border2);
+  background:var(--bg);color:var(--muted);font-weight:700;
+  font-size:9.5px;line-height:14px;margin:0 1px}
+.rq-hb:hover{border-color:var(--text);color:var(--text)}
+.rq-hb.on{background:var(--text);border-color:var(--text);
+  color:#fff}
+#rfq_tbl td.rq-rfc{text-align:center;white-space:nowrap}
+.rq-rf{cursor:pointer;border:1px solid var(--border2);
+  background:var(--bg);color:var(--muted);font-size:9.5px;
+  font-weight:700;padding:1px 5px;line-height:14px;
+  display:inline-block}
+.rq-rf:hover{border-color:#b26a00;color:#b26a00}
+.rq-rf.rq-rfp{background:#b26a00;border-color:#b26a00;color:#fff;
+  cursor:default}
+#who_wrap{position:fixed;top:6px;right:10px;z-index:70;
+  font:11px 'Consolas','JetBrains Mono',monospace;color:#5a6068;
+  background:#fff;border:1px solid #c9ced4;padding:2px 4px 2px 8px}
+#who_badge{margin-right:6px;font-weight:700}
+#btn_logout{font:10px 'Consolas','JetBrains Mono',monospace;
+  border:1px solid #c9ced4;background:#f2f3f5;cursor:pointer;
+  padding:1px 6px;border-radius:0}
+#btn_logout:hover{border-color:#a8231b;color:#a8231b}
+.rq-await{letter-spacing:.4px;text-transform:uppercase}
+#rfq_tbl tr.brefr td{background:#b9d4f2 !important}
+#rfq_tbl tr.brefr:hover td{background:#a8c8ee !important}
+#rfq_tbl tbody tr.rowsel td{background:#e8eef7 !important;
+  border-top:1px solid var(--teal) !important;
+  border-bottom:1px solid var(--teal) !important}
+#rfq_tbl tbody tr.rowsel td:first-child{
+  border-left:3px solid var(--teal) !important}
+#rf_fields input[type=date]{width:118px}
+#rfq_mon{position:fixed;top:52px;right:0;width:340px;bottom:0;
+  min-width:220px;max-width:60vw;resize:horizontal;
+  background:var(--bg);border-left:1px solid var(--border2);
+  z-index:61;transform:translateX(105%);
+  transition:transform .18s ease;padding:6px 8px;
+  font:11px var(--mono);overflow:auto}
+#rfq_mon.on{transform:none}
+body.amdock-b #rfq_mon{top:auto;left:0;right:0;bottom:0;
+  width:auto;min-width:0;max-width:none;height:240px;
+  min-height:110px;max-height:60vh;resize:vertical;
+  border-left:none;border-top:2px solid var(--border2);
+  transform:translateY(105%)}
+body.amdock-b #rfq_mon.on{transform:none}
+#rm_dock,#rm_zi,#rm_zo{cursor:pointer;color:var(--blue);
+  margin-left:8px;font-weight:700}
+#rm_dock:hover,#rm_zi:hover,#rm_zo:hover{color:var(--text)}
+#rfq_mon .rm-head{display:flex;justify-content:space-between;
+  font-weight:700;font-size:11px;text-transform:uppercase;
+  letter-spacing:1.2px;border-bottom:1px solid var(--text);
+  padding-bottom:5px;margin-bottom:4px}
+#rm_close{cursor:pointer;color:var(--red)}
+#rfq_mon .rm-meta{color:var(--faint);font-size:10px;
+  margin-bottom:8px}
+.rm-it{display:grid;
+  grid-template-columns:70px 48px minmax(86px,118px) 104px
+    58px 38px 62px 1fr;
+  gap:0 7px;align-items:center;padding:2px 6px;border:0;
+  border-left:3px solid var(--border2);
+  border-bottom:1px solid var(--border);margin:0;
   cursor:pointer;background:var(--bg)}
-.chips b:hover{color:#ffffff;background:var(--amber);border-color:var(--amber)}
-.chips b.rfs{color:var(--blue)}
-.chips b.rfs:hover{background:var(--blue);border-color:var(--blue);color:#ffffff}
-.chips b.rff{color:var(--teal)}
-.chips b.rff:hover{background:var(--teal);border-color:var(--teal);color:#ffffff}
-.qgrp{display:inline-flex;align-items:center;gap:3px;
-  border:1px solid var(--border2);padding:2px 5px 2px 4px;
-  background:var(--panel2)}
-.qgrp>b{font:8px var(--mono);font-weight:700;color:var(--faint);
-  letter-spacing:1px;margin-right:2px}
-.qgrp.qvs button{border-color:#b9c6dd;color:var(--blue)}
-.qgrp.qvs button:hover{background:var(--blue);border-color:var(--blue);color:#ffffff}
-.qgrp.qor button{border-color:#d9c9a3;color:var(--amber)}
-.qgrp.qor button:hover{background:var(--amber);border-color:var(--amber);color:#ffffff}
-td.gc input.sprd{cursor:text;user-select:text}
-td.gc input.sprd:focus{box-shadow:inset 0 0 0 1px var(--amber)}
-#tbl.hb-model th[data-band="model"]:not(.bfirst),#tbl.hb-model td[data-band="model"]:not(.bfirst){display:none}
-#tbl.hb-brw th[data-band="brw"]:not(.bfirst),#tbl.hb-brw td[data-band="brw"]:not(.bfirst){display:none}
-#tbl.hb-brw .bfirst[data-band="brw"]{font-size:0;padding:0;width:14px;min-width:14px;max-width:14px;background:#f1ecf6;border-left:1px solid #d8d4cc}
-#tbl.hb-brw .bfirst[data-band="brw"] input{display:none}
-.bw{background:#efe9f5}
-input.bwv{width:52px}
-th[data-key^="bw_"],td[data-band="brw"]{width:58px;min-width:58px;max-width:76px}
-input.bwv.bwred{background:#fde7e5 !important;border-color:#b3261e !important;color:#8a1c12}
-#tbl.hb-res th[data-band="res"]:not(.bfirst),#tbl.hb-res td[data-band="res"]:not(.bfirst){display:none}
-#tbl.hb-inp th[data-band="inp"]:not(.bfirst),#tbl.hb-inp td[data-band="inp"]:not(.bfirst){display:none}
-#tbl.hb-live th[data-band="live"]:not(.bfirst),#tbl.hb-live td[data-band="live"]:not(.bfirst){display:none}
-#tbl.hb-eod th[data-band="eod"]:not(.bfirst),#tbl.hb-eod td[data-band="eod"]:not(.bfirst){display:none}
-#tbl.hb-theo th[data-band="theo"]:not(.bfirst),#tbl.hb-theo td[data-band="theo"]:not(.bfirst){display:none}
-#tbl.hb-stk th[data-band="stk"]:not(.bfirst),#tbl.hb-stk td[data-band="stk"]:not(.bfirst){display:none}
-#tbl.hb-fx th[data-band="fx"]:not(.bfirst),#tbl.hb-fx td[data-band="fx"]:not(.bfirst){display:none}
-#tbl.hb-flags th[data-band="flags"]:not(.bfirst),#tbl.hb-flags td[data-band="flags"]:not(.bfirst){display:none}
-#tbl.hb-vol th[data-band="vol"]:not(.bfirst),#tbl.hb-vol td[data-band="vol"]:not(.bfirst){display:none}
-#tbl.hb-model .bfirst[data-band="model"]{font-size:0;padding:0;width:14px;min-width:14px;max-width:14px;background:#f3f2ef;border-left:1px solid #d8d4cc}
-#tbl.hb-model .bfirst[data-band="model"] input,#tbl.hb-model .bfirst[data-band="model"] .rz{display:none}
-#tbl.hb-res .bfirst[data-band="res"]{font-size:0;padding:0;width:14px;min-width:14px;max-width:14px;background:#f3f2ef;border-left:1px solid #d8d4cc}
-#tbl.hb-res .bfirst[data-band="res"] input,#tbl.hb-res .bfirst[data-band="res"] .rz{display:none}
-#tbl.hb-inp .bfirst[data-band="inp"]{font-size:0;padding:0;width:14px;min-width:14px;max-width:14px;background:#f3f2ef;border-left:1px solid #d8d4cc}
-#tbl.hb-inp .bfirst[data-band="inp"] input,#tbl.hb-inp .bfirst[data-band="inp"] .rz{display:none}
-#tbl.hb-live .bfirst[data-band="live"]{font-size:0;padding:0;width:14px;min-width:14px;max-width:14px;background:#f3f2ef;border-left:1px solid #d8d4cc}
-#tbl.hb-live .bfirst[data-band="live"] input,#tbl.hb-live .bfirst[data-band="live"] .rz{display:none}
-#tbl.hb-eod .bfirst[data-band="eod"]{font-size:0;padding:0;width:14px;min-width:14px;max-width:14px;background:#f3f2ef;border-left:1px solid #d8d4cc}
-#tbl.hb-eod .bfirst[data-band="eod"] input,#tbl.hb-eod .bfirst[data-band="eod"] .rz{display:none}
-#tbl.hb-theo .bfirst[data-band="theo"]{font-size:0;padding:0;width:14px;min-width:14px;max-width:14px;background:#f3f2ef;border-left:1px solid #d8d4cc}
-#tbl.hb-theo .bfirst[data-band="theo"] input,#tbl.hb-theo .bfirst[data-band="theo"] .rz{display:none}
-#tbl.hb-stk .bfirst[data-band="stk"]{font-size:0;padding:0;width:14px;min-width:14px;max-width:14px;background:#f3f2ef;border-left:1px solid #d8d4cc}
-#tbl.hb-stk .bfirst[data-band="stk"] input,#tbl.hb-stk .bfirst[data-band="stk"] .rz{display:none}
-#tbl.hb-fx .bfirst[data-band="fx"]{font-size:0;padding:0;width:14px;min-width:14px;max-width:14px;background:#f3f2ef;border-left:1px solid #d8d4cc}
-#tbl.hb-fx .bfirst[data-band="fx"] input,#tbl.hb-fx .bfirst[data-band="fx"] .rz{display:none}
-#tbl.hb-flags .bfirst[data-band="flags"]{font-size:0;padding:0;width:14px;min-width:14px;max-width:14px;background:#f3f2ef;border-left:1px solid #d8d4cc}
-#tbl.hb-flags .bfirst[data-band="flags"] input,#tbl.hb-flags .bfirst[data-band="flags"] .rz{display:none}
-#tbl.hb-vol .bfirst[data-band="vol"]{font-size:0;padding:0;width:14px;min-width:14px;max-width:14px;background:#f3f2ef;border-left:1px solid #d8d4cc}
-#tbl.hb-vol .bfirst[data-band="vol"] input,#tbl.hb-vol .bfirst[data-band="vol"] .rz{display:none}
-.fb{background:#f0e9f7}
-td[data-fl]{text-align:center;font-size:10.5px}
-td[data-fl^="f_"].fl-red{color:#c62828;font-weight:700}
-td[data-fl^="f_"].fl-amb{color:#b26a00;font-weight:600}
-td[data-fl^="f_"].fl-dim{color:#b6b1a8}
-td[data-fl="stk_move"],td[data-fl="fx_move"]{text-align:right}
-td.bgpos{background:#d7f2dd !important;color:#14532d;font-weight:600}
-td.bgneg{background:#fbdcda !important;color:#7f1d1d;font-weight:600}
-td.qcell{color:#0b3d91;font-weight:600;text-align:right}
-td[data-q="mid_drift"]{text-align:right;font-weight:600}
-.volsel{font:inherit;font-size:10.5px;border:1px solid #cfcabf;
-  background:#fffbe8;border-radius:3px}
-.volsel.vol-cheap{background:#d7f2dd;color:#14532d;border-color:#14532d;
+.rm-it:hover{background:var(--hover)}
+.rm-sec{font-weight:700;white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis}
+.rm-t,.rm-isin,.rm-ty,.rm-sd,.rm-by{color:var(--muted);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  font-size:10px}
+.rm-t{color:var(--faint)}
+.rm-why{color:var(--faint);white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis;text-align:right}
+body.amdock-b #rm_list{display:grid;
+  grid-template-columns:repeat(auto-fill,minmax(640px,1fr));
+  gap:0 16px}
+#rm_grip{position:absolute;left:0;top:0;bottom:0;width:6px;
+  cursor:ew-resize;z-index:2}
+#rm_grip:hover{background:var(--border2)}
+body.amdock-b #rm_grip{left:0;right:0;top:0;bottom:auto;
+  height:6px;width:auto;cursor:ns-resize}
+.rm-b{font-size:8.5px;font-weight:700;letter-spacing:.5px;
+  padding:1px 4px;border:1px solid;min-width:38px;
+  text-align:center}
+.rm-hit{color:#b26a00;border-color:#b26a00;background:#fbe3c4}
+.rm-it[data-k="hit"]{border-left-color:#b26a00}
+.rm-rf{color:var(--blue);border-color:var(--blue);
+  background:#d9e7f8}
+.rm-it[data-k="rf"]{border-left-color:var(--blue)}
+.rm-pl{color:var(--red);border-color:var(--red);
+  background:#f6dcd9}
+.rm-it[data-k="pl"]{border-left-color:var(--red)}
+.rm-rq{color:#7b5cc4;border-color:#7b5cc4;background:#eadef7}
+.rm-it[data-k="rq"]{border-left-color:#7b5cc4}
+.rm-re{color:var(--teal);border-color:var(--teal);
+  background:#d4ebe7}
+.rm-it[data-k="re"]{border-left-color:var(--teal)}
+.rm-aj{color:#a8231b;border-color:#a8231b;background:#f6d3ce}
+.rm-it[data-k="aj"]{border-left-color:#a8231b}
+.rm-st{color:var(--muted);border-color:var(--border2);
+  background:var(--panel)}
+.rm-it[data-k="st"]{border-left-color:var(--border2)}
+.rm-sec{font-weight:700}
+.rm-why{color:var(--muted);font-size:10.5px;margin-left:auto;
+  text-align:right}
+@keyframes rflash{0%{outline:2px solid var(--teal);
+  outline-offset:-2px}100%{outline:2px solid transparent}}
+#rfq_tbl tr.rflash td{animation:rflash 1.6s ease-out}
+.rq-rfb{margin-left:4px}
+#rfq_hist{font:11.5px var(--mono)}
+#rfq_hist .rh-head{text-transform:uppercase;letter-spacing:1.2px;
+  font-size:11px;border-bottom:1px solid var(--text);
+  padding-bottom:5px}
+#rh_tbl{border:1px solid var(--border2);width:100%}
+#rh_tbl th{background:var(--panel);color:var(--muted);
+  font-weight:700;font-size:9.5px;letter-spacing:.4px;
+  text-transform:uppercase;border:none;
+  border-bottom:1px solid var(--text)}
+#rh_tbl td{border:none;border-bottom:1px solid var(--border)}
+#rh_tbl tbody tr:nth-child(even) td{background:var(--row)}
+.blgrid td.fl-ok{color:#1d7a3d;font-weight:600;text-align:center}
+.blgrid td.fl-stale{color:#b26a00;font-weight:700;text-align:center}
+.blgrid td.fl-moved{text-align:center}
+.blgrid td.fl-none{text-align:center}
+.rq-up{cursor:pointer;color:#274f8f;font-weight:700;margin-left:4px}
+.rq-up:hover{color:#0b3d91}
+.blgrid td.rq-tbtn{text-align:center}
+.rq-x{cursor:pointer;color:#c62828;font-weight:700;border:1px solid #c62828;
+  border-radius:3px;padding:0 5px;font-size:10.5px}
+.rq-x:hover{background:#c62828;color:#fff}
+.blgrid td.rq-ref{text-align:right}
+.blgrid tr.bwork td{background:#e6f2f1}
+.blgrid td.rq-na{color:#b8bcc2;text-align:center}
+.blgrid td.rq-qty{text-align:right}
+.rq-cp{cursor:pointer;color:#274f8f;font-weight:700;border:1px solid #274f8f;
+  border-radius:3px;padding:0 4px;font-size:10.5px;margin-right:4px}
+.rq-cp:hover{background:#274f8f;color:#fff}
+#rfq_tbl td.bed{padding:0;background:#fffdf2}
+#rfq_tbl td.bed input:focus{box-shadow:inset 0 0 0 1px #8a5b00}
+#rfq_tbl td.bed input[data-rf="client"],#rfq_tbl td.bed input[data-rf="notes"],
+#rfq_tbl td.bed input[data-rf="isin"]{text-align:left;width:104px}
+.rf-f{border:1px solid #c9c9c9;background:#fff;padding:2px 10px;
+  cursor:pointer;font-size:11px}
+.rf-f.on{background:#1c1c1c;color:#fff;border-color:#1c1c1c;font-weight:700}
+.bar input.opt{background:#f2f3f5}
+.bar input.req{background:#d6e5fa;border-color:#274f8f;border-width:2px}
+.bar input.miss{border-color:#a8231b !important;background:#f6d3ce !important}
+.rq-sel{font:11.5px var(--mono);border:1px solid #d5d9d5;
+  background:#fff;color:var(--text);padding:1px 2px;max-width:150px}
+#rfq_tbl td.rq-selc{padding:1px 3px;text-align:left}
+.rq-rj{display:inline-block;min-width:16px;text-align:center;
+  cursor:pointer;border:1px solid var(--red);
+  background:var(--bg);color:var(--red);font-weight:700;
+  font-size:9.5px;line-height:14px;margin-left:3px;
+  padding:0 3px}
+.rq-rj:hover{background:var(--red);color:#fff}
+.blgrid td.rq-ackd{text-align:center}
+.blgrid td.rq-ackn{text-align:center}
+.blgrid tr.bnack td{background:#fdf3e0}
+.rq-ab{cursor:pointer;color:#fff;background:#b26a00;
+  border:1px solid #b26a00;border-radius:3px;padding:0 6px;
+  font-size:10.5px;font-weight:700}
+.rq-ab:hover{background:#8a5b00}
+#bl_live.liveon{background:#e7f4ea;border-color:#2e9e53;color:#1d7a3d;
   font-weight:700}
-.volsel.vol-rich{background:#fbdcda;color:#7f1d1d;border-color:#7f1d1d;
-  font-weight:700}
-.vb{background:#e8ddf2;color:#4a2d6b}
-td[data-v]{text-align:right;color:#4a2d6b}
-th[data-band="vol"] input{width:26px;font:inherit;font-size:10px;
-  border:1px solid #b9a8cf;border-radius:2px;background:#f6f0fc}
-td.gc.stick3{position:sticky}
-td.cpy{cursor:pointer}
-td.cpy:hover{color:var(--amber)}
-#fh{position:absolute;width:7px;height:7px;background:var(--text);
-  border:1px solid #ffffff;cursor:crosshair;z-index:5;display:none}
-.rz{position:absolute;right:-3px;top:0;width:6px;height:100%;cursor:col-resize;
-  z-index:6}
-.rz:hover{background:var(--amber);opacity:.4}
-th{position:sticky}
-.bar{display:flex;align-items:center;gap:6px;margin-top:8px;flex-wrap:wrap}
-.status{margin-left:auto;font:11px var(--mono);color:var(--muted)}
-.status .ok{color:var(--green)} .status .warn{color:var(--amber)} .status .err{color:var(--red)}
-.ovd-on{background:var(--amber-dim)!important}
-.pos{color:var(--green)} .neg{color:var(--red)}
-.hint{color:var(--faint);font-size:10px;margin:0}
-kbd{background:var(--panel2);border:1px solid var(--border2);border-radius:0;
-  padding:0 4px;font:10px var(--mono);color:var(--muted)}
-h2{font-size:10.5px;font-weight:700;color:var(--muted);margin:0;
-  text-transform:uppercase;letter-spacing:.7px}
-.cfg{max-width:520px;background:var(--panel2);border:1px solid var(--border);
-  border-radius:0;padding:12px 14px}
-.cfg h2{margin-bottom:10px}
-.cfg .fieldrow{display:flex;align-items:center;gap:10px;margin-bottom:8px}
-.cfg .fieldrow label{flex:1;font-size:11px;color:var(--muted)}
-.cfg input[type=number]{width:100px;background:var(--bg);color:var(--text);
-  border:1px solid var(--border2);border-radius:0;padding:3px 8px;
-  font:11.5px var(--mono);text-align:right}
-.cfg input[type=checkbox]{accent-color:var(--text);width:13px;height:13px}
-.cfg .note{font-size:10px;color:var(--faint);margin:8px 0 10px}
-</style>
-<style id="colstyle"></style>
-</head>
-<body>
-<header>
-  <h1>CB nuke station</h1>
-  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b8</b></span>
-  <span id="conn" class="conn warn" title="Connection">&#9679;</span>
-  <span id="online" class="sub"></span>
-  <div class="tabs">
-    <button id="tabMain" class="active" onclick="showTab('main')">Workstation</button>
-    <button id="tabRuns" onclick="showTab('runs')">Runs</button>
-    <button id="tabSnap" onclick="showTab('snap')">Morning Snap</button>
-    <button id="tabLog" onclick="showTab('log')">Log</button>
-    <button id="tabCfg" onclick="showTab('cfg')">Config</button>
+#bl_tbl td.bed{padding:0;background:#fffdf2}
+#bl_tbl td.bce{cursor:pointer}
+#bl_tbl td.bce:hover{box-shadow:inset 0 0 0 1px #8a5b0055}
+#bl_tbl td.bed input{width:140px;border:0;background:transparent;
+  font:12px 'Segoe UI',Consolas,sans-serif;color:#8a5b00;padding:2px 7px;
+  outline:none}
+#bl_tbl td.bed input:focus{box-shadow:inset 0 0 0 1px #8a5b00}
+#bl_tbl td.selcell{outline:2px solid #1a73e8;outline-offset:-2px}
+#bl_tbl td.pend{color:#8a8f98;font-style:italic}
+#bl_tbl td.bederr{animation:blerr .9s}
+@keyframes blerr{0%{background:#fbdada}100%{background:inherit}}
+ .toInput{width:280px}
+ .note{padding:5px 18px;background:#f6ead2;color:#8f5f00;border-bottom:1px solid #e5d9bd;
+       font-size:12px}
+ .panel{margin:10px 18px;border:1px solid #d8d8d8;background:#fff}
+ .panel .cap{padding:6px 12px;background:#f0f0f0;border-bottom:1px solid #d8d8d8;
+       font-weight:700;letter-spacing:1px;color:#1c1c1c;font-size:12px}
+ .panel .cap small{color:#6e6a63;font-weight:400;letter-spacing:0;margin-left:8px}
+ .panel .body{padding:10px 12px}
+ .panel textarea{width:100%;box-sizing:border-box;font:12px Consolas,monospace;
+       border:1px solid #c9c9c9;padding:6px;resize:vertical}
+ .btnrow{display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap}
+ .btnrow .hint{color:#6e6a63;font-size:12px}
+</style></head><body>
+<header>LAGRANGE <small>CB Runs desk console &middot; build 2026-08-19.r79 &middot; one port (59988)</small>
+  <small id="built"></small></header>
+<div id="tabs">
+  <div class="tab active" id="tabbtn-recon" onclick="showTab('recon')">TRADE BOOKING RECONCILIATION</div>
+  <div class="tab" id="tabbtn-delta" onclick="showTab('delta')">DELTA CHECK</div>
+  <div class="tab" id="tabbtn-dscan" onclick="showTab('dscan')" title="delta risk scanner · standalone app on :59966">DELTA SCAN</div>
+  <div class="tab" id="tabbtn-risk" onclick="showTab('risk')" title="latest risk_positions snapshot (freshest loaded_at batch, 60s buffer)">RISK POSITIONS</div>
+  <div class="tab" id="tabbtn-bau" onclick="showTab('bau')">BAU TASKS</div>
+  <div class="tab" id="tabbtn-twcb" onclick="showTab('twcb')" title="TW Convertible Bond Issuance Pipeline Monitor">TW CB PIPELINE</div>
+  <div class="tab" id="tabbtn-blotter" onclick="showTab('blotter')">TRADE BLOTTER</div>
+  <div class="tab" id="tabbtn-rfq" onclick="showTab('rfq')">RFQ STATION</div>
+  <div class="tab" id="tabbtn-nuke" onclick="showTab('nuke')">NUKE STATION</div>
+  <span id="who_wrap"><span id="who_badge"></span><button id="btn_logout" title="log out">logout</button></span>
+</div>
+
+<!-- ============ TAB 1 : RECON ============ -->
+<div id="tab-recon">
+<div class="bar">
+  <label>mode</label>
+  <select id="mode">
+    <option value="today">Today</option>
+    <option value="date">Single date</option>
+    <option value="range">Date range</option>
+  </select>
+  <input type="date" id="d1" class="hide">
+  <input type="date" id="d2" class="hide">
+  <label><input type="checkbox" id="skiploader"> skip txt loader (DB only)</label>
+  <button id="refresh" class="refresh">&#8635; Refresh</button>
+</div>
+<div class="bar">
+  <label>To</label><input id="to" class="toInput" placeholder="a@citi.com; b@citi.com">
+  <label>Cc</label><input id="cc" class="toInput">
+  <button id="draft" disabled>Open Draft</button>
+  <button id="sendnow" class="sendnow" disabled>Send Now</button>
+</div>
+<div class="status" id="status">Press Refresh to load the latest EQRMS export and build the report.</div>
+<iframe id="frame"></iframe>
+</div>
+
+<!-- ============ TAB 2 : DELTA CHECK ============ -->
+<div id="tab-delta" class="hide">
+<div class="note">Quick refresh = CBA source only. Full pipeline (below) adds the
+derivation leg &mdash; recovered code: verify FIXME items and compare the first run
+against a notebook-generated report.</div>
+<div class="bar">
+  <button id="dupdate">&#8645; Update DB</button>
+  <label><input type="checkbox" id="dupdfirst"> update DB first (applies to all checks below)</label>
+  <button id="drefresh" class="refresh">&#8635; Refresh (CBA only)</button>
+  <span id="dstats" style="color:#6e6a63"></span>
+</div>
+<div class="panel">
+  <div class="cap">FULL PIPELINE <small>derivation + CBA &mdash; paste the grid, or let Lagrange grab it</small></div>
+  <div class="body">
+    <textarea id="dpaste" rows="4" placeholder="Paste the Derivation grid here:  click the Derivation window &rarr; Ctrl+A &rarr; Ctrl+C &rarr; Ctrl+V here"></textarea>
+    <div class="btnrow">
+      <button id="dfull" class="refresh">&#9654; Run full pipeline (pasted data)</button>
+      <button id="dauto">&#9889; Auto-grab from Derivation window &amp; run</button>
+      <span class="hint">auto-grab sends Ctrl+E / Ctrl+A / Ctrl+C to the Derivation window &mdash; hands off until it finishes</span>
+    </div>
   </div>
-</header>
-<div class="layout" id="viewMain">
-  <aside class="side">
-    <span id="siderz" title="drag: sidebar width &middot; double-click: reset &middot; Save layout to keep"></span>
-    <button id="sidecol" onclick="sideToggle()" title="collapse security IDs panel">&#9666;</button>
-    <label for="ids">Security IDs (one per line)
-      <span style="color:var(--faint)">&middot; __IDS_SRC__</span></label>
-    <textarea id="ids"></textarea>
-    <button class="b-a" onclick="sendIds()">Load into table (all users)</button>
-  </aside>
-  <main>
-    <div class="toprow">
-      <h2>Securities</h2>
-      <p class="hint">
-        short_name, und_fx, nGamma (teal, manual) and overrides (amber) all behave like a spreadsheet:
-        drag select, <kbd>Ctrl</kbd>+<kbd>C</kbd>/<kbd>X</kbd>/<kbd>V</kbd>, corner drag-fill,
-        <kbd>Ctrl</kbd>+<kbd>D</kbd>, <kbd>Esc</kbd> &middot;
-        und_fx takes an Eikon FX RIC (<kbd>TWD=</kbd> <kbd>KRW=</kbd> <kbd>TWDKRW=R</kbd>, <kbd>1</kbd> = USD)
-        and drives fx last/time/date/close &middot;
-        toolbar buttons fill overrides (Live/EOD = all-or-selected, Last/Close = selected only) &middot;
-        click eikon last/close cells to copy one value &middot; bands refresh on click
-      </p>
-      <span class="namebox" id="namebox">&mdash;</span>
-    </div>
-    <div class="tablewrap" id="wrap"><table id="tbl"></table><div id="fh"></div></div>
-    <div class="bar">
-      <button class="primary" id="go" onclick="nuke()">Nuke prices</button>
-      <button id="cplive" class="b-a" onclick="bulkCopy('live')">Live &rarr; ovd</button>
-      <button id="cpeod" class="b-a" onclick="bulkCopy('eod')">EOD &rarr; ovd</button>
-      <button class="b-e" onclick="bulkEikon('last')"
-        title="Selected rows only: stock last &rarr; ovdSpot, fx last &rarr; ovdUndFx, live &rarr; ovdCbFx">Last &rarr; ovd</button>
-      <button id="autoLastBtn" class="b-e" onclick="toggleAutoLast()"
-        title="While ON: every Refinitiv tick copies stock last &rarr; ovdSpot and fx last &rarr; ovdUndFx on ALL rows, then auto-renukes changed rows">AUTO last: OFF</button>
-      <button class="b-e" onclick="bulkEikon('close')"
-        title="Selected rows only: stock close &rarr; ovdSpot, fx close &rarr; ovdUndFx, live &rarr; ovdCbFx">Close &rarr; ovd</button>
-      <button class="b-r" onclick="clearOverrides()">Clear overrides</button>
-      <button class="b-a" onclick="generateRuns()"
-        title="Selected rows only: build a runs table in the Runs tab">Generate runs</button>
-      <button class="b-g" onclick="saveToDb()">Save to DB</button>
-      <button class="b-t" onclick="saveLayout()">Save layout</button>
-      <button onclick="copyTable()">Copy table (TSV)</button>
-      <span class="qgrp qvs"><b>VS</b><button onclick="quoteRows('vs')">copy vs</button><button onclick="quoteRows('bid')">vs bid</button><button onclick="quoteRows('ask')">vs ask</button></span>
-      <span class="qgrp qor"><b>O/R</b><button onclick="quoteRows('or')">copy o/r</button><button onclick="quoteRows('orbid')">o/r bid</button><button onclick="quoteRows('orask')">o/r ask</button></span>
-      <button id="dl" onclick="download()" disabled>Download JSON</button>
-      <div class="status" id="status">Ready.</div>
-    </div>
-  </main>
 </div>
-<div id="viewLog" style="display:none;padding:14px 18px">
-  <h3 style="margin:0 0 8px">Server log
-    <button onclick="loadLogs()" style="margin-left:10px">&#8635;</button>
-    <label style="margin-left:10px;font-weight:400;font-size:12px">
-      <input type="checkbox" id="logAuto" checked> auto-refresh 5s</label>
-    <button onclick="copyLogs()" style="margin-left:10px">Copy</button>
-    <span id="logMeta" style="margin-left:12px;color:#6e6a63"></span>
-  </h3>
-  <pre id="logpre" style="background:#14161a;color:#d7dbe0;padding:10px 12px;
-    border-radius:4px;max-height:70vh;overflow:auto;font-size:11.5px;
-    line-height:1.45;white-space:pre-wrap"></pre>
+<div class="bar">
+  <label>To</label><input id="dto" class="toInput" placeholder="a@citi.com; b@citi.com">
+  <label>Cc</label><input id="dcc" class="toInput">
+  <button id="ddraft" disabled>Open Draft</button>
+  <button id="dsendnow" class="sendnow" disabled>Send Now</button>
 </div>
-<div id="viewSnap" style="display:none;padding:14px 18px">
-  <h3 style="margin:0 0 8px">Morning marking snapshot
-    <select id="sn8date" style="margin-left:10px"
-      onchange="loadSnap8(this.value)"></select>
-    <button onclick="loadSnap8(document.getElementById('sn8date').value)"
-      style="margin-left:6px">&#8635;</button>
-    <button onclick="snap8Now()" style="margin-left:6px"
-      title="store QuoteBid/QuoteAsk right now (replaces today)">Snap now</button>
-    <span id="sn8meta" style="margin-left:12px;color:#6e6a63"></span>
-  </h3>
-  <table class="report" id="sn8tbl" style="min-width:760px">
-    <thead><tr><th>Short Name</th><th>ISIN</th><th>Bid</th><th>Ask</th>
-      <th>Indic Ask</th><th>Vs</th><th>Fx</th><th>Vs USD</th>
-      <th>Delta</th><th>Quantity</th><th>Snapped</th></tr></thead>
-    <tbody></tbody></table>
+<div class="status" id="dstatus">Press Refresh to run the CBA delta + price check
+(flags: |&Delta; vs nuked| &gt; 5 points, |mkt bid &minus; fair| &gt; 2).</div>
+<iframe id="dframe"></iframe>
 </div>
-<div class="layout" id="viewRuns" style="display:none">
-  <aside class="side"></aside>
-  <main>
-    <div class="toprow">
-      <h2>Runs</h2>
-      <p class="hint">Generated from the selected rows on the Workstation tab.
-        Bid/ask use the displayed rounding.</p>
-    </div>
-    <div class="tablewrap"><table id="runstbl"></table></div>
-    <div class="bar">
-      <button onclick="copyRuns()">Copy runs (TSV / Excel)</button>
-      <button class="b-a" onclick="copyRunsBbg()"
-        title="Copies an HTML table + TSV fallback &mdash; the same clipboard shape Excel uses">Copy for BBG chat (table)</button>
-      <div class="status" id="runstatus">No runs generated yet.</div>
-    </div>
-  </main>
+
+<!-- ============ TAB 3 : BAU TASKS ============ -->
+<div id="tab-dscan" class="hide">
+  <div class="bar">
+    <span class="status" id="ds_status">checking delta scan mount…</span>
+    <a id="ds_open" target="_blank" style="margin-left:10px">open in new window ↗</a>
+  </div>
+  <iframe id="ds_frame" style="width:100%;border:0;height:calc(100vh - 120px);background:#101418"></iframe>
 </div>
-<div class="layout" id="viewCfg" style="display:none">
-  <aside class="side"></aside>
-  <main>
-    <div class="cfg">
-      <h2>Config</h2>
-      <div class="fieldrow">
-        <label for="cfgName">Your name (shown to others on edits)</label>
-        <input type="text" id="cfgName" maxlength="24" style="width:150px;
-          background:var(--bg);color:var(--text);border:1px solid var(--border2);
-          border-radius:0;padding:3px 8px;font:11.5px var(--mono)">
-      </div>
-      <div class="fieldrow">
-        <label for="cfgSec">Server Refinitiv refresh (seconds, all users)</label>
-        <input type="number" id="cfgSec" min="2" step="1">
-      </div>
-      <div class="fieldrow">
-        <label for="cfgRef">EQRMS / reference refresh (seconds, all users)</label>
-        <input type="number" id="cfgRef" min="30" step="1">
-      </div>
-      <div class="fieldrow">
-        <label for="cfgAuto">Autosave to DB (seconds, 0 = off, all users)</label>
-        <input type="number" id="cfgAuto" min="0" step="5">
-      </div>
-      <div class="fieldrow">
-        <label for="cfgThSS">RENUKE: stock move vs last nuke (%, all users)</label>
-        <input type="number" id="cfgThSS" min="0.01" step="0.05">
-      </div>
-      <div class="fieldrow">
-        <label for="cfgThSF">RENUKE: fx move vs last nuke (%, all users)</label>
-        <input type="number" id="cfgThSF" min="0.01" step="0.05">
-      </div>
-      <div class="fieldrow">
-        <label for="cfgThMS">MOVE flag: stock last vs close (%, all users)</label>
-        <input type="number" id="cfgThMS" min="0.1" step="0.5">
-      </div>
-      <div class="fieldrow">
-        <label for="cfgThMF">MOVE flag: fx last vs close (bps, all users)</label>
-        <input type="number" id="cfgThMF" min="1" step="5">
-      </div>
-      <div class="fieldrow">
-        <label for="cfgStep">Bid/ask rounding step (live, eod, override, &Delta;)</label>
-        <input type="number" id="cfgStep" min="0.0001" step="0.01">
-      </div>
-      <p class="note">Rounding and your name are saved in this browser; the
-        refresh interval applies to the shared server poller for everyone.</p>
-      <button class="primary" onclick="saveCfg()">Save &amp; apply</button>
-    </div>
-    <div class="cfg" style="margin-top:16px">
-      <h2>Column format</h2>
-      <div class="fieldrow">
-        <label for="lcol">Column</label>
-        <select id="lcol" style="width:200px;background:var(--bg);color:var(--text);
-          border:1px solid var(--border2);border-radius:0;padding:3px 7px;
-          font:13px var(--mono)" onchange="loadColForm()"></select>
-      </div>
-      <div class="fieldrow">
-        <label for="lw">Width (px, blank = auto)</label>
-        <input type="number" id="lw" min="40" step="1" oninput="colFormChanged()">
-      </div>
-      <div class="fieldrow">
-        <label for="lfg">Foreground (font colour)</label>
-        <input type="color" id="lfg" oninput="colFormChanged('fg')">
-        <button onclick="clearColField('fg')" title="Clear">&times;</button>
-      </div>
-      <div class="fieldrow">
-        <label for="lbg">Background</label>
-        <input type="color" id="lbg" oninput="colFormChanged('bg')">
-        <button onclick="clearColField('bg')" title="Clear">&times;</button>
-      </div>
-      <div class="fieldrow">
-        <label for="lb">Bold</label>
-        <input type="checkbox" id="lb" onchange="colFormChanged()">
-      </div>
-      <p class="note">Changes preview immediately. Drag the right edge of any
-        column header to resize on screen. Save layout makes it permanent
-        in this browser.</p>
-      <button class="b-t" onclick="saveLayout()">Save layout</button>
-      <button onclick="clearColumn()">Clear this column</button>
-      <button class="b-r" onclick="resetLayout()">Reset all</button>
-    </div>
-  </main>
+<div id="tab-risk" class="hide">
+  <div class="bar">
+    <button id="rk_reload">&#8635; Reload</button>
+    <input type="text" id="rk_filt" placeholder="filter\u2026" size="18">
+    <span id="rk_meta" class="status"></span>
+  </div>
+  <div id="rk_scroll" style="overflow:auto;max-height:calc(100vh - 128px)">
+    <table id="rk_tbl" class="report blgrid"><thead></thead><tbody></tbody></table>
+  </div>
 </div>
+<div id="tab-bau" class="hide">
+<div class="bar">
+  <label>date</label><input type="date" id="bdate">
+  <button id="bload" class="refresh">&#8635; Load</button>
+  <span id="bprog" style="color:#6e6a63"></span>
+  <span style="flex:1"></span>
+  <label><input type="checkbox" id="bmanage"> manage tasks</label>
+</div>
+<div class="status" id="bstatus">Pick a date and Load. Tick tasks as you complete them &mdash; each date keeps its own record.</div>
+<div class="panel" id="bpanel" style="display:none">
+  <div class="cap">TASK TEMPLATE <small>add or edit &mdash; changes apply to every day going forward; history is kept</small></div>
+  <div class="body">
+    <div class="btnrow">
+      <input id="bt_name" placeholder="task name" style="flex:2;min-width:220px">
+      <input id="bt_time" type="time" title="scheduled time">
+      <input id="bt_cat" placeholder="category (AM/PM/EOD)" style="width:140px">
+      <input id="bt_sort" type="number" value="100" title="sort order" style="width:70px">
+      <input id="bt_notes" placeholder="notes / how-to" style="flex:2;min-width:180px">
+      <button id="bt_save" class="refresh">Save task</button>
+      <button id="bt_clear">Clear form</button>
+      <input type="hidden" id="bt_id">
+    </div>
+  </div>
+</div>
+<div style="margin:10px 18px;background:#fff;border:1px solid #d8d8d8">
+  <table id="btable" style="width:100%;border-collapse:collapse;font:13px Consolas,monospace"></table>
+</div>
+</div>
+
+<!-- ============ TAB 4 : TRADE BLOTTER ============ -->
+<div id="tab-blotter" class="hide">
+<div class="bar">
+  <label>from <input type="date" id="bl_from"></label>
+  <label>to <input type="date" id="bl_to"></label>
+  <input type="text" id="bl_ticker" placeholder="ISIN / name" size="14">
+  <select id="bl_type"><option value="">all types</option></select>
+  <button id="bl_load" class="refresh">&#8635; Load</button>
+  <button id="bl_live">&#9679; live: off</button>
+  <input type="text" id="bl_q" placeholder="search loaded rows" size="16">
+  <button id="bl_reset" title="clear saved column widths + sort">reset layout</button>
+  <label style="margin-left:auto">you: <input type="text" id="bl_user" size="10"
+    placeholder="name"></label>
+  <span id="bl_meta" style="color:#6e6a63"></span>
+</div>
+<div class="status" id="bl_status">Read-only view of eqrms.trade_blotter; only
+Comments and Trader Agree are editable. Auto-refreshes every 30s.</div>
+<div style="overflow:auto;max-height:calc(100vh - 210px)">
+<style id="blcolstyle"></style>
+<table id="bl_tbl" class="report blgrid"><thead></thead><tbody></tbody></table>
+</div>
+</div>
+
+<!-- ============ TAB 5 : RFQ STATION ============ -->
+<div id="tab-rfq" class="hide">
+<div class="bar">
+  <input type="text" id="rf_sec" list="rf_secdl" placeholder="short name or ISIN"
+    style="min-width:190px" autocomplete="off">
+  <datalist id="rf_secdl"></datalist>
+  <select id="rf_style"><option value="outright">outright</option>
+    <option value="vs">versus</option>
+    <option value="working">working stock</option></select>
+  <select id="rf_sides"><option value="two_way">two-way</option>
+    <option value="bid">bid only</option><option value="ask">ask only</option>
+  </select>
+  <select id="rf_ord" title="send as a plain RFQ, or as a WORKING client order (client has given a level / instruction; the desk works toward the fill)">
+    <option value="">RFQ</option>
+    <option value="buy">order: client BUYS</option>
+    <option value="sell">order: client SELLS</option>
+    <option value="two">order: two-way</option></select>
+  <input type="text" id="rf_lvl" placeholder="bid level" size="9"
+    title="client target level / limit \u00b7 REQUIRED for working orders">
+  <input type="text" id="rf_lvl2" placeholder="ask level" size="8"
+    title="ask-side target \u00b7 REQUIRED for two-way working orders">
+  <input type="text" id="rf_vs" placeholder="vs" size="8"
+    title="stock reference \u00b7 REQUIRED for versus working orders">
+  <input type="text" id="rf_fx" placeholder="fx" size="7"
+    title="fx reference (optional)">
+  <input type="text" id="rf_delta" placeholder="delta" size="5"
+    title="delta % (optional)">
+  <input type="text" id="rf_qty" placeholder="qty" size="10">
+  <input type="text" id="rf_client" placeholder="client" size="12">
+  <button id="rf_send" class="refresh">Send RFQ</button>
+  <button id="rf_reload">&#8635;</button>
+  <button id="rf_mon" title="activity monitor - what needs a trader now, most urgent first">&#9873; <b id="rf_mon_n">0</b></button>
+  <button id="rf_cfg" title="display config">&#9881;</button>
+  <div id="rf_cfgp" class="hide">
+    <div class="cfg-t">DISPLAY CONFIG
+      <span id="rf_cfg_x" title="close">&#10005;</span></div>
+    <div class="cfg-s">density</div>
+    <label><input type="radio" name="cfg_den" value="compact"> compact</label>
+    <label><input type="radio" name="cfg_den" value="cozy"> cozy</label>
+    <div class="cfg-s">text</div>
+    <label><input type="radio" name="cfg_fs" value="s"> S</label>
+    <label><input type="radio" name="cfg_fs" value="m"> M</label>
+    <label><input type="radio" name="cfg_fs" value="l"> L</label>
+    <div class="cfg-s">columns</div>
+    <div id="cfg_cols"></div>
+    <div class="cfg-s">column format</div>
+    <select id="cf_col" style="width:100%"></select>
+    <div class="cf-row"><span>width px (blank = auto)</span>
+      <input id="cf_w" size="4"></div>
+    <div class="cf-row"><span>foreground</span>
+      <input type="color" id="cf_fg" value="#1c1c1c">
+      <b id="cf_fgx" title="clear">&#10005;</b></div>
+    <div class="cf-row"><span>background</span>
+      <input type="color" id="cf_bg" value="#ffffff">
+      <b id="cf_bgx" title="clear">&#10005;</b></div>
+    <div class="cf-row"><span>bold</span>
+      <input type="checkbox" id="cf_bold"></div>
+    <div class="cf-note">changes preview instantly &middot; drag the right edge
+      of any column header to resize &middot; all of it is saved in this
+      browser</div>
+    <button id="cf_clear">Clear this column</button>
+    <button id="cfg_reset">Reset to defaults</button>
+  </div>
+  <span id="rf_filt" style="margin-left:8px">
+    <button class="rf-f" data-f="open">Open</button><button class="rf-f" data-f="all">All</button><button class="rf-f" data-f="bondcfg" id="rf_bcfg" title="per-bond defaults: Tol + Autopilot (spreadsheet)">Bond Cfg</button><button class="rf-f on" data-f="nocxl">All &minus;CXL</button><button class="rf-f" data-f="done">Done</button></span>
+  <span id="rf_fields" style="margin-left:10px">
+    from <input type="date" id="rf_f_from" title="trade date from">
+    to <input type="date" id="rf_f_to" title="trade date to">
+    <input id="rf_f_txt" placeholder="ISIN / name / client" size="15">
+    <select id="rf_f_type"><option value="">all types</option>
+      <option>outright</option><option>vs</option>
+      <option value="working">working stock</option></select>
+  </span>
+  <span id="rf_meta" style="margin-left:auto;color:#5a6068"></span>
+</div>
+<div class="status" id="rf_status">RFQs on Nuke Station securities - outright, versus
+or working stock. Runs-format line per RFQ; Status / Type / Side / Hit are dropdowns.
+Grey Bid/Ask = draft (model at your refs); press Q to confirm it as the
+standing client quote - every rev is kept, H opens the history panel.
+Fresh (outright): GOOD = slippage favorable / tiny, PULL = a side has
+gone -ve beyond tolerance - hover the cell: \u27f3 refresh that side,
+\u2a2f pull it (Q refreshes both). vs / working use symmetric REQUOTE.
+Type a short name OR an ISIN to send. DONE lines need the trader's
+ACK (amber), then they're shaped for blotter upload (upload itself:
+coming later).</div>
+<div style="overflow:auto;max-height:calc(100vh - 210px)">
+<style id="rfq_grpcss"></style>
+<style id="rfq_colcss"></style>
+<div id="rf_cap"><b>RFQ STATION</b><small>grey italic = ghost (empty cell, info only) \u00b7 black italic Bid/Ask = draft (Q confirms) \u00b7 black = standing / pinned &middot; Hit: B / A \u2192 HIT (amber \u00b7 live keeps tracking), ACK books it DONE / REJ busts it \u00b7 rows: violet=req salmon=adjusting (quote off) skyblue=quoted teal=working amber=hit green=done grey=cxl blue=refresh (status reads REFRESH while pending) &middot; Refresh: sales &#10227; req tints the row blue until the trader answers (Q / &#10227; / &#10759;) &middot; H / &#10697; by the ID &middot; trader ctrl: Q quote &middot; &#10680; off &middot; L live &middot; &#10005; cancel</small></div>
+<div id="rfq_scroll"><table id="rfq_tbl" class="report blgrid"><thead></thead><tbody></tbody></table></div>
+<div id="rfq_bcfg" class="hide" style="padding:8px 10px">
+  <b style="letter-spacing:1px">PER-BOND DEFAULTS \u00b7 applied when a row has no explicit Tol / Auto</b>
+  <table class="blgrid" id="bc_tbl" style="margin-top:6px"><thead><tr><th>ISIN</th><th>Security</th><th style="width:80px">Tol</th><th style="width:70px">Autopilot</th><th style="width:60px"></th></tr></thead>
+  <tbody id="bc_body"></tbody></table>
+  <div class="bar"><input id="bc_isin" placeholder="ISIN" size="14"><input id="bc_name" placeholder="security" size="12"><input id="bc_tol" placeholder="tol" size="6">
+  <label><input type="checkbox" id="bc_ap"> autopilot</label>
+  <button id="bc_add" class="refresh">Save</button>
+  <span id="bc_status"></span></div>
+</div>
+<div id="rfq_mon"><div id="rm_grip" title="drag to resize"></div>
+  <div class="rm-head">ACTIVITY MONITOR<span><span id="rm_zo" title="smaller">A&#8722;</span><span id="rm_zi" title="bigger">A+</span><span id="rm_dock" title="dock to bottom / right">&#8681;</span><span id="rm_close" title="close" style="margin-left:8px">&#10005;</span></span></div>
+  <div class="rm-meta">most urgent first &middot; click to jump &middot; refreshes with the poll</div>
+  <div id="rm_list"></div>
+</div>
+<div id="rfq_hist">
+  <div id="rh_rz" title="drag &#8596; to resize &middot; double-click resets"></div>
+  <div class="rh-head"><span id="rh_title">Quoting history</span>
+    <span id="rh_close" title="close">&#10005;</span></div>
+  <div id="rh_meta" class="rh-meta"></div>
+  <table class="report blgrid" id="rh_tbl"><thead><tr>
+    <th>Rev</th><th>Act</th><th>Time</th><th>By</th><th>Bid</th><th>Ask</th>
+    <th>Move</th><th>Vs</th><th>Fx</th><th>&Delta;</th>
+  </tr></thead><tbody></tbody></table>
+  <div class="rh-sub">EVENT LOG <small>created &middot; status &middot; hit &middot; refresh &middot; ack &middot; edits</small></div>
+  <table class="report blgrid" id="rh_ev"><thead><tr>
+    <th>Time</th><th>By</th><th>What</th><th>Change</th>
+  </tr></thead><tbody></tbody></table>
+</div>
+</div>
+</div>
+
+<!-- ============ TAB 6 : NUKE STATION ============ -->
+<div id="tab-twcb" class="hide">
+<div class="bar">
+  <b style="letter-spacing:1px">TW CONVERTIBLE BOND ISSUANCE PIPELINE MONITOR</b>
+  <button id="twrun" class="refresh">&#8635; Refresh</button>
+  <button id="twbf" title="one-time: walk ~92 days of SFB daily-news pages to seed the LIVE SHELF with June / July effective registrations; runs in the background (a few minutes), then the view refreshes itself">Backfill 92d</button>
+  <label title="update the seen-store so these events stop counting as NEW (same dedupe the scheduled run uses)">
+    <input type="checkbox" id="twmark"> mark as seen</label>
+  <span id="twstatus" style="color:#6e6a63"></span>
+</div>
+<div class="bar">
+  To <input type="text" id="twto" size="34" placeholder="a@citi.com; b@citi.com">
+  Cc <input type="text" id="twcc" size="24">
+  <button id="twdraft" disabled>Open Draft</button>
+  <button id="twsendnow" class="sendnow" disabled>Send Now</button>
+  <span id="twmeta" style="color:#6e6a63"></span>
+</div>
+<div style="padding:0 10px 10px">
+<table class="blgrid" id="tw_tbl"><thead><tr>
+  <th style="width:44px">New</th><th>Source</th><th style="width:86px">Date</th>
+  <th>Company</th><th>Detail</th><th>Detail (EN)</th></tr></thead>
+<tbody id="tw_body"><tr><td colspan="6" style="color:#8b919a">Press Refresh to pull TWSE / TPEx / SFB.</td></tr></tbody></table>
+<div id="tw_shelf_wrap" class="hide" style="margin-top:14px">
+  <b style="letter-spacing:1px" title="every SFB effective-registration stays here for the 92-day issuance window; seed history once with: python tw_cb_pipeline_monitor.py --backfill">LIVE SHELF \u00b7 effective registrations inside the 92-day issuance window</b>
+  <table class="blgrid" id="tws_tbl" style="margin-top:6px"><thead><tr>
+    <th style="width:70px">Days left</th><th style="width:86px">Effective</th>
+    <th>Company</th><th>Detail</th><th>Detail (EN)</th></tr></thead>
+  <tbody id="tws_body"></tbody></table>
+</div>
+</div>
+</div>
+<div id="tab-nuke" class="hide">
+<div class="bar">
+  <button id="nretry" class="refresh">&#8635; Connect</button>
+  <a id="nopen" href="#" target="_blank"><button>Open in new window</button></a>
+  <span id="nstat" style="color:#6e6a63"></span>
+</div>
+<div class="status" id="nstatus">Checking Nuke Station server ...</div>
+<iframe id="nframe" style="height:calc(100vh - 160px)"></iframe>
+</div>
+
 <script>
-const DEFAULT_IDS = __DEFAULT_IDS__;
-/* unified editable grid: c0 short_name | c1 und_fx | c2-4 overrides.
-   zones keep selections within a column group so ranges never span
-   the read-only columns physically in between. */
-const COLS = ["short_name","und_fx","n_gamma",
-              "ovdSpot","ovdCbFx","ovdUndFx"];
-const NCOLS = COLS.length;
-const FIELDS = ["ovdSpot","ovdCbFx","ovdUndFx"];
-const FSUF = {ovdSpot:"Spot", ovdCbFx:"CbFx", ovdUndFx:"UndFx"};
-const zoneOf = c => c===0 ? 0 : (c===1 ? 1 : (c===2 ? 2 : 3));
-const zoneBounds = z => z===0 ? [0,0] : (z===1 ? [1,1] :
-                         (z===2 ? [2,2] : [3,5]));
-const isNum = c => c >= 2;
-let lastResponse = null;
-const refCache = {};
-
-const NL = String.fromCharCode(10);
-const CFG = Object.assign(
-  {roundStep:0.05, user:"user-"+Math.random().toString(36).slice(2,6)},
-  JSON.parse(localStorage.getItem("nukestation.cfg")||"{}"));
-
-/* every visible column after the checkbox, in exact display order */
-const COL_DEFS = [
-  ["secId","secId","stick1"],["company","company","ref stick2"],
-  ["short_name","short_name","ref stick3"],
-  ["bond_type","BOND_TYPE",""],["ric","ric","ref"],
-  ["expiry","expiry","ref"],["isin","isin","ref"],["sec_fx","sec_fx","ref"],
-  ["und_fx","und_fx","ref"],["quantity_live","qty_live","ref"],
-  ["usd_qty_live","usd_qty_live","ref"],
-  ["n_bid","nBid","grp"],["n_gamma","nGamma",""],
-  ["n_spread","nSpread",""],
-  ["n_spot","nSpot",""],["n_spotfx","nSpotFx",""],
-  ["n_delta","nDelta%",""],["m_delta","MDelta%",""],
-  ["parityPct","PARITY%",""],["cs_used","CSprd",""],
-  ["bw_dvb","\u2202V/B","grp"],["bw_dvs","\u2202V/S",""],
-  ["bw_brw","BRW",""],["bw_lo","B.LO",""],["bw_hi","B.HI",""],
-  ["bw_gap","GAP",""],["bw_util","UTIL",""],["bw_d5","\u03945D",""],
-  ["bw_htb","HTB",""],["bw_evt","EVT",""],["bw_src","SRC",""],["bw_tnr","TNR",""],
-  ["x_bid","XBid","grp"],
-  ["or_bid_sprd","OrBidSprd",""],["ovd_bid","bid",""],
-  ["ovd_ask","ask",""],["or_ask_sprd","OrAskSprd",""],
-  ["x_ask","XAsk",""],["x_both","X",""],
-  ["quote_bid","QuoteBid",""],["quote_ask","QuoteAsk",""],
-  ["stk_move","Stk%",""],["fx_move","FXbps",""],
-  ["d_vs","\u0394 vs live bid",""],["mid_drift","MID DRIFT",""],
-  ["f_call","CALL","grp"],["f_exp","EXP",""],["f_put","PUT",""],
-  ["f_div","DIV",""],["f_move","MOVE",""],["f_nuke","NUKE",""],
-  ["f_vol","VOL",""],
-  ["v_iv","ImpVol","grp"],["v_10","V10",""],["v_30","V30",""],["v_90","V90",""],
-  ["v_n",'VN <input id="volN" size="2" oninput="volNChanged(this)">',""],
-  ["v_vega","Vega",""],
-  ["ovdSpot","ovdSpot","grp"],["ovdCbFx","ovdCbFx",""],["ovdUndFx","ovdUndFx",""],
-  ["live_bid","bid","grp"],["live_ask","ask",""],["live_spot","spot",""],
-  ["live_cbfx","cbFx",""],["live_undfx","undFx",""],
-  ["eod_bid","bid","grp"],["eod_ask","ask",""],["eod_spot","spot",""],
-  ["eod_cbfx","cbFx",""],["eod_undfx","undFx",""],
-  ["t_m","m%","grp"],["t_rolld","roll\u0394",""],["t_dpnl","\u0394pnl",""],
-  ["t_gpnl","\u03b3pnl",""],["t_theo","theo",""],["t_vslive","vs live",""],
-  ["stk_last","last","grp rf"],["stk_time","time","rf"],["stk_date","date","rf"],
-  ["stk_close","close","rf"],["stk_closedt","close dt","rf"],
-  ["fx_last","fx last","grp fx"],["fx_time","fx time","fx"],
-  ["fx_date","fx date","fx"],["fx_close","fx close","fx"],
-  ["fx_closedt","fx close dt","fx"],
-];
-const COL_KEYS = COL_DEFS.map(d=>d[0]);
-const DEF_W = {secId:97, company:180, short_name:110, und_fx:92,
-               ovdSpot:96, ovdCbFx:96, ovdUndFx:96};
-const SIDE_W_DEF = 172;   // left secid panel; LAYOUT._side overrides
-const SIDE_RAIL = 18;     // collapsed rail width
-let SIDE_HID = localStorage.getItem("nukestation.sidehide")==="1";
-const LAYOUT = JSON.parse(localStorage.getItem("nukestation.layout")||"{}");
-const colIdx = key => COL_KEYS.indexOf(key) + 2;   // nth-child (1=checkbox)
-
-const RES_COLS = ["nBid","nDeltaPct","nSpread","nSpot","nSpotFx",
-  "liveMktBid","liveMktAsk","liveSpot","liveCbFx","liveUndFx",
-  "eodMktBid","eodMktAsk","eodSpot","eodCbFx","eodUndFx",
-  "ovdMktBid","ovdMktAsk","dVsLive"];
-const RF_COLS = ["last","last_time","last_date","close","close_date"];
-const FX_COLS = ["last","last_time","last_date","close","close_date"];
-
-const _grp = (v, dpMax, dpMin=0) => Number(v).toLocaleString("en-US",
-  {minimumFractionDigits:dpMin, maximumFractionDigits:dpMax});
-const fmt = (v, dp=4) => (v===null||v===undefined||isNaN(v)) ? "" :
-  _grp(v, dp);
-const fmtBA = v => {
-  if(v===null||v===undefined||isNaN(v)) return "";
-  const s = CFG.roundStep > 0 ? CFG.roundStep : 0.05;
-  return _grp(Math.round(Number(v)/s)*s, 2, 2);
-};
-const fmt2 = v => (v===null||v===undefined||v===""||isNaN(v)) ? "" :
-  _grp(v, 2, 2);
-const fmt4 = v => (v===null||v===undefined||v===""||isNaN(v)) ? "" :
-  _grp(v, 4, 4);
-const fmt0 = v => (v===null||v===undefined||v===""||isNaN(v)) ? "" :
-  Math.round(Number(v)).toLocaleString("en-US");
-const sanitizeNum = s => {
-  const v = String(s).replace(/[, ]/g,"").trim();
-  return v === "" || isNaN(Number(v)) ? "" : v;
-};
-const cellVal = (c, raw) => isNum(c) ? sanitizeNum(raw) : String(raw).trim();
-
-/* ---------------- tabs & config ---------------- */
-function showTab(t){
-  for(const [k,v] of [["main","viewMain"],["cfg","viewCfg"],
-                      ["runs","viewRuns"],["snap","viewSnap"],
-                      ["log","viewLog"]]){
-    const el = document.getElementById(v);
-    if(el) el.style.display = t===k ? (k==="snap"?"block":"grid") : "none";
-  }
-  for(const [k,b] of [["main","tabMain"],["cfg","tabCfg"],
-                      ["runs","tabRuns"],["snap","tabSnap"],
-                      ["log","tabLog"]]){
-    document.getElementById(b).classList.toggle("active", t===k);
-  }
-  if(t==="snap" && typeof loadSnap8==="function") loadSnap8();
-  if(t==="log" && typeof loadLogs==="function") loadLogs();
-}
-async function volNow(){
-  setStatus("Fetching vol history (isolated child, up to ~1 min)...");
+const $=id=>document.getElementById(id);
+let AUTH={user:"",role:""};
+async function authBoot(){
   try{
-    const base = location.pathname.replace(new RegExp("[/]+$"),"");
-    const j = await (await fetch(base+"/api/vol/run",{method:"POST"})).json();
-    setStatus(j.ok
-      ? `Vol history loaded for ${j.rics} ric(s) - cells fill on the next refresh.`
-      : `<span class="warn">Vol fetch: ${j.error}</span>`);
-  }catch(e){ setStatus(`<span class="warn">Vol fetch failed: ${e}</span>`); }
-}
-let _logTimer = null;
-async function loadLogs(){
-  try{
-    const base = location.pathname.replace(new RegExp("[/]+$"),"");
-    const j = await (await fetch(base+"/api/logs?n=400")).json();
-    const esc = t => t.replace(/&/g,"&amp;").replace(/</g,"&lt;");
-    const pre = document.getElementById("logpre");
-    const stick = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 30;
-    pre.innerHTML = (j.lines||[]).map(l=>{
-      const e = esc(l);
-      if(l.includes("[ERRO")) return `<span style="color:#ff8f8f">${e}</span>`;
-      if(l.includes("[WARN")) return `<span style="color:#ffd37a">${e}</span>`;
-      return e;
-    }).join("\\n");
-    if(stick) pre.scrollTop = pre.scrollHeight;
-    document.getElementById("logMeta").textContent =
-      (j.lines||[]).length + " lines";
-  }catch(e){ document.getElementById("logMeta").textContent = String(e); }
-  clearTimeout(_logTimer);
-  const on = document.getElementById("logAuto");
-  const vis = document.getElementById("viewLog").style.display !== "none";
-  if(on && on.checked && vis) _logTimer = setTimeout(loadLogs, 5000);
-}
-function copyLogs(){
-  const t = document.getElementById("logpre").textContent;
-  copyText(t).then(ok => document.getElementById("logMeta").textContent =
-    ok ? "copied" : "copy blocked");
-}
-const _p2s = v => v == null || !isFinite(v) ? "\u2014" : Number(v).toFixed(2);
-async function loadSnap8(d){
-  try{
-    const base = location.pathname.replace(new RegExp("[/]+$"),"");
-    const j = await (await fetch(base+"/api/snap8"+(d?("?d="+d):""))).json();
-    if(!j.ok){ document.getElementById("sn8meta").textContent=j.error; return; }
-    const sel = document.getElementById("sn8date");
-    sel.innerHTML = (j.dates||[]).map(x=>
-      `<option${x===j.date?" selected":""}>${x}</option>`).join("");
-    const R="text-align:right";
-    const fN=(v,d)=>v==null||!isFinite(v)?"\u2014":Number(v).toFixed(d);
-    const fQ=v=>v==null||!isFinite(v)?"\u2014":Number(v).toLocaleString();
-    document.querySelector("#sn8tbl tbody").innerHTML =
-      (j.rows||[]).map(r=>`<tr><td>${r.short_name}</td><td>${r.isin||""}</td>`+
-        `<td style="${R}">${fN(r.ovd_bid,2)}</td>`+
-        `<td style="${R}">${fN(r.ovd_ask,2)}</td>`+
-        `<td style="${R}">${fN(r.indic_ask,2)}</td>`+
-        `<td style="${R}">${fN(r.vs_ref,2)}</td>`+
-        `<td style="${R}">${fN(r.fx_ref,4)}</td>`+
-        `<td style="${R}">${fN(r.vs_usd,2)}</td>`+
-        `<td style="${R}">${fN(r.delta_pct,1)}</td>`+
-        `<td style="${R}">${fQ(r.qty)}</td>`+
-        `<td>${(r.snapped_at||"").slice(11,19)}</td></tr>`).join("");
-    document.getElementById("sn8meta").textContent =
-      (j.rows||[]).length + " securities \u00b7 " + (j.date||"no snapshot");
-  }catch(e){ document.getElementById("sn8meta").textContent=String(e); }
-}
-async function snap8Now(){
-  const base = location.pathname.replace(new RegExp("[/]+$"),"");
-  const j = await (await fetch(base+"/api/snap8/run",{method:"POST"})).json();
-  document.getElementById("sn8meta").textContent =
-    j.ok ? ("snapped " + j.stored + " securities") : j.error;
-  loadSnap8();
-}
-
-function loadCfgForm(){
-  document.getElementById("cfgName").value = CFG.user;
-  document.getElementById("cfgSec").value = NS.refreshSec;
-  document.getElementById("cfgRef").value = NS.refdataSec;
-  document.getElementById("cfgAuto").value = NS.autosaveSec;
-  document.getElementById("cfgStep").value = CFG.roundStep;
-  document.getElementById("cfgThSS").value = FLAG_TH.staleSpotPct;
-  document.getElementById("cfgThSF").value = FLAG_TH.staleFxPct;
-  document.getElementById("cfgThMS").value = FLAG_TH.stkPct;
-  document.getElementById("cfgThMF").value = FLAG_TH.fxBps;
-}
-function saveCfg(){
-  const name = document.getElementById("cfgName").value.trim();
-  if(name && name !== CFG.user){ CFG.user = name.slice(0,24); NS.hello(); }
-  CFG.roundStep = parseFloat(document.getElementById("cfgStep").value)||0.05;
-  localStorage.setItem("nukestation.cfg", JSON.stringify(CFG));
-  const sec = Math.max(2, parseInt(document.getElementById("cfgSec").value)||5);
-  if(sec !== NS.refreshSec) NS.send({type:"refresh", sec});
-  const rsec = Math.max(30, parseInt(document.getElementById("cfgRef").value)||300);
-  if(rsec !== NS.refdataSec) NS.send({type:"refInt", sec: rsec});
-  const asec = Math.max(0, parseInt(document.getElementById("cfgAuto").value)||0);
-  if(asec !== NS.autosaveSec) NS.send({type:"autosave", sec: asec});
-  const th = {
-    staleSpot: parseFloat(document.getElementById("cfgThSS").value),
-    staleFx: parseFloat(document.getElementById("cfgThSF").value),
-    moveStk: parseFloat(document.getElementById("cfgThMS").value),
-    moveFx: parseFloat(document.getElementById("cfgThMF").value)};
-  if(isFinite(th.staleSpot) && (th.staleSpot !== FLAG_TH.staleSpotPct ||
-     th.staleFx !== FLAG_TH.staleFxPct || th.moveStk !== FLAG_TH.stkPct ||
-     th.moveFx !== FLAG_TH.fxBps))
-    NS.send({type:"flagTh", ...th});
-  loadCfgForm();
-  if(lastResponse) render(lastResponse);
-  showTab("main");
-  setStatus(`Config saved: rounding ${CFG.roundStep}, ` +
-            `server refresh ${sec}s, name ${CFG.user}.`);
-}
-
-/* ---------------- selection state ---------------- */
-const S = {a:null, f:null, dragging:false, filling:false, fillRect:null};
-const rowSel = new Set();
-let rowAnchor = null;
-
-const cellAt = (r,c) => document.querySelector(
-  `#tbl input[data-row="${r}"][data-col="${c}"]`);
-const tdAt = (r,c) => { const i = cellAt(r,c); return i ? i.parentElement : null; };
-const trAt = r => document.querySelectorAll("#tbl tr[data-id]")[r];
-const cbAt = r => { const tr = trAt(r); return tr ? tr.querySelector(".rowcb") : null; };
-const nRows = () => document.querySelectorAll("#tbl tr[data-id]").length;
-const rect = () => S.a && S.f ? {
-  r1: Math.min(S.a.r,S.f.r), r2: Math.max(S.a.r,S.f.r),
-  c1: Math.min(S.a.c,S.f.c), c2: Math.max(S.a.c,S.f.c)} : null;
-const area = rc => rc ? (rc.r2-rc.r1+1)*(rc.c2-rc.c1+1) : 0;
-const clampZone = c => {
-  if(!S.a) return c;
-  const [z1,z2] = zoneBounds(zoneOf(S.a.c));
-  return Math.max(z1, Math.min(z2, c));
-};
-
-function paint(){
-  document.querySelectorAll("#tbl td.gc").forEach(td=>
-    td.classList.remove("sel","active","fillprev"));
-  const rc = rect();
-  if(rc){
-    for(let r=rc.r1;r<=rc.r2;r++) for(let c=rc.c1;c<=rc.c2;c++){
-      const td = tdAt(r,c); if(td) td.classList.add("sel");
-    }
-    const atd = tdAt(S.a.r,S.a.c); if(atd) atd.classList.add("active");
-  }
-  if(S.fillRect){
-    const fr = S.fillRect;
-    for(let r=fr.r1;r<=fr.r2;r++) for(let c=fr.c1;c<=fr.c2;c++){
-      const inSel = rc && r>=rc.r1&&r<=rc.r2&&c>=rc.c1&&c<=rc.c2;
-      const td = tdAt(r,c); if(td && !inSel) td.classList.add("fillprev");
-    }
-  }
-  positionHandle();
-  updateNamebox();
-}
-
-function paintRows(){
-  document.querySelectorAll("#tbl tr[data-id]").forEach((tr,ri)=>{
-    const on = rowSel.has(ri);
-    tr.classList.toggle("rowsel", on);
-    const cb = tr.querySelector(".rowcb"); if(cb) cb.checked = on;
-  });
-  const all = document.getElementById("cbAll");
-  if(all){
-    all.checked = rowSel.size===nRows() && nRows()>0;
-    all.indeterminate = rowSel.size>0 && rowSel.size<nRows();
-  }
-  const go = document.getElementById("go");
-  go.textContent = rowSel.size ? `Nuke ${rowSel.size} selected` : "Nuke prices";
-}
-
-function positionHandle(){
-  const fh = document.getElementById("fh"), rc = rect();
-  if(!rc){ fh.style.display="none"; return; }
-  const td = tdAt(rc.r2, rc.c2), wrap = document.getElementById("wrap");
-  if(!td){ fh.style.display="none"; return; }
-  const tr_ = td.getBoundingClientRect(), wr = wrap.getBoundingClientRect();
-  fh.style.left = (tr_.right - wr.left + wrap.scrollLeft - 5) + "px";
-  fh.style.top  = (tr_.bottom - wr.top + wrap.scrollTop - 5) + "px";
-  fh.style.display = "block";
-}
-
-function updateNamebox(){
-  const nb = document.getElementById("namebox"), rc = rect();
-  if(!rc){ nb.innerHTML = rowSel.size ? `${rowSel.size} row(s)` : "&mdash;"; return; }
-  const tr_ = trAt(S.a.r);
-  const sid = tr_ ? tr_.dataset.id : "?";
-  nb.textContent = area(rc)===1 ? `${sid} \u00b7 ${COLS[S.a.c]}` :
-    `${rc.r2-rc.r1+1}R \u00d7 ${rc.c2-rc.c1+1}C`;
-}
-
-function setActive(r, c, extend=false){
-  r = Math.max(0, Math.min(nRows()-1, r));
-  c = Math.max(0, Math.min(NCOLS-1, c));
-  if(extend && S.a){ S.f = {r, c: clampZone(c)}; }
-  else { S.a = {r,c}; S.f = {r,c};
-    const el = cellAt(r,c);
-    if(el){ el.classList.remove("editing"); el.focus({preventScroll:true});
-      el.select();
-      el.scrollIntoView({block:"nearest", inline:"nearest"}); } }
-  paint();
-}
-
-function flash(el){
-  el.classList.add("justset");
-  setTimeout(()=>el.classList.remove("justset"), 400);
-}
-
-/* ---------------- row selection ---------------- */
-function selectRowClick(ri, e){
-  if(e.shiftKey && rowAnchor!==null){
-    if(!e.ctrlKey && !e.metaKey) rowSel.clear();
-    const [a,b] = [Math.min(rowAnchor,ri), Math.max(rowAnchor,ri)];
-    for(let i=a;i<=b;i++) rowSel.add(i);
-  } else if(e.ctrlKey || e.metaKey){
-    rowSel.has(ri) ? rowSel.delete(ri) : rowSel.add(ri);
-    rowAnchor = ri;
-  } else {
-    const only = rowSel.size===1 && rowSel.has(ri);
-    rowSel.clear();
-    if(!only) rowSel.add(ri);
-    rowAnchor = ri;
-  }
-  paintRows(); updateNamebox();
-}
-
-function toggleRow(ri){
-  rowSel.has(ri) ? rowSel.delete(ri) : rowSel.add(ri);
-  rowAnchor = ri;
-  paintRows(); updateNamebox();
-}
-
-function targetRows(){
-  return rowSel.size ? [...rowSel].sort((a,b)=>a-b)
-                     : [...Array(nRows()).keys()];
-}
-
-/* --------- copy live/eod values into overrides --------- */
-function copyResultToInput(ri, field, kind){
-  const tr = trAt(ri); if(!tr) return false;
-  const src = tr.querySelector(`td[data-c="${kind}${FSUF[field]}"]`);
-  const v = sanitizeNum(src ? src.textContent : "");
-  if(v===""){ return false; }
-  const inp = tr.querySelector(`input[data-f="${field}"]`);
-  if(inp){ inp.value = v; flash(inp); return true; }
-  return false;
-}
-
-/* --------- copy eikon (stock/fx, last/close) into overrides --------- */
-function eikonVal(ri, e){
-  const tr = trAt(ri); if(!tr) return "";
-  const [src, metric] = e.split("_");
-  const td = tr.querySelector(src==="stk"
-    ? `td[data-rf="${metric}"]` : `td[data-fx="${metric}"]`);
-  return sanitizeNum(td ? td.textContent : "");
-}
-
-function vanRow(tr){
-  const b=tr&&tr.querySelector('input[data-u="bond_type"]');
-  return b&&String(b.value||'').toLowerCase().startsWith('vanil');
-}
-function vanCbFromUnd(ri){
-  const tr=trAt(ri); if(!tr||!vanRow(tr)) return false;
-  const u=tr.querySelector('input[data-f="ovdUndFx"]');
-  const c=tr.querySelector('input[data-f="ovdCbFx"]');
-  if(u&&c&&String(u.value).trim()!==''){
-    c.value=u.value; flash(c); return true; }
-  return false;
-}
-function copyEikonToInput(ri, field, e){
-  const v = eikonVal(ri, e);
-  if(v === "") return false;
-  const tr = trAt(ri); if(!tr) return false;
-  const inp = tr.querySelector(`input[data-f="${field}"]`);
-  if(inp){ inp.value = v; flash(inp); return true; }
-  return false;
-}
-
-function fillFromEikon(e, r, c, field){
-  const metric = e.split("_")[1];
-  const srcFor = f => f==="ovdSpot" ? "stk_"+metric
-                    : f==="ovdUndFx" ? "fx_"+metric : null;
-  const rc = rect();
-  const inSel = rc && rc.c1>=3 && r>=rc.r1 && r<=rc.r2 && c>=rc.c1 && c<=rc.c2;
-  if(inSel && area(rc) > 1){
-    let ok=0, miss=0, na=0;
-    for(let rr=rc.r1; rr<=rc.r2; rr++)
-      for(let cc=rc.c1; cc<=rc.c2; cc++){
-        const f = FIELDS[cc-3], src = srcFor(f);
-        if(!src){ na++; continue; }               // ovdCbFx has no eikon source
-        copyEikonToInput(rr, f, src) ? ok++ : miss++;
-      }
-    const extra = [];
-    if(miss) extra.push(`<span class="warn">${miss} without eikon values</span>`);
-    if(na) extra.push(`${na} ovdCbFx cell(s) skipped`);
-    setStatus(`Filled ${ok} cell(s) from eikon ${metric}` +
-              (extra.length ? "; " + extra.join("; ") : "."));
-  } else {
-    const done = copyEikonToInput(r, field, e);
-    if(!done) setStatus(`<span class="warn">No eikon ${metric} value yet.</span>`);
-  }
-  { const rc2 = rect(); const ris = [r];
-    if(rc2 && rc2.c1 >= 3) for(let rr=rc2.r1;rr<=rc2.r2;rr++) ris.push(rr);
-    syncRows(ris); }
-}
-
-function bulkCopy(kind){
-  const rows = targetRows();
-  let ok=0, skip=0;
-  for(const ri of rows){
-    let any=false;
-    for(const f of FIELDS) any = copyResultToInput(ri, f, kind) || any;
-    vanCbFromUnd(ri);
-    any ? ok++ : skip++;
-  }
-  syncRows(rows);
-  rows.forEach(ri=>{ const tr=trAt(ri); if(tr) autoNukeQueue(Number(tr.dataset.id)); });
-  const scope = rowSel.size ? `${rows.length} selected row(s)` : "all rows";
-  setStatus(skip
-    ? `Copied ${kind} &rarr; overrides for ${ok} of ${scope}; ` +
-      `<span class="warn">${skip} without ${kind} values &mdash; nuke first</span>`
-    : `Copied ${kind} &rarr; overrides for ${scope}.`);
-}
-
-function bulkEikon(metric){
-  if(!rowSel.size){
-    setStatus('<span class="warn">No rows selected &mdash; tick rows first, ' +
-              'nothing updated.</span>');
-    return;
-  }
-  const rows = [...rowSel].sort((a,b)=>a-b);
-  let ok=0, miss=0;
-  for(const ri of rows){
-    let any=false;
-    any = copyEikonToInput(ri, "ovdSpot",  "stk_"+metric) || any;
-    any = copyEikonToInput(ri, "ovdUndFx", "fx_"+metric)  || any;
-    any = (vanCbFromUnd(ri)
-           || copyResultToInput(ri, "ovdCbFx", "live")) || any;
-    any ? ok++ : miss++;
-  }
-  syncRows(rows);
-  rows.forEach(ri=>{ const tr=trAt(ri); if(tr) autoNukeQueue(Number(tr.dataset.id)); });
-  setStatus(miss
-    ? `Eikon ${metric} &rarr; overrides for ${ok} of ${rows.length} selected row(s); ` +
-      `<span class="warn">${miss} without values</span>`
-    : `Eikon ${metric} &rarr; overrides (spot, undFx; cbFx from live) ` +
-      `for ${ok} selected row(s).`);
-}
-
-/* ---------------- grid wiring ---------------- */
-function wireGrid(){
-  document.querySelectorAll("#tbl input.gridcell").forEach(inp=>{
-    const r = +inp.dataset.row, c = +inp.dataset.col;
-
-    inp.addEventListener("mousedown", (e)=>{
-      if(e.button!==0) return;
-      e.preventDefault();
-      if(e.shiftKey && S.a){ S.f = {r, c: clampZone(c)}; paint(); }
-      else setActive(r,c);
-      S.dragging = true;
-    });
-    inp.addEventListener("dblclick", ()=>{
-      inp.classList.add("editing");
-      inp.focus();
-      const len = inp.value.length;
-      inp.setSelectionRange(len,len);
-    });
-    inp.addEventListener("mouseover", ()=>{
-      if(S.dragging){ S.f = {r, c: clampZone(c)}; paint(); }
-      else if(S.filling){ updateFillRect(r,c); paint(); }
-    });
-    inp.addEventListener("focus", ()=>{
-      inp.dataset.orig = inp.value;
-      if(!S.a || S.a.r!==r || S.a.c!==c){ S.a={r,c}; S.f={r,c}; paint(); }
-    });
-
-    inp.addEventListener("keydown", (e)=>{
-      const rc = rect(), multi = area(rc)>1;
-      const editing = inp.classList.contains("editing");
-      const len = inp.value.length;
-      const atStart = inp.selectionStart===0 && inp.selectionEnd===0;
-      const atEnd = inp.selectionStart===len && inp.selectionEnd===len;
-      const allSel = inp.selectionStart===0 && inp.selectionEnd===len;
-
-      if(e.key==="Enter"){ e.preventDefault(); setActive(e.shiftKey?r-1:r+1, c); }
-      else if(e.key==="Tab"){ e.preventDefault();
-        setActive(r, e.shiftKey?c-1:c+1); }
-      else if(e.key==="ArrowLeft" && c===0 && !e.shiftKey &&
-              (allSel||len===0||atStart)){
-        e.preventDefault(); const cb = cbAt(r); if(cb) cb.focus(); }
-      else if(e.key.startsWith("Arrow")){
-        const d = {ArrowUp:[-1,0],ArrowDown:[1,0],ArrowLeft:[0,-1],ArrowRight:[0,1]}[e.key];
-        if(e.shiftKey){ e.preventDefault();
-          setActive((S.f?S.f.r:r)+d[0], (S.f?S.f.c:c)+d[1], true); }
-        else if(!editing || d[0]!==0 || allSel || len===0 ||
-                (d[1]===-1&&atStart) || (d[1]===1&&atEnd)){
-          e.preventDefault(); setActive(r+d[0], c+d[1]); }
-      }
-      else if(e.key==="Escape"){ inp.value = inp.dataset.orig ?? "";
-        inp.classList.remove("editing"); S.f={r,c}; paint(); inp.select(); }
-      else if(e.key==="Delete" || (e.key==="Backspace" && multi)){
-        if(multi || allSel){ e.preventDefault(); forSel((el)=>el.value="");
-          const rc2 = rect();
-          if(rc2){ const ris=[]; for(let rr=rc2.r1;rr<=rc2.r2;rr++) ris.push(rr);
-            syncRows(ris); } } }
-      else if((e.ctrlKey||e.metaKey) && e.key.toLowerCase()==="a"){
-        e.preventDefault();
-        const [z1,z2] = zoneBounds(zoneOf(c));
-        S.a={r:0,c:z1}; S.f={r:nRows()-1,c:z2}; paint(); }
-      else if((e.ctrlKey||e.metaKey) && e.key.toLowerCase()==="d"){
-        e.preventDefault();
-        if(multi){
-          for(let cc=rc.c1;cc<=rc.c2;cc++){
-            const src = cellAt(rc.r1,cc);
-            for(let rr=rc.r1+1;rr<=rc.r2;rr++){
-              const t = cellAt(rr,cc); if(t&&src) t.value = src.value; } } }
-        else { const above = cellAt(r-1,c); if(above) inp.value = above.value; }
-        { const rc2 = rect(); const ris=[];
-          if(rc2) for(let rr=rc2.r1;rr<=rc2.r2;rr++) ris.push(rr); else ris.push(r);
-          syncRows(ris); } }
-      else if((e.ctrlKey||e.metaKey) && ["c","x"].includes(e.key.toLowerCase()) && multi){
-        e.preventDefault(); copySelection(e.key.toLowerCase()==="x"); }
-      else if(!editing && !e.ctrlKey && !e.metaKey && e.key.length===1){
-        if(multi){ S.f={r,c}; paint(); }
-        inp.classList.add("editing");   // typing starts edit: first char
-      }                                 // replaces (all selected), rest append
-    });
-
-    inp.addEventListener("blur", ()=>inp.classList.remove("editing"));
-    inp.addEventListener("change", ()=>syncRows([r]));
-
-    inp.addEventListener("paste", (e)=>{
-      const text = (e.clipboardData||window.clipboardData).getData("text");
-      e.preventDefault();
-      const rc = rect();
-      const block = text.replace(/\\r/g,"").split("\\n")
-        .filter(l=>l!=="").map(l=>l.split("\\t"));
-      if(!block.length) return;
-      if(rc && area(rc)>1){
-        for(let rr=rc.r1;rr<=rc.r2;rr++) for(let cc=rc.c1;cc<=rc.c2;cc++){
-          const raw = block[(rr-rc.r1)%block.length][(cc-rc.c1)%block[0].length];
-          const t = cellAt(rr,cc);
-          if(t && raw!==undefined) t.value = cellVal(cc, raw); }
-        { const ris=[]; for(let rr=rc.r1;rr<=rc.r2;rr++) ris.push(rr); syncRows(ris); }
-        setStatus(`Pasted into ${area(rc)} cells.`);
-      } else {
-        const [z1,z2] = zoneBounds(zoneOf(c));
-        let lastR=r, lastC=c;
-        block.forEach((line,dr)=>line.forEach((raw,dc)=>{
-          const cc = c+dc;
-          if(cc>z2) return;                    // stay within the zone
-          const t = cellAt(r+dr, cc);
-          if(t){ t.value = cellVal(cc, raw); lastR=r+dr; lastC=cc; } }));
-        S.a={r,c}; S.f={r:lastR,c:lastC}; paint();
-        { const ris=[]; for(let rr=r;rr<=lastR;rr++) ris.push(rr); syncRows(ris); }
-        setStatus(`Pasted ${block.length} row(s).`);
-      }
-    });
-  });
-
-  document.querySelectorAll("#tbl td.cpy[data-rf], #tbl td.cpy[data-fx]").forEach(td=>{
-    td.addEventListener("click", ()=>{
-      const isStk = td.dataset.rf !== undefined;
-      const metric = isStk ? td.dataset.rf : td.dataset.fx;
-      const e = (isStk ? "stk_" : "fx_") + metric;
-      const field = isStk ? "ovdSpot" : "ovdUndFx";
-      const tr = td.closest("tr");
-      const ri = [...document.querySelectorAll("#tbl tr[data-id]")].indexOf(tr);
-      fillFromEikon(e, ri, FIELDS.indexOf(field)+2, field);
-    });
-  });
-
-  document.querySelectorAll("#tbl td.rowclick, #tbl td.inp, #tbl td.rsel").forEach(td=>{
-    td.addEventListener("click", (e)=>{
-      const tr = td.closest("tr");
-      const ri = [...document.querySelectorAll("#tbl tr[data-id]")].indexOf(tr);
-      selectRowClick(ri, e);
-    });
-  });
-
-  document.querySelectorAll("#tbl .rowcb").forEach(cb=>{
-    const ri = +cb.dataset.ri;
-    cb.addEventListener("change", ()=>toggleRow(ri));
-    cb.addEventListener("keydown", (e)=>{
-      if(e.key==="Enter"){ e.preventDefault(); toggleRow(ri); }
-      else if(e.key==="ArrowDown"||e.key==="ArrowUp"){
-        e.preventDefault();
-        const nr = ri + (e.key==="ArrowDown"?1:-1);
-        if(e.shiftKey && nr>=0 && nr<nRows()){ rowSel.add(ri); rowSel.add(nr); paintRows(); }
-        const ncb = cbAt(nr); if(ncb) ncb.focus();
-      }
-      else if(e.key==="ArrowRight"){ e.preventDefault(); setActive(ri, 0); }
-    });
-  });
-
-  const all = document.getElementById("cbAll");
-  if(all) all.onchange = ()=>{
-    rowSel.clear();
-    if(all.checked) for(let i=0;i<nRows();i++) rowSel.add(i);
-    paintRows(); updateNamebox();
-  };
-
-  const rfband = document.getElementById("rfband");
-  if(rfband) rfband.onclick = ()=>NS.send({type:"rfxNow"});
-  const fxband = document.getElementById("fxband");
-  if(fxband) fxband.onclick = ()=>NS.send({type:"rfxNow"});
-
-  bandApplyAll();
-  paintAutoLast();
-  const vn=document.getElementById("volN");
-  if(vn) vn.value = localStorage.getItem("nukestation.volN") || "60";
-}
-
-function forSel(fn){
-  const rc = rect(); if(!rc) return;
-  for(let r=rc.r1;r<=rc.r2;r++) for(let c=rc.c1;c<=rc.c2;c++){
-    const el = cellAt(r,c); if(el) fn(el, r, c); }
-}
-
-function copySelection(cut=false){
-  const rc = rect(); if(!rc) return;
-  const lines = [];
-  for(let r=rc.r1;r<=rc.r2;r++){
-    const vals = [];
-    for(let c=rc.c1;c<=rc.c2;c++) vals.push(cellAt(r,c)?.value ?? "");
-    lines.push(vals.join("\\t"));
-  }
-  navigator.clipboard.writeText(lines.join("\\n")).then(()=>{
-    if(cut) forSel(el=>el.value="");
-    setStatus(`${cut?"Cut":"Copied"} ${area(rc)} cell(s).`);
-  }).catch(err=>setStatus(`<span class="err">Copy failed: ${err}</span>`));
-}
-
-/* ---------------- drag-fill handle ---------------- */
-function updateFillRect(r, c){
-  const rc = rect(); if(!rc) return;
-  const [, z2] = zoneBounds(zoneOf(rc.c1));
-  const cc = Math.min(c, z2);
-  const dv = r - rc.r2, dh = cc - rc.c2;
-  if(dv >= dh && r > rc.r2)       S.fillRect = {r1:rc.r1, r2:r, c1:rc.c1, c2:rc.c2};
-  else if(cc > rc.c2)             S.fillRect = {r1:rc.r1, r2:rc.r2, c1:rc.c1, c2:cc};
-  else                            S.fillRect = null;
-}
-
-function applyFill(){
-  const rc = rect(), fr = S.fillRect;
-  if(!rc || !fr) return;
-  const srcRows = rc.r2-rc.r1+1, srcCols = rc.c2-rc.c1+1;
-  const src = [];
-  for(let r=rc.r1;r<=rc.r2;r++){
-    const row = [];
-    for(let c=rc.c1;c<=rc.c2;c++) row.push(cellAt(r,c)?.value ?? "");
-    src.push(row);
-  }
-  const vertical = fr.r2 > rc.r2;
-  if(vertical){
-    for(let c=0;c<srcCols;c++){
-      const col = rc.c1 + c;
-      const nums = src.map(row=>parseFloat(row[c]));
-      const numeric = isNum(col) && nums.every(v=>!isNaN(v)) &&
-                      src.every(row=>row[c]!=="");
-      let step = null;
-      if(numeric && srcRows>=2){
-        step = nums[1]-nums[0];
-        for(let i=2;i<srcRows;i++) if(Math.abs(nums[i]-nums[i-1]-step)>1e-9){ step=null; break; }
-      }
-      for(let r=rc.r2+1;r<=fr.r2;r++){
-        const k = r-rc.r1;
-        const t = cellAt(r, col); if(!t) continue;
-        if(step!==null) t.value = fmt(nums[0]+step*k, 6) || String(nums[0]+step*k);
-        else t.value = src[k%srcRows][c];
-      }
-    }
-  } else {
-    for(let r=0;r<srcRows;r++){
-      const nums = src[r].map(parseFloat);
-      const numeric = isNum(rc.c1) && nums.every(v=>!isNaN(v)) &&
-                      src[r].every(v=>v!=="");
-      let step = null;
-      if(numeric && srcCols>=2){
-        step = nums[1]-nums[0];
-        for(let i=2;i<srcCols;i++) if(Math.abs(nums[i]-nums[i-1]-step)>1e-9){ step=null; break; }
-      }
-      for(let c=rc.c2+1;c<=fr.c2;c++){
-        const k = c-rc.c1;
-        const t = cellAt(rc.r1+r, c); if(!t) continue;
-        if(step!==null) t.value = fmt(nums[0]+step*k, 6) || String(nums[0]+step*k);
-        else t.value = src[r][k%srcCols];
-      }
-    }
-  }
-  S.f = {r:fr.r2, c:fr.c2};
-  { const ris=[]; for(let rr=Math.min(rc.r1,fr.r1);rr<=Math.max(rc.r2,fr.r2);rr++)
-      ris.push(rr); syncRows(ris);
-    ris.forEach(ri=>{ const tr=trAt(ri); if(tr) autoNukeQueue(Number(tr.dataset.id)); }); }
-  setStatus("Filled.");
-}
-
-document.getElementById("fh").addEventListener("mousedown", (e)=>{
-  e.preventDefault(); e.stopPropagation();
-  S.filling = true; S.fillRect = null;
-});
-document.addEventListener("mouseup", ()=>{
-  if(S.filling){ applyFill(); S.filling=false; S.fillRect=null; paint(); }
-  S.dragging = false;
-});
-document.getElementById("wrap").addEventListener("scroll", positionHandle);
-window.addEventListener("resize", positionHandle);
-
-/* ---------------- table build / data ---------------- */
-function parseIds(){
-  return [...new Set(document.getElementById("ids").value
-    .split(/[^0-9]+/).filter(x=>x.length).map(Number))];
-}
-function sendIds(){
-  const uniq = parseIds();
-  if(NS.up()){ NS.send({type:"ids", ids: uniq});
-    setStatus(`Loading ${uniq.length} securities for everyone&hellip;`); }
-  else { buildTable(uniq);
-    setStatus('<span class="warn">Offline &mdash; loaded locally only.</span>'); }
-}
-function buildTable(idsOpt){
-  const uniq = idsOpt || parseIds();
-  const t = document.getElementById("tbl");
-  let h = `<tr class="band"><td class="stick0"></td><td class="stick1"></td>` +
-    `<td class="stick2"></td><td class="uin stick3" colspan="2">yours</td><td colspan="3"></td>` +
-    `<td></td><td class="uin"></td><td colspan="2"></td>` +
-    `<td colspan="9" class="gm grp bandhd" id="band-model" onclick="bandToggle('model')">model (last nuke) &#9662;</td>` +
-    `<td colspan="12" class="bw grp bandhd" id="band-brw" onclick="bandToggle('brw')">borrow &#9662;</td>` +
-    `<td colspan="13" class="go grp bandhd" id="band-res" onclick="bandToggle('res')">override result &#9662;</td>` +
-    `<td colspan="7" class="fb grp bandhd" id="band-flags" onclick="bandToggle('flags')">flags &#9662;</td>` +
-    `<td colspan="6" class="vb grp bandhd" id="band-vol" onclick="bandToggle('vol')">vol &#9662;</td>` +
-    `<td colspan="3" class="in grp bandhd" id="band-inp" onclick="bandToggle('inp')">override inputs &#9662;</td>` +
-    `<td colspan="5" class="gl grp bandhd" id="band-live" onclick="bandToggle('live')">live &#9662;</td>` +
-    `<td colspan="5" class="ge grp bandhd" id="band-eod" onclick="bandToggle('eod')">eod &#9662;</td>` +
-    `<td colspan="6" class="grp bandhd" id="band-theo" onclick="bandToggle('theo')">theo &middot; &gamma;-adj &#9662;</td>` +
-    `<td colspan="5" class="grp rfx bandhd" id="band-stk" onclick="bandToggle('stk')">stock <span id="rfxts" onclick="event.stopPropagation(); rfxNow&&rfxNow()">&mdash;</span> &#9662;</td>` +
-    `<td colspan="5" class="grp fxx bandhd" id="band-fx" onclick="bandToggle('fx')">fx &#9662;</td></tr>`;
-  h += `<tr><th class="stick0"><input type="checkbox" id="cbAll" title="Select all"></th>` +
-    COL_DEFS.map(([k,label,cls])=>
-      `<th class="${cls}${BAND_FIRST.has(k)?" bfirst":""}" data-key="${k}" data-band="${bandOf(k)}">` +
-      `<span class="rz" data-key="${k}"></span>${label}</th>`
-    ).join("") + "</tr>";
-  uniq.forEach((id, ri)=>{
-    h += `<tr data-id="${id}">` +
-      `<td class="stick0"><input type="checkbox" class="rowcb" data-ri="${ri}"></td>` +
-      `<td class="stick1 rowclick">${id}</td>` +
-      `<td class="ref co stick2 rowclick" data-r="company_name"></td>` +
-      `<td class="gc uinp stick3"><input class="gridcell" data-u="short_name"
-         data-row="${ri}" data-col="0" autocomplete="off"
-         placeholder="&#8212;"></td>` +
-      `<td class="gc uinp"><input class="sprd" data-u="bond_type"
-         data-id="${id}" onchange="sprdChanged(this)" autocomplete="off"
-         placeholder="&#8212;" style="width:64px"></td>` +
-      `<td class="ref rowclick" data-r="ric"></td>` +
-      `<td class="ref rowclick" data-r="expiry_date"></td>` +
-      `<td class="ref rowclick" data-r="isin"></td>` +
-      `<td class="ref rowclick" data-r="sec_fx"></td>` +
-      `<td class="gc uinp"><input class="gridcell" data-u="und_fx"
-         data-row="${ri}" data-col="1" autocomplete="off"
-         placeholder="&#8212;"></td>` +
-      `<td class="ref rowclick" data-r="quantity_live"></td>` +
-      `<td class="ref rowclick" data-r="usd_qty_live"></td>` +
-      RES_COLS.slice(0,1).map((c,i)=>
-        `<td data-c="${c}" data-band="model" class="rowclick gM${i===0?" grp bfirst":""}"></td>`).join("") +
-      `<td class="gc uinp" data-band="model"><input class="gridcell" data-u="n_gamma"
-         data-row="${ri}" data-col="2" inputmode="decimal" autocomplete="off"
-         placeholder="&#8212;" title="\u0394-points per 1% und move (manual)"></td>` +
-      RES_COLS.slice(2,5).map(c=>
-        `<td data-c="${c}" data-band="model" class="rowclick gM"></td>`).join("") +
-      `<td data-c="nDeltaPct" data-band="model" class="rowclick gM"></td>` +
-      `<td data-r="lp_delta" data-band="model" class="rowclick gM"
-         title="model delta (cbanalytics.lp_model_output) x 100"></td>` +
-      `<td data-c="parityPct" data-band="model" class="rowclick gM"
-         title="(ovdSpot x fxSpot) / (conversion_price x conversion_fixed_fx), lp_model_output"></td>` +
-      `<td data-r="credit_spread_used" data-band="model" class="rowclick gM"
-         title="credit_spread_used x 10000, bps (cbanalytics.lp_model_output)"></td>` +
-      `<td class="gc uinp grp bfirst" data-band="brw"><input class="gridcell bwv" data-u="bw_dvb" data-id="${id}" onchange="bwChg(this)" autocomplete="off" placeholder="&#8212;" title="\u2202V/B \u00b7 value per +100bp borrow bump (engine bump-and-reprice) \u00b7 Bloomberg-only, build first"></td>` +
-      `<td class="gc uinp" data-band="brw"><input class="gridcell bwv" data-u="bw_dvs" data-id="${id}" onchange="bwChg(this)" autocomplete="off" placeholder="&#8212;" title="\u2202V/S \u00b7 value per +100bp credit-spread bump (same engine route)"></td>` +
-      `<td class="gc uinp" data-band="brw"><input class="gridcell bwv" data-u="bw_brw" data-id="${id}" onchange="bwChg(this)" autocomplete="off" placeholder="&#8212;" title="BRW \u00b7 borrow rate % \u00b7 SRC O=option-implied F=SSF-futures-implied (better where both) P=SecFin quoted W=web M=manual"></td>` +
-      `<td class="gc uinp" data-band="brw"><input class="gridcell bwv" data-u="bw_lo" data-id="${id}" onchange="bwChg(this)" autocomplete="off" placeholder="&#8212;" title="B.LO \u00b7 low of the implied-borrow band (route bid/ask)"></td>` +
-      `<td class="gc uinp" data-band="brw"><input class="gridcell bwv" data-u="bw_hi" data-id="${id}" onchange="bwChg(this)" autocomplete="off" placeholder="&#8212;" title="B.HI \u00b7 high of the implied-borrow band"></td>` +
-      `<td class="gc uinp" data-band="brw"><input class="gridcell bwv" data-u="bw_gap" data-id="${id}" onchange="bwChg(this)" autocomplete="off" placeholder="&#8212;" title="GAP = implied \u2212 SecFin quoted \u00b7 blank without Securities Finance \u00b7 the MPP lie-detector: the only column that says whether the rest of the block is lying"></td>` +
-      `<td class="gc uinp" data-band="brw"><input class="gridcell bwv" data-u="bw_util" data-id="${id}" onchange="bwChg(this)" autocomplete="off" placeholder="&#8212;" title="UTIL % \u00b7 TW exact (SBL balance/quota) \u00b7 KR balance/est. float (SEIBRO/KOFIA)"></td>` +
-      `<td class="gc uinp" data-band="brw"><input class="gridcell bwv" data-u="bw_d5" data-id="${id}" onchange="bwChg(this)" autocomplete="off" placeholder="&#8212;" title="\u03945D \u00b7 5-day change in balance/util (TW/KR scrape)"></td>` +
-      `<td class="gc uinp" data-band="brw"><input class="gridcell bwv" data-u="bw_htb" data-id="${id}" onchange="bwChg(this)" autocomplete="off" placeholder="&#8212;" title="HTB \u00b7 JP JSF \u54c1\u8cb8\u6599\u7387 annualised (\u00f7\u54c1\u8cb8\u65e5\u6570) \u00b7 auction ALARM, not the institutional level \u2014 prime finance for the level \u00b7 KR rate: no public print exists, prime only"></td>` +
-      `<td class="gc uinp" data-band="brw"><input class="gridcell bwv" data-u="bw_evt" data-id="${id}" onchange="bwChg(this)" autocomplete="off" placeholder="&#8212;" title="EVT \u00b7 days to next div/AGM record date or index review (CACS date-diff)"></td>` +
-      `<td class="gc uinp" data-band="brw"><input class="gridcell bwv" data-u="bw_src" data-id="${id}" onchange="bwChg(this)" autocomplete="off" placeholder="&#8212;" title="SRC \u00b7 O option / F futures / P SecFin / W web / M manual"></td>` +
-      `<td class="gc uinp" data-band="brw"><input class="gridcell bwv" data-u="bw_tnr" data-id="${id}" onchange="bwChg(this)" autocomplete="off" placeholder="&#8212;" title="TNR \u00b7 tenor of the borrow quote"></td>` +
-      `<td class="gc inp gO grp rsel bfirst" data-band="res"><input class="sprd"
-         data-u="x_bid" data-id="${id}" onchange="sprdChanged(this)"
-         autocomplete="off" placeholder="&#8212;"></td>` +
-      `<td class="gc inp gO rsel" data-band="res"><input class="sprd" data-u="or_bid_sprd"
-         data-id="${id}" onchange="sprdChanged(this)"
-         autocomplete="off" placeholder="&#8212;"></td>` +
-      `<td data-c="ovdMktBid" data-band="res" class="rowclick gO"></td>` +
-      `<td data-c="ovdMktAsk" data-band="res" class="rowclick gO"></td>` +
-      `<td class="gc inp gO rsel" data-band="res"><input class="sprd" data-u="or_ask_sprd"
-         data-id="${id}" onchange="sprdChanged(this)"
-         autocomplete="off" placeholder="&#8212;"></td>` +
-      `<td class="gc inp gO rsel" data-band="res"><input class="sprd"
-         data-u="x_ask" data-id="${id}" onchange="sprdChanged(this)"
-         autocomplete="off" placeholder="&#8212;"></td>` +
-      `<td class="gc inp gO rsel" data-band="res"><input class="sprd"
-         data-u="x_both" data-id="${id}" onchange="sprdChanged(this)"
-         autocomplete="off" placeholder="&#8212;"
-         title="X: shifts QuoteBid and QuoteAsk together"></td>` +
-      `<td data-q="quote_bid" data-band="res" class="rowclick qcell"
-         title="override bid + XBid"></td>` +
-      `<td data-q="quote_ask" data-band="res" class="rowclick qcell"
-         title="override ask + XAsk"></td>` +
-      `<td data-fl="stk_move" data-band="res" class="rowclick"
-         title="stock last / close - 1"></td>` +
-      `<td data-fl="fx_move" data-band="res" class="rowclick"
-         title="fx last / close - 1, in bps"></td>` +
-      `<td data-c="dVsLive" data-band="res" class="rowclick gO"></td>` +
-      `<td data-q="mid_drift" data-band="res" class="rowclick"
-         title="(QuoteBid+QuoteAsk)/2 vs 8am snapshot mid"></td>` +
-      ["f_call","f_exp","f_put","f_div","f_move","f_nuke"].map((f,i)=>
-        `<td data-fl="${f}" data-band="flags" class="rowclick${i===0?" grp bfirst":""}"></td>`).join("") +
-      `<td data-band="flags" class="gc"><select class="volsel"
-         data-u="vol_flag" data-id="${id}" onchange="volChanged(this)">
-         <option value=""></option><option>Cheap</option>
-         <option>Rich</option></select></td>` +
-      ["iv","10","30","90","n","vega"].map((n,i)=>
-        `<td data-v="${n}" data-band="vol" class="rowclick${i===0?" grp bfirst":""}"
-           title="realised vol, annualised (\u221a252), from daily closes"></td>`).join("") +
-      FIELDS.map((f,ci)=>
-        `<td class="gc inp${ci===0?" grp bfirst":""}" data-band="inp">` +
-        `<input class="gridcell" data-f="${f}" data-row="${ri}" data-col="${ci+3}"
-          inputmode="decimal" autocomplete="off" placeholder="&#8212;"></td>`).join("") +
-      RES_COLS.slice(5,10).map((c,i)=>
-        `<td data-c="${c}" data-band="live" class="rowclick gL${i===0?" grp bfirst":""}"></td>`).join("") +
-      RES_COLS.slice(10,15).map((c,i)=>
-        `<td data-c="${c}" data-band="eod" class="rowclick gE${i===0?" grp bfirst":""}"></td>`).join("") +
-      ["m","rolld","dpnl","gpnl","theo","vslive"].map((c,i)=>
-        `<td data-t="${c}" data-band="theo" class="rowclick tcell${i===0?" grp bfirst":""}"></td>`).join("") +
-      RF_COLS.map((c,i)=>{
-        const cp = (c==="last"||c==="close");
-        const cls = `rf${i===0?" grp bfirst":""}${cp?" cpy":" rowclick"}`;
-        const t = cp ? ' title="Click to copy into ovdSpot"' : "";
-        return `<td data-rf="${c}" data-band="stk" class="${cls}"${t}></td>`;
-      }).join("") +
-      FX_COLS.map((c,i)=>{
-        const cp = (c==="last"||c==="close");
-        const cls = `fx${i===0?" grp bfirst":""}${cp?" cpy":" rowclick"}`;
-        const t = cp ? ' title="Click to copy into ovdUndFx"' : "";
-        return `<td data-fx="${c}" data-band="fx" class="${cls}"${t}></td>`;
-      }).join("") +
-      "</tr>";
-  });
-  t.innerHTML = h;
-  S.a = S.f = null; S.fillRect = null;
-  rowSel.clear(); rowAnchor = null;
-  wireGrid(); wireResizers(); applyLayout(); bandApplyAll(); paint(); paintRows();
-  setStatus(`${uniq.length} securities loaded.`);
-  document.getElementById("dl").disabled = true;
-  lastResponse = null;
-  loadRefData(uniq).then(()=>{ applyState(); applyNuke(); applyRfx(); });
-}
-
-const BAND_FIRST = new Set(["n_bid","bw_dvb","x_bid","ovdSpot","f_call","v_iv",
-  "live_bid","eod_bid","t_m","stk_last","fx_last"]);
-const BANDS = {
-  model:{label:"model (last nuke)",span:9},
-  brw:{label:"borrow",span:12},
-  res:{label:"override result",span:13},
-  flags:{label:"flags",span:7},
-  vol:{label:"vol",span:6,vr:true},
-  inp:{label:"override inputs",span:3},
-  live:{label:"live",span:5}, eod:{label:"eod",span:5},
-  theo:{label:"theo \u00b7 \u03b3-adj",span:6},
-  stk:{label:"stock",span:5,ts:true}, fx:{label:"fx",span:5,rf:true}};
-function bandOf(k){
-  if(k.startsWith("bw_")) return "brw";
-  if(k==="parityPct"||k==="cs_used"||k==="m_delta"||k.startsWith("n_")) return "model";
-  if(k==="stk_move"||k==="fx_move"||k==="x_bid"||k==="x_ask"||
-     k==="quote_bid"||k==="quote_ask"||k==="mid_drift"||
-     k==="x_both") return "res";
-  if(k.startsWith("f_")) return "flags";
-  if(k.startsWith("v_")) return "vol";
-  if(k.startsWith("or_")||k==="ovd_bid"||k==="ovd_ask"||k==="d_vs") return "res";
-  if(k==="ovdSpot"||k==="ovdCbFx"||k==="ovdUndFx") return "inp";
-  if(k.startsWith("live_")) return "live";
-  if(k.startsWith("eod_")) return "eod";
-  if(k.startsWith("t_")) return "theo";
-  if(k.startsWith("stk_")) return "stk";
-  if(k.startsWith("fx_")) return "fx";
-  return "";
-}
-function rfxNow(){ if(NS.up&&NS.up()) NS.send({type:"rfxNow"}); }
-function bandHidden(){
-  try{ return JSON.parse(localStorage.getItem("nukestation.bands"))||{}; }
-  catch(e){ return {}; }
-}
-function bandPaint(k, hid){
-  const tbl=document.getElementById("tbl");
-  const td=document.getElementById("band-"+k);
-  if(!tbl||!td) return;
-  tbl.classList.toggle("hb-"+k, hid);
-  td.colSpan = hid ? 1 : BANDS[k].span;
-  const old = document.getElementById("rfxts");
-  const ts = BANDS[k].ts
-    ? ' <span id="rfxts" onclick="event.stopPropagation(); rfxNow&&rfxNow()">' +
-      (old ? old.innerHTML : "&mdash;") + "</span>"
-    : "";
-  const rf = BANDS[k].rf
-    ? ' <span class="fxnow" title="refresh now" ' +
-      'onclick="event.stopPropagation(); rfxNow()">&#8635;</span>'
-    : "";
-  const vr = BANDS[k].vr
-    ? ' <span class="fxnow" title="fetch daily-close history now ' +
-      '(isolated child process)" ' +
-      'onclick="event.stopPropagation(); volNow()">&#8635;</span>'
-    : "";
-  if(hid){
-    td.innerHTML = "&#9656;";
-    td.title = BANDS[k].label + " (collapsed - click to expand)";
-  } else {
-    td.innerHTML = BANDS[k].label + ts + rf + vr + " &#9662;";
-    td.title = "Click to collapse";
-  }
-}
-function bandToggle(k){
-  const hids=bandHidden();
-  hids[k]=!hids[k];
-  localStorage.setItem("nukestation.bands", JSON.stringify(hids));
-  bandPaint(k, !!hids[k]);
-  cfgSend("bands", JSON.stringify(hids));
-}
-function bandApplyAll(){
-  const hids=bandHidden();
-  if(localStorage.getItem("nukestation.eodhide")==="1" && !("eod" in hids)){
-    hids.eod=true;
-    localStorage.setItem("nukestation.bands", JSON.stringify(hids));
-    localStorage.removeItem("nukestation.eodhide");
-  }
-  for(const k of Object.keys(BANDS)) bandPaint(k, !!hids[k]);
-}
-
-/* auto-renuke: any override-input change re-prices those rows through
-   the normal server nuke (debounced) - override result stays automatic */
-let _anTimer=null; const _anPend=new Set();
-let _uiTimer=null;
-function uiRecalcSoon(){         // coalesce per-keystroke board recomputes
-  if(_uiTimer) return;
-  _uiTimer=setTimeout(()=>{ _uiTimer=null;
-    updParityAll(); updMovesFlags(); }, 120);
-}
-function nukeDone(){             // called when any nuke reply lands
-  NS._nukeInFlight=false;
-  if(NS._nukeSafety){ clearTimeout(NS._nukeSafety); NS._nukeSafety=null; }
-}
-function autoNukeQueue(sid){
-  if(sid) _anPend.add(Number(sid));
-  uiRecalcSoon();
-  if(_anTimer) clearTimeout(_anTimer);
-  _anTimer=setTimeout(function fire(){
-    _anTimer=null;
-    if(!_anPend.size || !NS.up()){ return; }
-    if(NS._nukeInFlight){       // exactly one auto-nuke outstanding:
-      _anTimer=setTimeout(fire, 400);   // wait, keep coalescing
-      return;
-    }
-    const secIds=[..._anPend]; _anPend.clear();
-    NS._nukeInFlight=true;
-    NS._nukeSafety=setTimeout(nukeDone, 8000);   // never wedge
-    NS.send({type:"nuke", secIds});
-    setStatus(`Auto-renuking ${secIds.length} row(s) on override change&hellip;`);
-  }, 800);
-}
-document.getElementById("tbl").addEventListener("change",(e)=>{
-  if(e.target && e.target.dataset && e.target.dataset.f){
-    const tr=e.target.closest("tr");
-    if(tr) autoNukeQueue(Number(tr.dataset.id));
-  }
-});
-document.getElementById("tbl").addEventListener("input",(e)=>{
-  if(e.target && e.target.dataset && e.target.dataset.f){
-    const tr=e.target.closest("tr");   // typing pause renukes, no blur needed
-    if(tr) autoNukeQueue(Number(tr.dataset.id));
-  }
-});
-
-const FLAG_TH = { yearsRed:1.0, yearsAmb:2.0, divRed:14, divAmb:30,
-                  stkPct:3.0, fxBps:30, staleSpotPct:0.5, staleFxPct:0.25 };
-function applyFlagTh(th){
-  if(!th) return;
-  if(th.moveStk !== undefined) FLAG_TH.stkPct = th.moveStk;
-  if(th.moveFx !== undefined) FLAG_TH.fxBps = th.moveFx;
-  if(th.staleSpot !== undefined) FLAG_TH.staleSpotPct = th.staleSpot;
-  if(th.staleFx !== undefined) FLAG_TH.staleFxPct = th.staleFx;
-  ["cfgThMS","cfgThMF","cfgThSS","cfgThSF"].forEach((id,i)=>{
-    const el = document.getElementById(id);
-    if(el) el.value = [FLAG_TH.stkPct, FLAG_TH.fxBps,
-                       FLAG_TH.staleSpotPct, FLAG_TH.staleFxPct][i];
-  });
-  if(typeof updMovesFlags === "function") updMovesFlags();
-}
-function _numTxt(td){
-  if(!td) return NaN;
-  return parseFloat(String(td.textContent).split(",").join("").trim());
-}
-function _yearsChip(td, v, missingTitle){
-  if(!isFinite(v)){ td.textContent="";
-    td.classList.remove("fl-red","fl-amb","fl-dim");
-    td.title=missingTitle; return; }
-  td.textContent = v.toFixed(1)+"y";
-  td.classList.remove("fl-red","fl-amb","fl-dim");
-  td.classList.add(v < FLAG_TH.yearsRed ? "fl-red"
-                 : v < FLAG_TH.yearsAmb ? "fl-amb" : "fl-dim");
-  td.title = "";
-}
-function updMovesFlags(scope){
-  const today = new Date();
-  document.querySelectorAll("#tbl tr[data-id]").forEach(tr=>{
-    const sid = Number(tr.dataset.id);
-    if(scope && !scope.has(sid)) return;
-    const ref = refCache[sid] || {};
-    const g = f => tr.querySelector(`td[data-fl="${f}"]`);
-    // moves: last vs close from the stock / fx bands
-    const sl=_numTxt(tr.querySelector('td[data-rf="last"]'));
-    const sc=_numTxt(tr.querySelector('td[data-rf="close"]'));
-    const fl=_numTxt(tr.querySelector('td[data-fx="last"]'));
-    const fc=_numTxt(tr.querySelector('td[data-fx="close"]'));
-    const sm = (isFinite(sl)&&isFinite(sc)&&sc!==0)?(sl/sc-1)*100:NaN;
-    const fm = (isFinite(fl)&&isFinite(fc)&&fc!==0)?(fl/fc-1)*10000:NaN;
-    const smTd=g("stk_move"), fmTd=g("fx_move");
-    if(smTd){ smTd.textContent=isFinite(sm)?sm.toFixed(2):"";
-      smTd.classList.remove("bgpos","bgneg");
-      if(isFinite(sm)&&sm!==0) smTd.classList.add(sm>0?"bgpos":"bgneg"); }
-    if(fmTd){ fmTd.textContent=isFinite(fm)?fm.toFixed(0):"";
-      fmTd.classList.remove("pos","neg");
-      if(isFinite(fm)&&fm!==0) fmTd.classList.add(fm>0?"pos":"neg"); }
-    // flags
-    _yearsChip(g("f_call"), parseFloat(ref.years_to_call),
-      "no years_to_call in lp_model_output");
-    let ye = NaN;
-    if(ref.expiry_date){
-      const d = new Date(ref.expiry_date);
-      if(!isNaN(d)) ye = (d - today) / (365.25*24*3600*1000);
-    }
-    _yearsChip(g("f_exp"), ye, "no expiry_date");
-    _yearsChip(g("f_put"), parseFloat(ref.years_to_put),
-      "no years_to_put in lp_model_output");
-    const dv = g("f_div");
-    if(dv){
-      dv.classList.remove("fl-red","fl-amb","fl-dim");
-      if(ref.next_div_date){
-        const dd = new Date(ref.next_div_date);
-        const days = (dd - today)/(24*3600*1000);
-        if(isFinite(days) && days >= 0){
-          dv.textContent = ref.next_div_date.slice(5);
-          dv.classList.add(days <= FLAG_TH.divRed ? "fl-red"
-                         : days <= FLAG_TH.divAmb ? "fl-amb" : "fl-dim");
-          dv.title = "next ex-div " + ref.next_div_date;
-        } else { dv.textContent=""; dv.title=""; }
-      } else { dv.textContent=""; dv.title="no dividend data"; }
-    }
-    const mv = g("f_move");
-    if(mv){
-      const parts=[];
-      if(isFinite(sm)&&Math.abs(sm)>=FLAG_TH.stkPct)
-        parts.push("S"+sm.toFixed(1)+"%");
-      if(isFinite(fm)&&Math.abs(fm)>=FLAG_TH.fxBps)
-        parts.push("F"+fm.toFixed(0));
-      mv.classList.remove("fl-red","fl-amb","fl-dim");
-      mv.textContent = parts.join(" ");
-      if(parts.length) mv.classList.add("fl-red");
-      mv.title = parts.length
-        ? `move vs close beyond ${FLAG_TH.stkPct}% / ${FLAG_TH.fxBps}bp`
-        : "";
-    }
-    const ovb=_numTxt(tr.querySelector('td[data-c="ovdMktBid"]'));
-    const ova=_numTxt(tr.querySelector('td[data-c="ovdMktAsk"]'));
-    const xin=f=>{ const i=tr.querySelector(`input[data-u="${f}"]`);
-      const n=parseFloat(i?i.value:""); return isFinite(n)?n:0; };
-    const x2 = xin("x_both");
-    const qb = isFinite(ovb) ? ovb + xin("x_bid") + x2 : NaN;
-    const qa = isFinite(ova) ? ova + xin("x_ask") + x2 : NaN;
-    const qbTd=tr.querySelector('td[data-q="quote_bid"]');
-    const qaTd=tr.querySelector('td[data-q="quote_ask"]');
-    if(qbTd) qbTd.textContent = isFinite(qb)?qb.toFixed(2):"";
-    if(qaTd) qaTd.textContent = isFinite(qa)?qa.toFixed(2):"";
-    const drTd=tr.querySelector('td[data-q="mid_drift"]');
-    if(drTd){
-      const smid=parseFloat(ref.snap8_mid);
-      drTd.classList.remove("pos","neg","bgpos","bgneg");
-      if(isFinite(qb)&&isFinite(qa)&&isFinite(smid)){
-        const st = (CFG.roundStep>0?CFG.roundStep:0.05);
-        const dd = Math.round(((qb+qa)/2 - smid)/st)*st;
-        drTd.textContent = (dd>0?"+":"")+dd.toFixed(2);
-        if(dd!==0) drTd.classList.add(dd>0?"bgpos":"bgneg");
-        drTd.title = "mid " + ((qb+qa)/2).toFixed(2) + " vs 8am " +
-                     smid.toFixed(2);
-      } else { drTd.textContent="";
-        drTd.title = isFinite(smid)?"":"no 8am snapshot yet today"; }
-    }
-    const px = ref.px_hist;
-    const vsig = (px?px.length:0) + ":" +
-      (px&&px.length?px[px.length-1]:"") + ":" + (volN()||"") + ":" +
-      (ref.implied_vol ?? "") + ":" + (ref.vega ?? "");
-    if(tr.dataset.vsig !== vsig){
-      tr.dataset.vsig = vsig;
-      const ivTd = tr.querySelector('td[data-v="iv"]');
-      if(ivTd){
-        const iv = parseFloat(ref.implied_vol);
-        ivTd.textContent = isFinite(iv) ? (iv*100).toFixed(1)+"%" : "";
-        ivTd.title = "implied_vol (cbanalytics.lp_model_output)";
-      }
-      const vgTd = tr.querySelector('td[data-v="vega"]');
-      if(vgTd){
-        const vg = parseFloat(ref.vega);
-        vgTd.textContent = isFinite(vg) ? vg.toFixed(2) : "";
-        vgTd.title = "vega (cbanalytics.lp_model_output)";
-      }
-      for(const [n, key] of [[10,"10"],[30,"30"],[90,"90"],[volN(),"n"]]){
-        const td = tr.querySelector(`td[data-v="${key}"]`);
-        if(!td) continue;
-        const v = n ? realVol(px, n) : null;
-        td.textContent = v==null ? "" : v.toFixed(1)+"%";
-      }
-    }
-    const nk = g("f_nuke");
-    if(nk){
-      const nSpot=_numTxt(tr.querySelector('td[data-c="nSpot"]'));
-      const nFx=_numTxt(tr.querySelector('td[data-c="nSpotFx"]'));
-      nk.classList.remove("fl-red","fl-amb","fl-dim");
-      if(!isFinite(nSpot)){
-        nk.textContent="\u2014"; nk.classList.add("fl-dim");
-        nk.title="not nuked yet";
-      } else {
-        const ds = isFinite(sl)&&nSpot!==0 ? Math.abs(sl/nSpot-1)*100 : 0;
-        const df = isFinite(fl)&&isFinite(nFx)&&nFx!==0
-          ? Math.abs(fl/nFx-1)*100 : 0;
-        if(ds > FLAG_TH.staleSpotPct || df > FLAG_TH.staleFxPct){
-          nk.textContent="RENUKE"; nk.classList.add("fl-red");
-          nk.title=`spot ${ds.toFixed(2)}% / fx ${df.toFixed(2)}% since nuke`;
-        } else { nk.textContent="ok"; nk.classList.add("fl-dim"); nk.title=""; }
-      }
-    }
-  });
-}
-
-let AUTO_LAST = localStorage.getItem("nukestation.autolast")==="1";
-function paintAutoLast(){
-  const b=document.getElementById("autoLastBtn");
-  if(!b) return;
-  b.textContent = "AUTO last: " + (AUTO_LAST?"ON":"OFF");
-  b.style.background = AUTO_LAST ? "#0b6e66" : "";
-  b.style.color = AUTO_LAST ? "#fff" : "";
-}
-function cfgSend(key,val){
-  try{ WS.send({type:"cfg", user:CFG.user, key, val}); }catch(e){}
-}
-function cfgApply(key,val,boot){
-  if(key==="bands"){
+    const r=await fetch('/api/auth/me');
+    if(r.status===401){ location.href='/login'; return; }
+    const j=await r.json();
+    if(!j.ok){ location.href='/login'; return; }
+    AUTH={user:j.user,role:j.role};
     try{
-      localStorage.setItem("nukestation.bands", String(val||"{}"));
-      bandApplyAll();
-      if(!boot) setStatus("bands layout synced from another window");
+      const pr=await (await fetch('/api/pref')).json();
+      if(pr.ok&&pr.prefs){
+        ['lagrange.cfg','lagrange.rhw','lagrange.twto','lagrange.twcc'].forEach(k=>{
+          if(pr.prefs[k]!=null&&pr.prefs[k]!=='')
+            localStorage.setItem(k,pr.prefs[k]);
+        });
+        RFQ_CFG=rfqLoadCfg(); rfqApplyCfg();
+        if(rfqRows.length) rfqRender(); else rfqHeader();
+      }
     }catch(e){}
-    return;
-  }
-  if(key==="autolast"){
-    AUTO_LAST = val==="1"||val===true;
-    localStorage.setItem("nukestation.autolast", AUTO_LAST?"1":"0");
-    paintAutoLast();
-    if(!boot) setStatus("AUTO last "+(AUTO_LAST?"ON":"OFF")+
-      " (synced from another window)");
-  }
-}
-function toggleAutoLast(){
-  AUTO_LAST = !AUTO_LAST;
-  localStorage.setItem("nukestation.autolast", AUTO_LAST?"1":"0");
-  cfgSend("autolast", AUTO_LAST?"1":"0");
-  paintAutoLast();
-  setStatus(AUTO_LAST
-    ? "AUTO last ON: stock/fx last feed the overrides each tick and renuke."
-    : "AUTO last OFF.");
-  if(AUTO_LAST) doAutoLast();
-}
-function doAutoLast(){
-  if(!AUTO_LAST) return;
-  const dirty=[];
-  document.querySelectorAll("#tbl tr[data-id]").forEach((tr,ri)=>{
-    const g=(sel)=>{ const el=tr.querySelector(sel);
-      return el ? el.textContent.trim() : ""; };
-    const pairs=[["ovdSpot", g('td[data-rf="last"]')],
-                 ["ovdUndFx", g('td[data-fx="last"]')]];
-    if(vanRow(tr)){ const fl=g('td[data-fx="last"]');
-      if(fl!=="") pairs.push(["ovdCbFx", fl]); }
-    let changed=false;
-    for(const [f,src] of pairs){
-      if(src==="") continue;
-      const v=src.split(",").join("");
-      const inp=tr.querySelector(`input[data-f="${f}"]`);
-      if(inp && inp.value!==v && document.activeElement!==inp){
-        inp.value=v; changed=true;
-      }
+    $('who_badge').textContent=AUTH.user+' \u00b7 '+AUTH.role;
+    if(AUTH.role==='sales'){
+      ['recon','delta','bau','blotter','twcb','nuke'].forEach(x=>{
+        const b=$('tabbtn-'+x); if(b) b.style.display='none';
+        const d=$('tab-'+x); if(d) d.classList.add('hide');
+      });
+      showTab('rfq');
+      if($('rf_mon')) $('rf_mon').style.display='none';
     }
-    if(changed){ dirty.push(ri);
-      autoNukeQueue(Number(tr.dataset.id)); }
-  });
-  if(dirty.length) syncRows(dirty);
-}
-function volN(){
-  const el=document.getElementById("volN");
-  const n=parseInt(el?el.value:"",10);
-  return (isFinite(n)&&n>=2)?n:null;
-}
-function volNChanged(el){
-  localStorage.setItem("nukestation.volN", el.value.trim());
-  updMovesFlags();
-}
-function realVol(px, n){
-  if(!Array.isArray(px) || px.length < n+1) return null;
-  const tail = px.slice(-(n+1));
-  const rets = [];
-  for(let i=1;i<tail.length;i++){
-    const a=tail[i-1], b=tail[i];
-    if(a>0 && b>0) rets.push(Math.log(b/a));
-  }
-  if(rets.length < 2) return null;
-  const m = rets.reduce((x,y)=>x+y,0)/rets.length;
-  const v = rets.reduce((x,y)=>x+(y-m)*(y-m),0)/(rets.length-1);
-  return Math.sqrt(v)*Math.sqrt(252)*100;
-}
-function updVolCls(sel){
-  sel.classList.remove("vol-cheap","vol-rich");
-  if(sel.value==="Cheap") sel.classList.add("vol-cheap");
-  else if(sel.value==="Rich") sel.classList.add("vol-rich");
-}
-function volChanged(sel){
-  updVolCls(sel);
-  sprdChanged(sel);
-}
-function updParity(tr){
-  const td = tr.querySelector('td[data-c="parityPct"]');
-  if(!td) return;
-  const sid = Number(tr.dataset.id);
-  const ref = refCache[sid] || {};
-  const cp = parseFloat(ref.lp_conversion_price) ||
-             parseFloat(ref.conversion_price);
-  const ff = parseFloat(ref.conversion_fixed_fx) || 1;
-  const inp = tr.querySelector('input[data-f="ovdSpot"]');
-  const sp = parseFloat(inp ? inp.value : "");
-  const fxi = tr.querySelector('input[data-f="ovdUndFx"]');
-  let fx = parseFloat(fxi ? fxi.value : "");
-  if(!isFinite(fx))
-    fx = parseFloat((tr.querySelector('td[data-c="nSpotFx"]')||{})
-                    .textContent || "");
-  const bt = ((tr.querySelector('input[data-u="bond_type"]')||{value:""})
-              .value || "").trim().toLowerCase();
-  if(bt.startsWith("vanil")){
-    if(isFinite(cp) && cp > 0 && isFinite(sp)){
-      td.textContent = (sp / cp * 100).toFixed(2);
-      td.title = `Vanilla: ovdSpot ${sp} / CP ${cp}`;
-    } else {
-      td.textContent = "\u2014";
-      td.title = "Vanilla: set ovdSpot (needs conversion_price)";
-    }
-    return;
-  }
-  if(isFinite(cp) && cp > 0 && isFinite(sp) && isFinite(fx) && fx > 0
-     && ff > 0){
-    td.textContent = ((sp / fx) / (cp / ff) * 100).toFixed(2);
-    td.title = `(${sp} / fx ${fx}) / (CP ${cp} / fixedFx ${ff}) x 100`;
-  } else {
-    td.textContent = "\u2014";
-    td.title = !isFinite(cp) || cp <= 0
-      ? "no conversion_price (lp_model_output / nuked_price)"
-      : "set ovdSpot and fx to compute parity";
-  }
-}
-function updParityAll(){
-  document.querySelectorAll("#tbl tr[data-id]").forEach(updParity);
-}
-document.getElementById("tbl").addEventListener("input", (e)=>{
-  if(e.target && e.target.dataset && e.target.dataset.u === "bond_type"){
-    const tr = e.target.closest("tr");
-    if(tr) updParity(tr);
-  }
-  if(e.target && e.target.dataset && e.target.dataset.f === "ovdSpot"){
-    const tr = e.target.closest("tr"); if(tr) updParity(tr);
-  }
-});
-
-function uVal(tr, u){
-  const i = tr.querySelector(`input[data-u="${u}"]`);
-  return i ? i.value.trim() : "";
-}
-
-function paintRefRow(tr, ref){
-  tr.querySelectorAll("td[data-r]").forEach(td=>{
-    let v;
-    if(td.dataset.r === "lp_delta"){
-      const n = parseFloat(ref.lp_delta);
-      td.textContent = isFinite(n) ? (n * 100).toFixed(1) + "%" : "\u2014";
-      return;
-    }
-    if(td.dataset.r === "credit_spread_used"){
-      const n = parseFloat(ref.credit_spread_used);
-      td.textContent = isFinite(n) ? (n * 10000).toFixed(0) : "\\u2014";
-      return;
-    }
-    if(td.dataset.r === "quantity_live" || td.dataset.r === "usd_qty_live"){
-      const q = fmt0(ref[td.dataset.r]);
-      v = q === "" ? "\\u2014" : q;
-    } else {
-      v = ref[td.dataset.r] || "\\u2014";
-    }
-    td.textContent = v;
-    if(td.dataset.r==="company_name") td.title = v;
-  });
-}
-
-async function loadRefData(ids){
-  const need = ids.filter(id=>!(id in refCache));
-  if(need.length){
-    try{
-      const resp = await fetch(location.pathname.replace(/[/]+$/, "") + "/api/refdata",{method:"POST",
-        headers:{"Content-Type":"application/json"},
-        body: JSON.stringify({sec_ids: need})});
-      const data = await resp.json();
-      for(const r of data.rows) refCache[r.secId] = r;
-      for(const id of need) if(!(id in refCache))
-        refCache[id] = {company_name:"", expiry_date:"", isin:"", ric:"",
-                        short_name:"", und_fx:"", quantity_live:"",
-                        sec_fx:"", usd_qty_live:""};
-      if(data.error) setStatus(`<span class="warn">${data.error}</span>`);
-    }catch(err){
-      setStatus(`<span class="warn">Reference lookup failed: ${err}</span>`);
-    }
-  }
-  for(const id of ids){
-    const tr = document.querySelector(`#tbl tr[data-id="${id}"]`);
-    const ref = refCache[id] || {};
-    if(!tr) continue;
-    paintRefRow(tr, ref);
-    const sn = tr.querySelector('input[data-u="short_name"]');
-    if(sn && !sn.value) sn.value = ref.short_name || "";
-    const uf = tr.querySelector('input[data-u="und_fx"]');
-    if(uf && !uf.value) uf.value = ref.und_fx || "";
-  }
-}
-
-/* ---------------- Refinitiv (server-pushed) ---------------- */
-function applyRfx(){
-  const byRic = NS.rfx;
-  const ts = document.getElementById("rfxts");
-  const _touched = new Set();
-  document.querySelectorAll("#tbl tr[data-id]").forEach(tr=>{
-    const stkRic = tr.querySelector("td[data-r='ric']").textContent.trim();
-    const stk = byRic[stkRic];
-    if(stk || byRic[uVal(tr, "und_fx")]) _touched.add(Number(tr.dataset.id));
-    tr.querySelectorAll("td[data-rf]").forEach(td=>{
-      if(!stk){ td.textContent = ""; return; }
-      const k = td.dataset.rf, v = stk[k];
-      td.textContent = (k==="last"||k==="close") ? fmt2(v) : (v ?? "");
-    });
-    const fxRic = uVal(tr, "und_fx");
-    const isConst = fxRic !== "" && !isNaN(Number(fxRic));
-    const fx = byRic[fxRic];
-    tr.querySelectorAll("td[data-fx]").forEach(td=>{
-      const k = td.dataset.fx;
-      if(isConst){ td.textContent = k==="last"||k==="close" ? fmt4(fxRic) : ""; return; }
-      if(!fx){ td.textContent = ""; return; }
-      td.textContent = (k==="last"||k==="close") ? fmt4(fx[k]) : (fx[k] ?? "");
-    });
-  });
-  if(ts){
-    ts.textContent = NS.rfxErrMsg ? "ERR" : (NS.rfxTs || "");
-    ts.title = NS.rfxErrMsg || "";
-  }
-  computeTheoAll();
-  doAutoLast();
-  updMovesFlags(_touched.size ? _touched : undefined);
-}
-
-/* ---------------- theo \u00b7 \u03b3-adj (client-computed) ---------------- */
-const T_KEYS = ["m","rolld","dpnl","gpnl","theo","vslive"];
-function computeTheoAll(){
-  document.querySelectorAll("#tbl tr[data-id]").forEach(tr=>{
-    const put = (k,v)=>{ const td = tr.querySelector(`td[data-t="${k}"]`);
-      if(td) td.textContent = v; };
-    const cls = (k,c,on)=>{ const td = tr.querySelector(`td[data-t="${k}"]`);
-      if(td) td.classList.toggle(c, !!on); };
-    const blank = ()=>{ T_KEYS.forEach(k=>put(k,""));
-      cls("rolld","gwarn",false); cls("theo","ovd-on",false);
-      cls("vslive","pos",false); cls("vslive","neg",false); };
-    const nk = NS.nuke[Number(tr.dataset.id)];
-    if(!nk || nk.nBid==null || nk.nDelta==null || !Number(nk.nSpot)){
-      blank(); return; }
-    const ovdS = parseFloat(
-      (tr.querySelector('input[data-f="ovdSpot"]')||{value:""}).value);
-    const stkRic = tr.querySelector('td[data-r="ric"]').textContent.trim();
-    const live = NS.rfx[stkRic];
-    const liveUnd = live ? Number(live.last) : NaN;
-    const undEff = !isNaN(ovdS) ? ovdS
-                 : !isNaN(liveUnd) ? liveUnd : Number(nk.liveSpot);
-    if(isNaN(undEff) || !undEff){ blank(); return; }
-    const g = parseFloat(
-      (tr.querySelector('input[data-u="n_gamma"]')||{value:""}).value);
-    const hasG = !isNaN(g);
-    const nSpot = Number(nk.nSpot), nD = Number(nk.nDelta)*100;
-    const m = 100*(undEff - nSpot)/nSpot;
-    const roll = nD + (hasG ? g : 0)*m;
-    const dpnl = (nD/100)*m;
-    const gpnl = hasG ? 0.5*(g/100)*m*m : NaN;
-    const theo = Number(nk.nBid) + dpnl + (hasG ? gpnl : 0);
-    const lb = nk.liveMktBid;
-    const vs = (lb===null||lb===undefined||lb==="") ? NaN : Number(lb) - theo;
-    put("m", m.toFixed(2));
-    put("rolld", roll.toFixed(1));
-    put("dpnl", dpnl.toFixed(2));
-    put("gpnl", hasG ? gpnl.toFixed(3) : "\u2014");
-    put("theo", theo.toFixed(2));
-    put("vslive", isNaN(vs) ? "" : vs.toFixed(2));
-    cls("rolld","gwarn", roll<0 || roll>100 || Math.abs(m)>15);
-    cls("theo","ovd-on", !isNaN(ovdS));
-    cls("vslive","pos", vs>0); cls("vslive","neg", vs<0);
-  });
-}
-
-/* ---------------- shared state (WebSocket) ---------------- */
-function applyState(){ try{
-  for(const [sid, row] of Object.entries(NS.rows)){
-    const tr = document.querySelector(`#tbl tr[data-id="${sid}"]`);
-    if(!tr) continue;
-    for(const f of ["short_name","und_fx","n_gamma","or_bid_sprd",
-                    "or_ask_sprd","x_bid","x_ask","x_both","vol_flag","bond_type",
-                    "bw_dvb","bw_dvs","bw_brw","bw_lo","bw_hi","bw_gap","bw_util","bw_d5","bw_htb","bw_evt","bw_src","bw_tnr"]){
-      const i = tr.querySelector(`[data-u="${f}"]`);
-      if(i && document.activeElement !== i){
-        let v = row[f] ?? "";
-        if(f==="vol_flag" && v==="Expensive") v = "Rich";
-        i.value = v;
-        if(f==="vol_flag") updVolCls(i);
-      }
-    }
-    for(const f of FIELDS){
-      const i = tr.querySelector(`input[data-f="${f}"]`);
-      if(i && document.activeElement !== i) i.value = row[f] ?? "";
-    }
-  }
-  computeTheoAll();} finally{ if(typeof updParityAll==='function') updParityAll(); updMovesFlags(); if(typeof bwFlagAll==="function") bwFlagAll(); }
-}
-
-
-
-function applyNuke(){
-  if(typeof nukeDone==="function") nukeDone();
-  const ids = Object.keys(NS.nuke);
-  if(!ids.length) return;
-  const data = {rows: Object.values(NS.nuke),
-    host: NS.nukeMeta.host || "?", elapsed: NS.nukeMeta.elapsed || 0,
-    requested: ids.length, returned: ids.length,
-    missing: NS.nukeMeta.missing || [],
-    secIds: ids.map(Number), by: NS.nukeMeta.by};
-  lastResponse = data;
-  document.getElementById("dl").disabled = false;
-  render(data, null, true);  updParityAll(); updMovesFlags();
-}
-
-function rowPayload(ri){
-  const tr = trAt(ri); if(!tr) return null;
-  const p = {secId: Number(tr.dataset.id)};
-  for(const f of ["short_name","und_fx","n_gamma"]) p[f] = uVal(tr, f);
-  for(const f of FIELDS){
-    const i = tr.querySelector(`input[data-f="${f}"]`);
-    p[f] = i ? i.value.trim() : "";
-  }
-  return p;
-}
-
-function syncRows(ris){
-  const list = [...new Set(ris)].map(rowPayload).filter(Boolean);
-  if(!list.length) return;
-  for(const p of list) NS.rows[p.secId] = {short_name:p.short_name,
-    und_fx:p.und_fx, n_gamma:p.n_gamma,
-    ovdSpot:p.ovdSpot, ovdCbFx:p.ovdCbFx, ovdUndFx:p.ovdUndFx};
-  NS.send({type:"rows", list});
-  computeTheoAll();
-}
-
-const NS = {
-  ws: null, tries: 0, lastMsg: 0, refreshSec: 5, refdataSec: 300,
-  autosaveSec: 300,
-  rfxErrMsg: null,
-  rows: {}, nuke: {}, nukeMeta: {}, rfx: {}, rfxTs: null,
-  up(){ return this.ws && this.ws.readyState === 1; },
-  send(m){ if(this.up()) this.ws.send(JSON.stringify(m)); },
-  hello(){ this.send({type:"hello", user: CFG.user}); },
-  setConn(cls, title){
-    const el = document.getElementById("conn");
-    if(el){ el.className = "conn " + cls; el.title = title; }
-  },
-  connect(){
-    const proto = location.protocol === "https:" ? "wss://" : "ws://";
-    const base = location.pathname.replace(/[/]+$/, "");
-    let ws;
-    try{ ws = new WebSocket(proto + location.host + base + "/ws"); }
-    catch(e){ this.setConn("err","No WebSocket"); return; }
-    this.ws = ws;
-    this.setConn("warn","Connecting...");
-    ws.onopen = ()=>{ this.tries = 0; this.setConn("ok","Live");
-      this.lastMsg = Date.now(); this.hello(); };
-    ws.onmessage = (ev)=>{ this.lastMsg = Date.now();
-      let m; try{ m = JSON.parse(ev.data); }catch(e){ return; }
-      this.onMsg(m); };
-    ws.onclose = ()=>{ this.setConn("err","Disconnected - retrying");
-      const wait = Math.min(15000, 500 * Math.pow(2, this.tries++));
-      setTimeout(()=>this.connect(), wait); };
-    ws.onerror = ()=>{ try{ ws.close(); }catch(e){} };
-  },
-  onMsg(m){
-    if(m.type === "cfg"){
-      if(String(m.by||"")===String(CFG.user||"")) cfgApply(m.key, m.val);
-      return;
-    }
-    if(m.type === "snapshot"){
-      try{
-        const uc=((m.state||{}).userCfg||{})[CFG.user]||{};
-        Object.entries(uc).forEach(([k,v])=>cfgApply(k,v,true));
-      }catch(e){}
-      const st = m.state;
-      this.rows = st.rows || {}; this.nuke = st.nuke || {};
-      this.nukeMeta = st.nukeMeta || {}; this.rfx = st.rfx || {};
-      this.rfxTs = st.rfxTs; this.rfxErrMsg = st.rfxErr || null;
-      this.refreshSec = st.refreshSec || 5;
-      this.refdataSec = st.refdataSec || 300;
-      this.autosaveSec = st.autosaveSec ?? 300;
-      applyFlagTh(st.flagTh);
-      document.getElementById("online").textContent =
-        "\u00b7 " + (m.online||1) + " online";
-      document.getElementById("ids").value = (st.ids||[]).join(NL);
-      buildTable(st.ids || []);
-      setStatus(`Connected as <b>${CFG.user}</b> &middot; shared book of ` +
-                `${(st.ids||[]).length} securities.`);
-    }
-    else if(m.type === "ids"){
-      this.rows = m.rows || this.rows;
-      document.getElementById("ids").value = (m.ids||[]).join(NL);
-      buildTable(m.ids || []);
-      setStatus(`Book set to ${(m.ids||[]).length} securities by ${m.by}.`);
-    }
-    else if(m.type === "rows"){
-      for(const it of m.list || []){
-        this.rows[it.secId] = {short_name: it.short_name, und_fx: it.und_fx,
-          n_gamma: it.n_gamma,
-          ovdSpot: it.ovdSpot, ovdCbFx: it.ovdCbFx, ovdUndFx: it.ovdUndFx};
-        const tr = document.querySelector(`#tbl tr[data-id="${it.secId}"]`);
-        if(!tr) continue;
-        for(const f of ["short_name","und_fx","n_gamma","or_bid_sprd","or_ask_sprd"]){
-          const i = tr.querySelector(`input[data-u="${f}"]`);
-          if(i && document.activeElement !== i) i.value = it[f] ?? "";
-        }
-        for(const f of FIELDS){
-          const i = tr.querySelector(`input[data-f="${f}"]`);
-          if(i && document.activeElement !== i) i.value = it[f] ?? "";
-        }
-      }
-      setStatus(`Edited by ${m.by}.`);
-      applyRfx();
-    }
-    else if(m.type === "nukeStart"){
-      document.getElementById("go").disabled = true;
-      setStatus(`Nuking ${m.n} securities (by ${m.by})&hellip;`);
-    }
-    else if(m.type === "nuke"){
-      document.getElementById("go").disabled = false;
-      for(const r of m.data.rows || [])
-        if(r.secId !== undefined) this.nuke[r.secId] = r;
-      this.nukeMeta = {host: m.data.host, elapsed: m.data.elapsed,
-        by: m.data.by, missing: m.data.missing};
-      lastResponse = m.data;
-      document.getElementById("dl").disabled = !(m.data.rows||[]).length;
-      render(m.data);
-      paintRows();
-    }
-    else if(m.type === "nukeErr"){
-      document.getElementById("go").disabled = false;
-      setStatus(`<span class="err">${m.error} (by ${m.by})</span>`);
-    }
-    else if(m.type === "rfx"){
-      for(const r of m.rows || []) if(r.ric) this.rfx[r.ric] = r;
-      this.rfxTs = m.ts;
-      this.rfxErrMsg = null;
-      applyRfx();
-    }
-    else if(m.type === "rfxErr"){
-      this.rfxErrMsg = m.error;
-      const b = document.getElementById("rfxts");
-      if(b){ b.textContent = "ERR"; b.title = m.error; }
-      setStatus(`<span class="warn">${m.error}</span>`);
-    }
-    else if(m.type === "cfg"){
-      if(m.refreshSec !== undefined){
-        this.refreshSec = m.refreshSec;
-        const el = document.getElementById("cfgSec");
-        if(el) el.value = m.refreshSec;
-        setStatus(`Server refresh set to ${m.refreshSec}s by ${m.by}.`);
-      }
-      if(m.flagTh !== undefined){
-        applyFlagTh(m.flagTh);
-        setStatus(`Flag thresholds set by ${m.by}: RENUKE ` +
-          `${m.flagTh.staleSpot}%/${m.flagTh.staleFx}%, MOVE ` +
-          `${m.flagTh.moveStk}%/${m.flagTh.moveFx}bp.`);
-      }
-      if(m.autosaveSec !== undefined){
-        this.autosaveSec = m.autosaveSec;
-        const el = document.getElementById("cfgAuto");
-        if(el) el.value = m.autosaveSec;
-      }
-      if(m.refdataSec !== undefined){
-        this.refdataSec = m.refdataSec;
-        const el2 = document.getElementById("cfgRef");
-        if(el2) el2.value = m.refdataSec;
-        setStatus(`Reference refresh set to ${m.refdataSec}s by ${m.by}.`);
-      }
-    }
-    else if(m.type === "refdata"){
-      for(const r of m.rows || []){
-        refCache[r.secId] = Object.assign(refCache[r.secId] || {}, r);
-        const tr = document.querySelector(`#tbl tr[data-id="${r.secId}"]`);
-        if(tr) paintRefRow(tr, refCache[r.secId]);
-      }
-      applyRfx();       // ric set may have changed; also recomputes theo
-      updParityAll(); updMovesFlags();
-    }
-    else if(m.type === "refErr"){
-      setStatus(`<span class="warn">${m.error}</span>`);
-    }
-    else if(m.type === "online"){
-      document.getElementById("online").textContent = "\u00b7 " + m.n + " online";
-      if(m.note) setStatus(m.note + ".");
-    }
-  },
-};
-setInterval(()=>{ if(NS.up()){ NS.send({type:"ping"});
-  if(Date.now() - NS.lastMsg > 45000){ try{ NS.ws.close(); }catch(e){} } }
-}, 15000);
-
-/* ---------------- column layout ---------------- */
-function applyLayout(){
-  const rules = [];
-  const wSide = (LAYOUT._side && LAYOUT._side.w) || SIDE_W_DEF;
-  rules.push(`.layout{grid-template-columns:${SIDE_HID?SIDE_RAIL:wSide}px 1fr}`);
-  const wSec = (LAYOUT.secId && LAYOUT.secId.w) || DEF_W.secId;
-  const wCo  = (LAYOUT.company && LAYOUT.company.w) || DEF_W.company;
-  rules.push(`#tbl .stick1{min-width:${wSec}px;max-width:${wSec}px}`);
-  rules.push(`#tbl .stick2{left:${28 + wSec}px;min-width:${wCo}px;max-width:${wCo}px}`);
-  rules.push(`#tbl .stick3{left:${28 + wSec + wCo}px}`);
-  for(const key of COL_KEYS){
-    const st = LAYOUT[key] || {};
-    const w = st.w || DEF_W[key];
-    const i = colIdx(key);
-    const sel = `#tbl tr[data-id] td:nth-child(${i})`;
-    const selH = `#tbl tr.band ~ tr th:nth-child(${i})`;
-    if(w) rules.push(`${sel},${selH}{min-width:${w}px;max-width:${w}px}`,
-                     `${sel}{overflow:hidden;text-overflow:ellipsis}`);
-    const decl = [];
-    if(st.bg) decl.push(`background:${st.bg}!important`);
-    if(st.fg) decl.push(`color:${st.fg}`);
-    if(st.b)  decl.push(`font-weight:600`);
-    if(decl.length){
-      rules.push(`${sel}{${decl.join(";")}}`);
-      const inner = [];
-      if(st.fg) inner.push(`color:${st.fg}`);
-      if(st.b)  inner.push(`font-weight:600`);
-      if(st.bg) inner.push(`background:transparent`);
-      if(inner.length) rules.push(`${sel} input{${inner.join(";")}}`);
-    }
-  }
-  document.getElementById("colstyle").textContent = rules.join("\\n");
-  positionHandle();
-}
-
-function wireResizers(){
-  document.querySelectorAll("#tbl .rz").forEach(rz=>{
-    rz.addEventListener("mousedown",(e)=>{
-      e.preventDefault(); e.stopPropagation();
-      const key = rz.dataset.key;
-      const th = rz.closest("th");
-      const startX = e.clientX;
-      const startW = th.getBoundingClientRect().width;
-      const move = ev=>{
-        const w = Math.max(40, Math.round(startW + ev.clientX - startX));
-        LAYOUT[key] = Object.assign({}, LAYOUT[key], {w});
-        applyLayout();
-      };
-      const up = ()=>{
-        document.removeEventListener("mousemove", move);
-        document.removeEventListener("mouseup", up);
-        setStatus(`Width of ${key} set &mdash; Save layout to keep.`);
-        syncColForm();
-      };
-      document.addEventListener("mousemove", move);
-      document.addEventListener("mouseup", up);
-    });
-  });
-}
-
-function sideToggle(){
-  SIDE_HID = !SIDE_HID;
-  localStorage.setItem("nukestation.sidehide", SIDE_HID?"1":"0");
-  sidePaint(); applyLayout();
-}
-function sidePaint(){
-  const a = document.querySelector("#viewMain aside.side");
-  if(a) a.classList.toggle("collapsed", SIDE_HID);
-  const b = document.getElementById("sidecol");
-  if(b){ b.innerHTML = SIDE_HID ? "&#9656;" : "&#9666;";
-    b.title = (SIDE_HID?"expand":"collapse")+" security IDs panel"; }
-}
-
-function wireSideResizer(){
-  const rz = document.getElementById("siderz");
-  if(!rz) return;
-  rz.addEventListener("mousedown",(e)=>{
-    e.preventDefault(); e.stopPropagation();
-    const startX = e.clientX;
-    const startW = (LAYOUT._side && LAYOUT._side.w) || SIDE_W_DEF;
-    const move = ev=>{
-      const w = Math.max(70, Math.min(480,
-        Math.round(startW + ev.clientX - startX)));
-      LAYOUT._side = Object.assign({}, LAYOUT._side, {w});
-      applyLayout();
-    };
-    const up = ()=>{
-      document.removeEventListener("mousemove", move);
-      document.removeEventListener("mouseup", up);
-      setStatus("Sidebar width set &mdash; Save layout to keep.");
-    };
-    document.addEventListener("mousemove", move);
-    document.addEventListener("mouseup", up);
-  });
-  rz.addEventListener("dblclick", ()=>{
-    delete LAYOUT._side;
-    applyLayout();
-    setStatus("Sidebar width reset &mdash; Save layout to keep.");
-  });
-}
-
-function saveLayout(){
-  localStorage.setItem("nukestation.layout", JSON.stringify(LAYOUT));
-  setStatus(`<span class="ok">Layout saved</span> &middot; ` +
-            `${Object.keys(LAYOUT).length} column(s) customised.`);
-}
-function resetLayout(){
-  for(const k of Object.keys(LAYOUT)) delete LAYOUT[k];
-  localStorage.removeItem("nukestation.layout");
-  applyLayout(); syncColForm();
-  setStatus("Layout reset to defaults.");
-}
-function clearColumn(){
-  const key = document.getElementById("lcol").value;
-  delete LAYOUT[key];
-  applyLayout(); syncColForm();
-}
-function clearColField(f){
-  const key = document.getElementById("lcol").value;
-  if(LAYOUT[key]){ delete LAYOUT[key][f];
-    if(!Object.keys(LAYOUT[key]).length) delete LAYOUT[key]; }
-  applyLayout(); syncColForm();
-}
-function loadColForm(){ syncColForm(); }
-function syncColForm(){
-  const key = document.getElementById("lcol").value;
-  const st = LAYOUT[key] || {};
-  document.getElementById("lw").value = st.w || DEF_W[key] || "";
-  document.getElementById("lfg").value = st.fg || "#16181d";
-  document.getElementById("lbg").value = st.bg || "#ffffff";
-  document.getElementById("lb").checked = !!st.b;
-}
-function colFormChanged(which){
-  const key = document.getElementById("lcol").value;
-  const st = LAYOUT[key] = Object.assign({}, LAYOUT[key]);
-  const w = parseInt(document.getElementById("lw").value);
-  if(w) st.w = w; else delete st.w;
-  if(which==="fg" || st.fg) st.fg = document.getElementById("lfg").value;
-  if(which==="bg" || st.bg) st.bg = document.getElementById("lbg").value;
-  st.b = document.getElementById("lb").checked;
-  if(!st.b) delete st.b;
-  applyLayout();
-}
-function initColPicker(){
-  const sel = document.getElementById("lcol");
-  sel.innerHTML = COL_DEFS.map(([k,label])=>
-    `<option value="${k}">${label} (${k})</option>`).join("");
-  syncColForm();
-}
-
-/* ---------------- runs ---------------- */
-const RUN_DEFS = [["short_name","Short Name"],["isin","ISIN"],
-  ["override_bid","Bid"],["override_ask","Ask"],["indic_ask","Indic Ask"],
-  ["ovdSpot","Vs"],["ovdUndFx","Fx"],["vs_usd","Vs USD"],
-  ["nDelta%","Delta"],
-  ["quantity_live","Quantity"]];
-const RUN_COLS = RUN_DEFS.map(d=>d[0]);
-const RUN_LABEL = Object.fromEntries(RUN_DEFS);
-let runsData = [];
-
-function generateRuns(){
-  if(!rowSel.size){
-    setStatus('<span class="warn">No rows selected &mdash; tick rows first, ' +
-              'no runs generated.</span>');
-    return;
-  }
-  const rows = [...rowSel].sort((a,b)=>a-b);
-  runsData = [];
-  let noBid = 0;
-  for(const ri of rows){
-    const tr = trAt(ri); if(!tr) continue;
-    const sid = Number(tr.dataset.id);
-    const tv = sel => { const td = tr.querySelector(sel);
-      return td ? td.textContent.trim() : ""; };
-    const iv = f => { const i = tr.querySelector(`input[data-f="${f}"]`);
-      return i ? i.value.trim() : ""; };
-    const _x = k => { const i = tr.querySelector(`input[data-u="${k}"]`);
-      const n = parseFloat(i ? i.value : ""); return isFinite(n) ? n : 0; };
-    const _q = v => { const n = parseFloat(v);
-      return isFinite(n) ? (n + _x("x_both")).toFixed(2) : ""; };
-    const _b0 = tv('td[data-c="ovdMktBid"]');
-    const bid = _b0 === "" ? ""
-      : (parseFloat(_b0) + _x("x_bid") + _x("x_both")).toFixed(2);
-    if(bid === "") noBid++;
-    const qty = fmt0((refCache[sid]||{}).quantity_live);
-    const _a0 = qty === "0" ? "" : tv('td[data-c="ovdMktAsk"]');
-    const ask = _a0 === "" ? ""
-      : (parseFloat(_a0) + _x("x_ask") + _x("x_both")).toFixed(2);
-    const nsprd = parseFloat(tv('td[data-c="nSpread"]'));
-    runsData.push({
-      short_name: uVal(tr, "short_name") || (refCache[sid]||{}).company_name || String(sid),
-      isin: (refCache[sid]||{}).isin || tv('td[data-r="isin"]'),
-      override_bid: bid,
-      override_ask: ask,
-      indic_ask: ask !== "" ? ask
-               : (bid !== "" ? (parseFloat(bid) +
-                   (isFinite(nsprd) ? nsprd : 1)).toFixed(2) : ""),
-      ovdSpot: iv("ovdSpot"),
-      ovdUndFx: iv("ovdUndFx"),
-      vs_usd: (()=>{ const v=parseFloat(String(iv("ovdSpot")).split(",").join(""));
-        const f=parseFloat(String(iv("ovdUndFx")).split(",").join(""));
-        return (isFinite(v)&&isFinite(f)&&f!==0)?(v/f).toFixed(2):""; })(),
-      "nDelta%": tv('td[data-c="nDeltaPct"]').replace("%",""),
-      quantity_live: qty,
-    });
-  }
-  renderRuns();
-  showTab("runs");
-  const note = noBid
-    ? `${runsData.length} run(s) &middot; <span class="warn">${noBid} without ` +
-      `override bid/ask &mdash; nuke with overrides first</span>`
-    : `${runsData.length} run(s) generated.`;
-  document.getElementById("runstatus").innerHTML = note;
-}
-
-function renderRuns(){
-  const t = document.getElementById("runstbl");
-  let h = "<tr>" + RUN_COLS.map((c,i)=>
-    `<th${i<2?' class="ref"':''}>${RUN_LABEL[c]}</th>`).join("") + "</tr>";
-  for(const r of runsData){
-    h += "<tr>" + RUN_COLS.map((c,i)=>
-      `<td${i<2?' class="ref"':''}>${r[c] ?? ""}</td>`).join("") + "</tr>";
-  }
-  t.innerHTML = h;
-}
-
-function runsAsTsv(){
-  const lines = [RUN_COLS.map(c=>RUN_LABEL[c]).join("\\t")];
-  for(const r of runsData)
-    lines.push(RUN_COLS.map(c=>r[c] ?? "").join("\\t"));
-  return lines.join("\\n");
-}
-
-function runsAsHtml(){
-  const isText = c => c==="short_name" || c==="isin";
-  const esc = v => String(v ?? "").replace(/&/g,"&amp;")
-    .replace(/</g,"&lt;").replace(/>/g,"&gt;");
-  const cellCss = c =>
-    `border:1px solid #999;padding:4px 9px;text-align:${isText(c)?"left":"right"};` +
-    `font-family:'Segoe UI',Arial,sans-serif;font-size:13px;`;
-  const head = RUN_COLS.map(c =>
-    `<th style="${cellCss(c)}font-weight:600;background:#f2f2f2;">` +
-    `${esc(RUN_LABEL[c])}</th>`
-  ).join("");
-  const body = runsData.map(r =>
-    "<tr>" + RUN_COLS.map(c =>
-      `<td style="${cellCss(c)}">${esc(r[c])}</td>`).join("") + "</tr>"
-  ).join("");
-  return `<table style="border-collapse:collapse;">` +
-         `<thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
-}
-
-async function copyText(text){
-  if(navigator.clipboard && navigator.clipboard.writeText){
-    try{ await navigator.clipboard.writeText(text); return true; }catch(e){}
-  }
-  const ta = document.createElement("textarea");
-  ta.style.position = "fixed"; ta.style.left = "-9999px"; ta.style.top = "0";
-  ta.value = text;
-  document.body.appendChild(ta);
-  ta.focus(); ta.select();
-  let ok = false;
-  try{ ok = document.execCommand("copy"); }catch(e){}
-  ta.remove();
-  return ok;
-}
-
-async function copyRich(html, text){
-  if(navigator.clipboard && navigator.clipboard.write && window.ClipboardItem){
-    try{
-      await navigator.clipboard.write([new ClipboardItem({
-        "text/html":  new Blob([html], {type: "text/html"}),
-        "text/plain": new Blob([text], {type: "text/plain"}),
-      })]);
-      return true;
-    }catch(e){}
-  }
-  // legacy path (works on http:// origins): select an off-screen node
-  // containing the table and let the browser copy it with both flavors
-  const host = document.createElement("div");
-  host.style.position = "fixed"; host.style.left = "-9999px"; host.style.top = "0";
-  host.setAttribute("contenteditable", "true");
-  host.innerHTML = html;
-  document.body.appendChild(host);
-  let ok = false;
-  try{
-    const range = document.createRange();
-    range.selectNodeContents(host);
-    const sel = window.getSelection();
-    sel.removeAllRanges(); sel.addRange(range);
-    ok = document.execCommand("copy");
-    sel.removeAllRanges();
   }catch(e){}
-  host.remove();
-  return ok;
 }
-
-async function copyRunsBbg(){
-  if(!runsData.length){
-    document.getElementById("runstatus").innerHTML =
-      '<span class="warn">Nothing to copy &mdash; generate runs first.</span>';
-    return;
-  }
-  const html = runsAsHtml(), tsv = runsAsTsv();
-  if(await copyRich(html, tsv)){
-    document.getElementById("runstatus").innerHTML =
-      "Runs copied as a <b>table</b> (HTML + text) &mdash; paste into Bloomberg " +
-      "chat. If IB pastes it flat, route via Excel: paste there, copy, paste to IB.";
-  } else if(await copyText(tsv)){
-    document.getElementById("runstatus").innerHTML =
-      '<span class="warn">Rich clipboard unavailable &mdash; copied TSV; ' +
-      'paste into Excel first, then copy from Excel into IB.</span>';
-  } else {
-    document.getElementById("runstatus").innerHTML =
-      '<span class="err">Copy blocked by the browser &mdash; select the ' +
-      'table with the mouse and press Ctrl+C.</span>';
-  }
-}
-
-async function copyRuns(){
-  if(!runsData.length){
-    document.getElementById("runstatus").innerHTML =
-      '<span class="warn">Nothing to copy &mdash; generate runs first.</span>';
-    return;
-  }
-  copyText(runsAsTsv()).then(ok =>
-    document.getElementById("runstatus").innerHTML = ok
-      ? "Runs copied as TSV &mdash; paste into Excel or chat."
-      : '<span class="err">Copy blocked by the browser &mdash; select the ' +
-        'table with the mouse and press Ctrl+C.</span>');
-}
-
-
-/* ---------------- save to DB ---------------- *//* ---------------- save to DB ---------------- */
-function gatherRows(){
-  const byId = {};
-  if(lastResponse) for(const r of lastResponse.rows) byId[r.secId] = r;
-  const rows = [];
-  document.querySelectorAll("#tbl tr[data-id]").forEach(tr=>{
-    const sid = Number(tr.dataset.id);
-    const ref = refCache[sid] || {};
-    const api = byId[sid] || {};
-    const gv = f => { const i = tr.querySelector(`input[data-f="${f}"]`);
-      return i ? sanitizeNum(i.value) : ""; };
-    const tv = sel => { const td = tr.querySelector(sel);
-      return td ? td.textContent.trim() : ""; };
-    rows.push({
-      sec_id: sid,
-      short_name: uVal(tr,"short_name"),
-      company_name: ref.company_name || "",
-      ric: ref.ric || "",
-      expiry_date: ref.expiry_date || "",
-      isin: ref.isin || "",
-      und_fx: uVal(tr,"und_fx"),
-      ovd_spot: gv("ovdSpot"), ovd_cbfx: gv("ovdCbFx"), ovd_undfx: gv("ovdUndFx"),
-      bw_dvb: uVal(tr,"bw_dvb"),
-      bw_dvs: uVal(tr,"bw_dvs"),
-      bw_brw: uVal(tr,"bw_brw"),
-      bw_lo: uVal(tr,"bw_lo"),
-      bw_hi: uVal(tr,"bw_hi"),
-      bw_gap: uVal(tr,"bw_gap"),
-      bw_util: uVal(tr,"bw_util"),
-      bw_d5: uVal(tr,"bw_d5"),
-      bw_htb: uVal(tr,"bw_htb"),
-      bw_evt: uVal(tr,"bw_evt"),
-      bw_src: uVal(tr,"bw_src"),
-      bw_tnr: uVal(tr,"bw_tnr"),
-
-      n_bid: api.nBid, n_delta: api.nDelta, n_spread: api.nSpread,
-      n_spot: api.nSpot, n_spotfx: api.nSpotFx,
-      live_bid: api.liveMktBid, live_ask: api.liveMktAsk, live_spot: api.liveSpot,
-      live_cbfx: api.liveCbFx, live_undfx: api.liveUndFx,
-      eod_bid: api.eodMktBid, eod_ask: api.eodMktAsk, eod_spot: api.eodSpot,
-      eod_cbfx: api.eodCbFx, eod_undfx: api.eodUndFx,
-      ovd_bid: api.ovdMktBid, ovd_ask: api.ovdMktAsk,
-      stk_last: tv("td[data-rf='last']"), stk_time: tv("td[data-rf='last_time']"),
-      stk_date: tv("td[data-rf='last_date']"),
-      stk_close: tv("td[data-rf='close']"), stk_close_date: tv("td[data-rf='close_date']"),
-      fx_last: tv("td[data-fx='last']"), fx_time: tv("td[data-fx='last_time']"),
-      fx_date: tv("td[data-fx='last_date']"),
-      fx_close: tv("td[data-fx='close']"), fx_close_date: tv("td[data-fx='close_date']"),
-    });
+authBoot();
+function showTab(t){
+  window.curTab=t;
+  ['recon','delta','dscan','risk','bau','blotter','rfq','twcb','nuke'].forEach(x=>{
+    if(t==='dscan' && x==='dscan'){
+      const u='/dscan/';
+      $('ds_open').href=u;
+      fetch('/api/dscan/status').then(r=>r.json()).then(j=>{
+        const st=$('ds_status'); if(!st) return;
+        st.textContent=j.ok?('delta scan \u00b7 '+j.note)
+          :('DELTA SCAN NOT MOUNTED \u2014 '+j.note);
+        st.className='status '+(j.ok?'ok':'err');
+        if(j.ok && !$('ds_frame').src) $('ds_frame').src=u+'?v='+Date.now();
+      }).catch(()=>{ if(!$('ds_frame').src) $('ds_frame').src=u; }); }
+    if(t==='risk' && x==='risk') riskLoad();
+    if(t==='nuke' && x==='nuke') nukeConnect();
+    if(t==='blotter' && x==='blotter') blotterLoad();
+    if(t==='rfq' && x==='rfq') rfqLoad();
+    $('tab-'+x).classList.toggle('hide', x!==t);
+    $('tabbtn-'+x).classList.toggle('active', x===t);
   });
-  return rows;
+}
+$('mode').onchange=()=>{
+  const m=$('mode').value;
+  $('d1').classList.toggle('hide', m==='today');
+  $('d2').classList.toggle('hide', m!=='range');
+};
+function setS(id,t,cls){const s=$(id);s.textContent=t;s.className='status '+(cls||'');}
+async function post(url,body){
+  const r=await fetch(url,{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
+  return [r.ok, await r.json()];
 }
 
-async function saveToDb(){
-  const rows = gatherRows();
-  if(!rows.length){ setStatus('<span class="err">Nothing to save.</span>'); return; }
-  setStatus("Saving to cba_app.cb_nuke&hellip;");
+/* ---- tab: risk positions ---- */
+let RK={cols:[],rows:[]};
+async function riskLoad(){
+  setS('rk_meta','loading\u2026','');
+  let j; try{ j=await (await fetch('/api/risk/latest')).json();
+  }catch(e){ setS('rk_meta','load failed: '+e,'err'); return; }
+  if(!j.ok){ setS('rk_meta',j.error||'error','err'); return; }
+  RK=j; riskRender();
+  setS('rk_meta','snapshot '+(j.snap||'?')+' \u00b7 batch '
+    +(j.loaded||'?')+' (\u226460s window) \u00b7 '
+    +j.rows.length+' rows \u00b7 '+(j.table||''),'ok');
+}
+function riskRender(){
+  const f=($('rk_filt').value||'').toLowerCase();
+  const rows=f?RK.rows.filter(r=>r.join(' ')
+    .toLowerCase().includes(f)):RK.rows;
+  $('rk_tbl').querySelector('thead').innerHTML='<tr>'+
+    RK.cols.map(c=>'<th>'+blEsc(c)+'</th>').join('')+'</tr>';
+  $('rk_tbl').querySelector('tbody').innerHTML=rows.map(r=>
+    '<tr>'+r.map((v,i)=>'<td class="'+
+    (/^-?[0-9,.]+$/.test(v)?'num':'')+'">'+blEsc(v)+'</td>')
+    .join('')+'</tr>').join('');
+}
+if($('rk_reload')) $('rk_reload').onclick=riskLoad;
+if($('rk_filt')) $('rk_filt').oninput=riskRender;
+
+/* ---- tab 1: recon ---- */
+$('refresh').onclick=async()=>{
+  const m=$('mode').value;
+  const body={mode:m, skip_loader:$('skiploader').checked};
+  if(m==='date')  body.date=$('d1').value;
+  if(m==='range'){body.date_from=$('d1').value; body.date_to=$('d2').value;}
+  $('refresh').disabled=true;
+  setS('status','Refreshing: loading txt exports, querying DB, reconciling ...');
   try{
-    const resp = await fetch(location.pathname.replace(/[/]+$/, "") + "/api/save",{method:"POST",
-      headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({rows, user: CFG.user})});
-    const data = await resp.json();
-    if(!resp.ok){ setStatus(`<span class="err">${data.error||resp.status}</span>`); return; }
-    setStatus(`<span class="ok">Saved ${data.saved} row(s)</span> &middot; ${data.table}`);
-  }catch(err){
-    setStatus(`<span class="err">Save failed: ${err}</span>`);
-  }
-}
-
-/* ---------------- actions ---------------- */
-function clearOverrides(){
-  const rows = targetRows();
-  for(const ri of rows){
-    const tr = trAt(ri); if(!tr) continue;
-    tr.querySelectorAll("input[data-f]").forEach(i=>i.value="");
-  }
-  syncRows(rows);
-  rows.forEach(ri=>{ const tr=trAt(ri); if(tr) autoNukeQueue(Number(tr.dataset.id)); });
-  setStatus(rowSel.size ? `Cleared overrides on ${rows.length} selected row(s).`
-                        : "Cleared all overrides.");
-}
-
-function setStatus(html){ document.getElementById("status").innerHTML = html; }
-
-function nuke(){
-  if(!NS.up()){
-    setStatus('<span class="err">Not connected &mdash; reconnecting, try again.</span>');
-    return;
-  }
-  const rows = rowSel.size ? [...rowSel].sort((a,b)=>a-b)
-                           : [...Array(nRows()).keys()];
-  if(!rows.length){ setStatus('<span class="err">Load security IDs first.</span>'); return; }
-  syncRows(rows);
-  const secIds = rows.map(ri => Number(trAt(ri).dataset.id));
-  document.getElementById("go").disabled = true;
-  NS._nukeInFlight=true;                 // manual has priority: send now,
-  NS._nukeSafety=setTimeout(nukeDone, 8000);   // autos coalesce behind it
-  NS.send({type:"nuke", secIds});
-  setStatus(`Requested nuke for ${secIds.length} securities&hellip;`);
-}
-
-function render(data, _unused, quiet){
-  const scope = new Set((data.secIds || data.rows.map(r=>r.secId)).map(Number));
-  document.querySelectorAll("#tbl tr[data-id]").forEach(tr=>{
-    if(scope.size && !scope.has(Number(tr.dataset.id))) return;
-    tr.querySelectorAll("td[data-c]").forEach(td=>{
-      if(td.dataset.c === "parityPct") return;   // client-computed, not ours
-      td.textContent = ""; td.classList.remove("ovd-on","pos","neg");
-    });
-  });
-  for(const r of data.rows){
-    const tr = document.querySelector(`#tbl tr[data-id="${r.secId}"]`);
-    if(!tr) continue;
-    const applied = (r.ovdSpot||r.ovdCbFx||r.ovdUndFx) ? true : false;
-    const dv = applied ? r.ovdMktBid - r.liveMktBid : null;
-    const vals = {
-      nBid: fmt(r.nBid), nDeltaPct: (v=>v===""?"":v+"%")(fmt(r.nDelta*100,1)), nSpread: fmt(r.nSpread),
-      nSpot: fmt(r.nSpot), nSpotFx: fmt(r.nSpotFx),
-      liveMktBid: fmtBA(r.liveMktBid), liveMktAsk: fmtBA(r.liveMktAsk),
-      liveSpot: fmt(r.liveSpot,2), liveCbFx: fmt(r.liveCbFx), liveUndFx: fmt(r.liveUndFx),
-      eodMktBid: fmtBA(r.eodMktBid), eodMktAsk: fmtBA(r.eodMktAsk),
-      eodSpot: fmt(r.eodSpot,2), eodCbFx: fmt(r.eodCbFx), eodUndFx: fmt(r.eodUndFx),
-      ovdMktBid: applied ? fmtBA(r.ovdMktBid) : "",
-      ovdMktAsk: applied ? fmtBA(r.ovdMktAsk) : "",
-      dVsLive: dv===null ? "" : fmtBA(dv),
-    };
-    tr.querySelectorAll("td[data-c]").forEach(td=>{
-      const c = td.dataset.c;
-      if(c === "parityPct") return;              // client-computed, not ours
-      td.textContent = vals[c];
-      if(applied && (c==="ovdMktBid"||c==="ovdMktAsk"||c==="dVsLive"))
-        td.classList.add("ovd-on");
-      if(c==="dVsLive"){
-        td.classList.remove("pos","neg","bgpos","bgneg");
-        if(dv!==null && dv!==0) td.classList.add(dv>0?"bgpos":"bgneg");
-      }
-    });
-  }
-  const miss = data.missing.length ?
-    ` &middot; <span class="warn">missing: ${data.missing.join(", ")}</span>` : "";
-  const empty = !data.rows.length ?
-    ' &middot; <span class="warn">empty payload &mdash; no live session or IDs not loaded</span>' : "";
-  computeTheoAll();
-  if(!quiet)
-    setStatus(`<span class="ok">Nuked</span>` +
-      (data.by ? ` by ${data.by}` : "") +
-      ` &middot; host ${data.host} &middot; ${data.elapsed}s &middot; ` +
-      `${data.returned}/${data.requested} returned${miss}${empty}`);
-}
-
-function bwChg(el){ bwFlag(el); sprdChanged(el); }
-function bwFlag(el){
-  const f=el.dataset.u,
-    v=parseFloat(String(el.value).replace("%",""));
-  let bad=false;
-  if(f==="bw_htb"&&isFinite(v)) bad=v>=1;
-  if(f==="bw_util"&&isFinite(v)) bad=v>=85;
-  if(f==="bw_gap"&&isFinite(v)) bad=Math.abs(v)>=1;
-  if(f==="bw_evt"&&isFinite(v)) bad=v>=0&&v<=3;
-  el.classList.toggle("bwred",bad);
-}
-function bwFlagAll(){
-  document.querySelectorAll('input[data-u^="bw_"]').forEach(bwFlag);
-}
-function sprdChanged(el){
-  const sid = Number(el.dataset.id), f = el.dataset.u, v = el.value.trim();
-  if(!sid || !f) return;
-  NS.rows[sid] = Object.assign({}, NS.rows[sid], {[f]: v});
-  const _msg={secId: sid, [f]: v};
-  if(f==="ovdUndFx"||f==="bond_type"){
-    const bt=String((f==="bond_type"?v:
-      (NS.rows[sid]||{}).bond_type)||"").toLowerCase();
-    const uv=f==="ovdUndFx"?v:
-      String((NS.rows[sid]||{}).ovdUndFx||"");
-    if(bt.startsWith("vanil")&&uv){
-      NS.rows[sid].ovdCbFx=uv; _msg.ovdCbFx=uv;
-      const tr=el.closest("tr");
-      const ci=tr&&tr.querySelector('input[data-u="ovdCbFx"]');
-      if(ci) ci.value=uv;
+    const [ok,j]=await post('/api/refresh',body);
+    if(!ok||!j.ok){
+      setS('status','ERROR: '+(j.error||'refresh failed')+'\n'+(j.loader||''),'err');
+      return;
     }
-  }
-  NS.send({type:"rows", list:[_msg]});
+    $('frame').srcdoc=j.html;
+    $('built').textContent='| recon built '+j.built_at+' | '+j.label;
+    $('draft').disabled=false; $('sendnow').disabled=false;
+    const tag=j.alerts===0?'CLEAN':'ALERTS: '+j.alerts;
+    setS('status',tag+' | matched '+j.matched+' | '+j.subject+
+      (j.loader_ok?'':'\n[loader warning] '+j.loader),
+      j.alerts===0?'ok':'err');
+  }catch(e){ setS('status','ERROR: '+e,'err'); }
+  finally{ $('refresh').disabled=false; }
+};
+async function reconSend(sendNow){
+  if(sendNow && !confirm('Send the recon email NOW?')) return;
+  $('draft').disabled=true; $('sendnow').disabled=true;
+  setS('status',sendNow?'Sending via Outlook ...':'Opening Outlook draft ...');
+  try{
+    const [ok,j]=await post('/api/send',
+      {to:$('to').value, cc:$('cc').value, send:sendNow});
+    setS('status',(j.ok?'Outlook: ':'Outlook ERROR: ')+j.message, j.ok?'ok':'err');
+  }catch(e){ setS('status','ERROR: '+e,'err'); }
+  finally{ $('draft').disabled=false; $('sendnow').disabled=false; }
+}
+$('draft').onclick=()=>reconSend(false);
+$('sendnow').onclick=()=>reconSend(true);
+
+/* ---- tab 2: delta check ---- */
+$('dupdate').onclick=async()=>{
+  $('dupdate').disabled=true;
+  setS('dstatus','Updating DB via cba_mariadb.py - this can take several minutes ...');
+  try{
+    const [ok,j]=await post('/api/delta/update_db');
+    if(!ok||!j.ok){ setS('dstatus','ERROR: '+(j.error||'update failed')+'\n'+(j.log||''),'err'); return; }
+    setS('dstatus','DB updated.\n'+j.log,'ok');
+  }catch(e){ setS('dstatus','ERROR: '+e,'err'); }
+  finally{ $('dupdate').disabled=false; }
+};
+$('drefresh').onclick=async()=>{
+  $('drefresh').disabled=true;
+  const upd=$('dupdfirst').checked;
+  setS('dstatus',(upd?'Updating DB, then running':'Running')+
+    ' CBA delta + price check ...'+(upd?' (DB update can take several minutes)':''));
+  try{
+    const [ok,j]=await post('/api/delta/refresh',{update_db:upd});
+    if(!ok||!j.ok){ setS('dstatus','ERROR: '+(j.error||'refresh failed'),'err'); return; }
+    $('dframe').srcdoc=j.html;
+    $('dstats').textContent=j.rows+' rows | '+j.flagged+' flagged | data as of '
+      +(j.data_as_of||'?')+' | built '+j.built_at;
+    $('ddraft').disabled=false; $('dsendnow').disabled=false;
+    setS('dstatus',(j.flagged===0?'ALL WITHIN TOLERANCE':'FLAGGED: '+j.flagged)
+      +' | '+j.subject+(j.log?'\n'+j.log:''),
+      j.stale?'err':(j.flagged===0?'ok':'err'));
+  }catch(e){ setS('dstatus','ERROR: '+e,'err'); }
+  finally{ $('drefresh').disabled=false; }
+};
+async function deltaSend(sendNow){
+  if(sendNow && !confirm('Send the delta check email NOW?')) return;
+  $('ddraft').disabled=true; $('dsendnow').disabled=true;
+  setS('dstatus',sendNow?'Sending via Outlook ...':'Opening Outlook draft ...');
+  try{
+    const [ok,j]=await post('/api/delta/send',
+      {to:$('dto').value, cc:$('dcc').value, send:sendNow});
+    setS('dstatus',(j.ok?'Outlook: ':'Outlook ERROR: ')+j.message, j.ok?'ok':'err');
+  }catch(e){ setS('dstatus','ERROR: '+e,'err'); }
+  finally{ $('ddraft').disabled=false; $('dsendnow').disabled=false; }
+}
+$('ddraft').onclick=()=>deltaSend(false);
+$('dsendnow').onclick=()=>deltaSend(true);
+
+async function runFull(source){
+  if(source==='auto' && !confirm(
+    'Auto-grab will focus the Derivation window and send Ctrl+E / Ctrl+A / Ctrl+C.\n'+
+    'Do not touch keyboard/mouse until it finishes. Continue?')) return;
+  $('dfull').disabled=true; $('dauto').disabled=true; $('drefresh').disabled=true;
+  setS('dstatus',($('dupdfirst').checked?'Updating DB, then running':'Running')+
+    ' FULL pipeline (derivation + CBA) - Bloomberg + Excel + DB, this can take a while ...');
+  try{
+    const [ok,j]=await post('/api/delta/full',
+      {source:source, pasted:$('dpaste').value, update_db:$('dupdfirst').checked});
+    if(!ok||!j.ok){
+      setS('dstatus','ERROR: '+(j.error||'pipeline failed')+
+        (j.log?'\n--- log ---\n'+j.log:''),'err');
+      return;
+    }
+    $('dframe').srcdoc=j.html;
+    $('dstats').textContent=j.rows+' rows | '+j.flagged+' flagged | data as of '
+      +(j.data_as_of||'?')+' | built '+j.built_at+' (full)';
+    $('ddraft').disabled=false; $('dsendnow').disabled=false;
+    setS('dstatus',(j.flagged===0?'ALL WITHIN TOLERANCE':'FLAGGED: '+j.flagged)
+      +' | '+j.subject+'\n--- log ---\n'+j.log, j.flagged===0?'ok':'err');
+  }catch(e){ setS('dstatus','ERROR: '+e,'err'); }
+  finally{ $('dfull').disabled=false; $('dauto').disabled=false; $('drefresh').disabled=false; }
+}
+$('dauto').onclick=()=>runFull('auto');
+$('dfull').onclick=()=>runFull('paste');
+
+/* ---- tab 3: BAU tasks ---- */
+$('bdate').value = new Date().toISOString().slice(0,10);
+$('bmanage').onchange=()=>{ $('bpanel').style.display=$('bmanage').checked?'':'none'; bauLoad(); };
+function esc(t){const d=document.createElement('div');d.textContent=t==null?'':t;return d.innerHTML;}
+async function bauLoad(){
+  const date=$('bdate').value;
+  if(!date) return;
+  const inc=$('bmanage').checked?'&include_inactive=true':'';
+  try{
+    const r=await fetch('/api/bau/list?date='+date+inc);
+    const j=await r.json();
+    if(!j.ok){ setS('bstatus','ERROR loading tasks','err'); return; }
+    $('bprog').textContent=j.done+' / '+j.total+' done';
+    const now=new Date(); const isToday=date===now.toISOString().slice(0,10);
+    const hhmm=now.toTimeString().slice(0,5);
+    let h='<tr style="background:#f0f0f0;font-weight:700">'
+      +'<td style="padding:6px 10px;width:36px"></td>'
+      +'<td style="padding:6px 10px;width:60px">TIME</td>'
+      +'<td style="padding:6px 10px">TASK</td>'
+      +'<td style="padding:6px 10px;width:70px">CAT</td>'
+      +'<td style="padding:6px 10px;width:120px">DONE AT</td>'
+      +'<td style="padding:6px 10px;width:260px">COMMENT</td>'
+      +'<td style="padding:6px 10px;width:130px"></td></tr>';
+    for(const t of j.tasks){
+      const overdue=isToday&&!t.done&&t.sched_time&&t.sched_time<hhmm;
+      const bg=!t.is_active?'#f3f3f3':t.done?'#f0f7f0':overdue?'#f6ead2':'#fff';
+      h+='<tr style="background:'+bg+';border-top:1px solid #e5e5e5'
+        +(t.is_active?'':';color:#9a9a9a')+'">'
+        +'<td style="padding:5px 10px;text-align:center">'
+        +'<input type="checkbox" '+(t.done?'checked':'')
+        +' onchange="bauTick('+t.task_id+',this.checked)"></td>'
+        +'<td style="padding:5px 10px">'+(t.sched_time||'')+'</td>'
+        +'<td style="padding:5px 10px" title="'+esc(t.notes)+'">'
+        +esc(t.task_name)+(t.is_active?'':' (archived)')+'</td>'
+        +'<td style="padding:5px 10px">'+esc(t.category)+'</td>'
+        +'<td style="padding:5px 10px;color:#6e6a63">'+(t.done_at||'')+'</td>'
+        +'<td style="padding:3px 6px"><input value="'+esc(t.comment)
+        +'" style="width:100%;border:1px solid #ddd;padding:3px 5px" '
+        +'onchange="bauComment('+t.task_id+',this.value)"></td>'
+        +'<td style="padding:3px 6px">'
+        +'<button onclick=\'bauEdit('+JSON.stringify(t).replace(/'/g,"&#39;")+')\'>edit</button> '
+        +'<button onclick="bauArch('+t.task_id+','+(t.is_active?'false':'true')+')">'
+        +(t.is_active?'archive':'restore')+'</button>'
+        +($('bmanage').checked
+          ?' <button style="color:#b3261e" onclick="bauDel('+t.task_id
+            +',\''+esc(t.task_name).replace(/'/g,"&#39;")+'\')">delete</button>'
+          :'')
+        +'</td></tr>';
+    }
+    $('btable').innerHTML=h;
+    setS('bstatus','Loaded '+j.date+'.','ok');
+  }catch(e){ setS('bstatus','ERROR: '+e,'err'); }
+}
+async function bauTick(id,done){
+  await post('/api/bau/log',{task_id:id,date:$('bdate').value,done:done});
+  bauLoad();
+}
+async function bauComment(id,c){
+  await post('/api/bau/log',{task_id:id,date:$('bdate').value,comment:c});
+}
+function bauEdit(t){
+  $('bmanage').checked=true; $('bpanel').style.display='';
+  $('bt_id').value=t.task_id; $('bt_name').value=t.task_name;
+  $('bt_time').value=t.sched_time||''; $('bt_cat').value=t.category||'';
+  $('bt_sort').value=t.sort_order; $('bt_notes').value=t.notes||'';
+}
+async function bauDel(id,name){
+  if(!confirm('DELETE "'+name+'" permanently?\n\n'+
+    'This removes the task AND every day\'s completion record for it.\n'+
+    'It cannot be undone. (Use archive instead to keep history.)')) return;
+  const [ok,j]=await post('/api/bau/delete',{task_id:id});
+  if(!ok||!j.ok){ setS('bstatus','ERROR: '+(j.error||'delete failed'),'err'); return; }
+  setS('bstatus','Task deleted ('+j.logs_deleted+' day record(s) removed).','ok');
+  bauLoad();
+}
+async function bauArch(id,act){
+  await post('/api/bau/archive',{task_id:id,is_active:act}); bauLoad();
+}
+$('bt_save').onclick=async()=>{
+  const body={task_id:$('bt_id').value?parseInt($('bt_id').value):null,
+    task_name:$('bt_name').value, sched_time:$('bt_time').value||null,
+    category:$('bt_cat').value||null, notes:$('bt_notes').value||null,
+    sort_order:parseInt($('bt_sort').value)||100, is_active:true};
+  const [ok,j]=await post('/api/bau/task',body);
+  if(!ok||!j.ok){ setS('bstatus','ERROR: '+(j.error||'save failed'),'err'); return; }
+  $('bt_clear').click(); bauLoad();
+};
+$('bt_clear').onclick=()=>{ ['bt_id','bt_name','bt_time','bt_cat','bt_notes'].forEach(i=>$(i).value=''); $('bt_sort').value=100; };
+$('bload').onclick=bauLoad;
+$('bdate').onchange=bauLoad;
+
+/* ---- tab: Trade Blotter (DB-only view of the separate blotter app) ---- */
+const BLOTTER_COLS = [   /* order mirrors the CB Trade Blotter app; kinds:
+   t text  n num  d date  b checkbox  e editable  h hedge(Done/Open/N-A)  s status */
+  ["status","Status","s"], ["trade_id","ID","n"], ["trade_date","Trade Date","d"],
+  ["client_side","Side","t"], ["isin","ISIN","t"], ["bond_name","Bond Name","t"],
+  ["bond_type","Bond Type","t"], ["bond_currency","Bond CCY","t"],
+  ["fx_rate","FX","n"], ["quantity","Quantity","n"], ["price","Price","n"],
+  ["client_name","Client","t"], ["client_type","Client Type","t"],
+  ["client_account","Client Acct","t"], ["sales","Sales","t"],
+  ["trade_type","Trade Type","t"], ["stock_ref","Stock Ref","n"],
+  ["fx_ref","FX Ref","n"], ["bond_fx_ref","Bond FX Ref","n"],
+  ["stock_quantity","Stock Qty","n"], ["delta","Delta","n"],
+  ["parity","Parity","n"], ["bond_usd_settlement","Bond FCS","b"],
+  ["stock_usd_settlement","Stock FCS","b"],
+  ["bond_settlement_ccy","Bond SetCcy","t"],
+  ["stock_settlement_ccy","Stock SetCcy","t"],
+  ["working_stock_instruction","WS Instruction","t"],
+  ["working_stock_start","WS Start","t"], ["working_stock_end","WS End","t"],
+  ["working_fx_instruction","FX Instr","t"], ["working_fx_time","FX Time","t"],
+  ["settlement_date","Settlement","d"], ["trader_agree","Trader Agree","t"],
+  ["booked","Booked","b"], ["internal_acct","Internal Acct","t"],
+  ["citi_give_up_stocks","Citi Give-up","b"],
+  ["other_comments","Comments","t"], ["cross_flag","Cross","b"],
+  ["cross_quantity","Cross Qty","n"], ["last_updated","Last Updated","t"],
+  ["updated_by","Updated","t"],
+  ["hedged_delta","Hedged \u0394","h"], ["hedged_fx","Hedged FX","h"],
+  ["hedged_vol","Hedged Vol","h"], ["hedged_credit","Hedged Credit","h"],
+  ["hedged_rates","Hedged Rates","h"]];
+const HEDGE_KEYS = ["hedged_delta","hedged_fx","hedged_vol","hedged_credit",
+                    "hedged_rates"];
+let blTimer=null, blEditable=[], blRows=[], blES=null, blPending=null;
+let blFilt={};                    /* per-column filters (session only) */
+const blEditing=()=>{ const a=document.activeElement;
+  return !!(a && ((a.dataset&&a.dataset.bf) || a.classList.contains("blf"))); };
+document.addEventListener("focusout",()=>{ setTimeout(()=>{
+  if(blPending && !blEditing()){ const p=blPending; blPending=null;
+    blApply(p,true); } }, 60); });
+const BLKEY="lagrange.blotter.layout";
+let blLay; try{ blLay=JSON.parse(localStorage.getItem(BLKEY))||{}; }
+catch(e){ blLay={}; }
+blLay.w = blLay.w||{}; blLay.sort = blLay.sort||{k:"trade_id",dir:-1};
+const blSave=()=>localStorage.setItem(BLKEY, JSON.stringify(blLay));
+const blEsc=v=>String(v??"").replace(/&/g,"&amp;").replace(/</g,"&lt;")
+  .replace(/"/g,"&quot;");
+const blNum=v=>{const n=Number(v);return v===""||isNaN(n)?blEsc(v)
+  :n.toLocaleString("en-US",{maximumFractionDigits:6});};
+const truthy=v=>v==="1"||v==="True"||v==="true";
+
+function blHeader(){
+  const sk=blLay.sort.k, sd=blLay.sort.dir;
+  $('bl_tbl').querySelector("thead").innerHTML = "<tr>" +
+    BLOTTER_COLS.map(([k,label],i)=>
+      `<th data-k="${k}"><span class="blh" onclick="blSort('${k}')">${label}` +
+      (k===sk ? (sd>0?" &#9650;":" &#9660;") : "") + `</span>` +
+      `<span class="blrz" data-i="${i}" data-k="${k}"` +
+      ` onmousedown="blRzDown(event,this)"></span></th>`).join("") + "</tr>" +
+    "<tr class=\"blfr\">" + BLOTTER_COLS.map(([k])=>
+      `<th class="blft"><input class="blf" data-fk="${k}" ` +
+      `value="${blEsc(blFilt[k]||"")}" oninput="blFiltChange(this)" ` +
+      `placeholder="&#8981;"></th>`).join("") + "</tr>";
+}
+function blFiltChange(el){
+  const v=el.value.trim();
+  if(v) blFilt[el.dataset.fk]=v; else delete blFilt[el.dataset.fk];
+  blApplyFilters();
+}
+function blApplyWidths(){
+  $('blcolstyle').textContent = Object.entries(blLay.w).map(([k,px])=>{
+    const i = BLOTTER_COLS.findIndex(c=>c[0]===k);
+    if(i<0) return "";
+    return `#bl_tbl th:nth-child(${i+1}),#bl_tbl td:nth-child(${i+1})` +
+      `{min-width:${px}px;max-width:${px}px;overflow:hidden;` +
+      `text-overflow:ellipsis}`;
+  }).join("\n");
+}
+let _rz=null;
+function blRzDown(e,el){
+  e.preventDefault(); e.stopPropagation();
+  const k=el.dataset.k;
+  _rz={k, x:e.clientX, w: blLay.w[k] ||
+       (el.parentElement.offsetWidth||100)};
+  document.onmousemove=ev=>{
+    if(!_rz) return;
+    blLay.w[_rz.k]=Math.max(40, _rz.w + (ev.clientX-_rz.x));
+    blApplyWidths();
+  };
+  document.onmouseup=()=>{ if(_rz){ blSave(); }
+    _rz=null; document.onmousemove=null; document.onmouseup=null; };
+}
+function blSort(k){
+  if(blLay.sort.k===k) blLay.sort.dir=-blLay.sort.dir;
+  else blLay.sort={k, dir:1};
+  blSave(); blRender();
+}
+function blStatus(row){
+  if(!truthy(row.booked))
+    return {cls:"bunb", cell:'<span class="dot dr"></span>UNBOOKED'};
+  if(HEDGE_KEYS.some(h=>row[h]==="Open"))
+    return {cls:"bdone bhedge", cell:'<span class="dot dy"></span>HEDGING'};
+  return {cls:"bdone", cell:'<span class="dot dg"></span>DONE'};
+}
+function blRender(){
+  blHeader(); blApplyWidths();
+  const {k,dir}=blLay.sort;
+  const kind=(BLOTTER_COLS.find(c=>c[0]===k)||[])[2];
+  const rows=[...blRows].sort((a,b)=>{
+    let x=a[k]??"", y=b[k]??"";
+    if(kind==="n"||k==="trade_id"){
+      x=Number(String(x).replace(/[, ]/g,""))||0;
+      y=Number(String(y).replace(/[, ]/g,""))||0;
+      return (x-y)*dir;
+    }
+    return String(x).localeCompare(String(y))*dir;
+  });
+  const body=rows.map(row=>{
+    const st=blStatus(row);
+    const searchable=(st.cell.replace(/<[^>]*>/g,"")+" "+
+      BLOTTER_COLS.map(c=>row[c[0]]??"").join(" ")).toLowerCase();
+    return `<tr class="${st.cls}" data-id="${row.trade_id}" ` +
+      `data-tok="${blEsc(row._tok||"")}" data-s="${blEsc(searchable)}">` +
+      BLOTTER_COLS.map(([ck,_,ckind])=>{
+        const v=row[ck]??"";
+        const ed=blEditable.includes(ck);
+        const dk=`data-k="${ck}"`;
+        if(ckind==="s") return `<td ${dk} class="bst">${st.cell}</td>`;
+        if(ckind==="b") return `<td ${dk} class="bck${ed?" bce":""}">${truthy(v)
+          ?'<span class="cb on">&#10003;</span>':'<span class="cb"></span>'}</td>`;
+        if(ckind==="h"){
+          const cls = v==="Done"?"hd":(v==="Open"?"ho":"bna");
+          return `<td ${dk} class="${cls}${ed?" bce":""}">${v===""?"N/A":blEsc(v)}</td>`;
+        }
+        if(ckind==="n") return `<td ${dk} class="bnum${ed?" bce":""}">${blNum(v)}</td>`;
+        return `<td ${dk} class="${ed?"bce":""}">${blEsc(v)}</td>`;
+      }).join("")+"</tr>";
+  }).join("");
+  $('bl_tbl').querySelector("tbody").innerHTML=body;
+  blApplyFilters();
+  blSelApply();
+}
+const blCellText=td=>{ const i=td.querySelector("input");
+  return (i? i.value : td.textContent).toLowerCase(); };
+function blApplyFilters(){
+  const q=($('bl_q').value||"").trim().toLowerCase();
+  const act=Object.entries(blFilt).map(([k,v])=>
+    [BLOTTER_COLS.findIndex(c=>c[0]===k), v.toLowerCase()])
+    .filter(([i])=>i>=0);
+  document.querySelectorAll("#bl_tbl tbody tr").forEach(tr=>{
+    let vis = !q || tr.dataset.s.includes(q);
+    if(vis && act.length){
+      const tds=tr.children;
+      vis = act.every(([i,v])=>blCellText(tds[i]).includes(v));
+    }
+    tr.style.display = vis ? "" : "none";
+  });
+}
+function blotterInit(){
+  const today=new Date().toISOString().slice(0,10);
+  if(!$('bl_from').value){$('bl_from').value=today;$('bl_to').value=today;}
+  if(!$('bl_user').value)
+    $('bl_user').value=localStorage.getItem("lagrange.user")||"";
+}
+async function blotterLoad(quiet){
+  blotterInit();
+  try{
+    const q=new URLSearchParams({dfrom:$('bl_from').value,dto:$('bl_to').value,
+      ticker:$('bl_ticker').value.trim(),ttype:$('bl_type').value});
+    const r=await fetch('/api/blotter/list?'+q); const j=await r.json();
+    if(!j.ok){setS('bl_status','ERROR: '+j.error,'err');return;}
+    blApply(j, quiet);
+    if(blES) blLiveStart(true);            // filters may have changed
+    if(blTimer) clearInterval(blTimer);
+    blTimer=setInterval(()=>{
+      if(blES) return;                     // live stream owns refresh
+      if(blEditing()) return;              // user mid-edit
+      if(window.curTab==='blotter') blotterLoad(true);
+    },30000);
+  }catch(e){ setS('bl_status','ERROR: '+e,'err'); }
 }
 
-function quoteRows(mode){   // 'vs' | 'bid' | 'ask'
-  const rows = rowSel.size ? [...rowSel].sort((a,b)=>a-b) : [];
-  if(!rows.length){
-    setStatus('<span class="err">Select rows first (tick the checkboxes), then quote.</span>');
+function blApply(j, quiet){
+  blEditable=j.editable||[]; blRows=j.rows||[];
+  const sel=$('bl_type'), cur=sel.value;
+  sel.innerHTML='<option value="">all types</option>'+
+    (j.types||[]).map(t=>`<option${t===cur?" selected":""}>${blEsc(t)}</option>`).join("");
+  blRender();
+  $('bl_meta').textContent=blRows.length+" trades"+(blES?" \u00b7 live":"");
+  $('bl_meta').title='unresolved logical: '+(j.missing||[]).join(', ')+
+    String.fromCharCode(10)+'table columns not yet mapped: '+
+    (j.unmapped||[]).join(', ');
+  if(!quiet) setS('bl_status','Loaded '+blRows.length+
+    ' trades. Click headers to sort, drag edges to resize (saved), '+
+    'filter per column below the headers. Only Comments / Trader Agree '+
+    'editable.','ok');
+}
+
+function blLiveParams(){
+  return new URLSearchParams({dfrom:$('bl_from').value,dto:$('bl_to').value,
+    ticker:$('bl_ticker').value.trim(),ttype:$('bl_type').value}).toString();
+}
+function blLiveStart(restart){
+  if(blES){ try{blES.close();}catch(e){} blES=null; }
+  blES = new EventSource('/api/blotter/stream?'+blLiveParams());
+  blES.addEventListener('rows', ev=>{
+    let j; try{ j=JSON.parse(ev.data); }catch(e){ return; }
+    blEditable=j.editable||[];
+    blMerge(j.rows||[]);
+    $('bl_meta').textContent=(j.rows||[]).length+" trades \u00b7 live";
+  });
+  blES.addEventListener('err', ev=>{
+    try{ setS('bl_status','stream: '+JSON.parse(ev.data).error,'err'); }
+    catch(e){}
+  });
+  blES.onerror = ()=>setS('bl_status',
+    'live stream interrupted - reconnecting ...','err');
+  $('bl_live').textContent='\u25cf live: on';
+  $('bl_live').classList.add('liveon');
+  if(!restart) setS('bl_status',
+    'LIVE - pushes within ~2s of any blotter change (edits, new trades, '+
+    'deletes). Toggle again to stop.','ok');
+}
+function blLiveStop(){
+  if(blES){ try{blES.close();}catch(e){} blES=null; }
+  $('bl_live').textContent='\u25cf live: off';
+  $('bl_live').classList.remove('liveon');
+  setS('bl_status','Live off - back to manual Load / 30s refresh.','ok');
+}
+$('bl_live').onclick=()=>{ blES ? blLiveStop() : blLiveStart(false); };
+/* ---- excel-style editing: selection model, optimistic commits, ---- */
+/* ---- surgical cell patches (no full re-renders on edit/push)    ---- */
+const BL_CYCLE = { client_side:["BUY","SELL"],
+  hedged_delta:["N/A","Open","Done"], hedged_fx:["N/A","Open","Done"],
+  hedged_vol:["N/A","Open","Done"], hedged_credit:["N/A","Open","Done"],
+  hedged_rates:["N/A","Open","Done"] };
+const blKind=k=>(BLOTTER_COLS.find(c=>c[0]===k)||[])[2];
+const blRow=id=>blRows.find(x=>String(x.trade_id)===String(id));
+const blTd=(id,k)=>document.querySelector(
+  `#bl_tbl tr[data-id="${id}"] td[data-k="${k}"]`);
+const BL_COLKEYS = BLOTTER_COLS.map(c=>c[0]);
+let blSel=null;                       /* {id,k} selected cell */
+let blQ={};                           /* per-row promise queues */
+
+function blCellHTML(row, ck, ckind, st){
+  const v=row[ck]??"";
+  if(ckind==="s") return st.cell;
+  if(ckind==="b") return truthy(v)
+    ?'<span class="cb on">&#10003;</span>':'<span class="cb"></span>';
+  if(ckind==="h") return v===""?"N/A":blEsc(v);
+  if(ckind==="n") return blNum(v);
+  return blEsc(v);
+}
+function blCellCls(row, ck, ckind, ed){
+  if(ckind==="s") return "bst";
+  if(ckind==="b") return "bck"+(ed?" bce":"");
+  if(ckind==="h") return (row[ck]==="Done"?"hd":(row[ck]==="Open"?"ho":"bna"))
+                  +(ed?" bce":"");
+  if(ckind==="n") return "bnum"+(ed?" bce":"");
+  return ed?"bce":"";
+}
+function blPatchRow(row){
+  const tr=document.querySelector(`#bl_tbl tr[data-id="${row.trade_id}"]`);
+  if(!tr) return false;
+  const st=blStatus(row);
+  tr.className=st.cls; tr.dataset.tok=row._tok||"";
+  tr.dataset.s=(st.cell.replace(/<[^>]*>/g,"")+" "+
+    BLOTTER_COLS.map(c=>row[c[0]]??"").join(" ")).toLowerCase();
+  BLOTTER_COLS.forEach(([ck,_,ckind],i)=>{
+    const td=tr.children[i];
+    if(!td || td.querySelector("input")) return;    // never touch open editor
+    if(td.classList.contains("pend")) return;       // optimistic in flight
+    const ed=blEditable.includes(ck);
+    const html=blCellHTML(row,ck,ckind,st);
+    if(td.innerHTML!==html) td.innerHTML=html;
+    const cls=blCellCls(row,ck,ckind,ed);
+    if(td.className.replace(" selcell","")!==cls)
+      td.className=cls+(blSel&&blSel.id==String(row.trade_id)&&blSel.k===ck
+                        ?" selcell":"");
+  });
+  return true;
+}
+function blMerge(newRows){
+  const oldIds=new Set(blRows.map(r=>String(r.trade_id)));
+  const newIds=new Set(newRows.map(r=>String(r.trade_id)));
+  const structural=oldIds.size!==newIds.size ||
+    [...newIds].some(id=>!oldIds.has(id));
+  const oldBy={}; blRows.forEach(r=>oldBy[String(r.trade_id)]=r);
+  blRows=newRows;
+  if(structural){ blRender(); blSelApply(); return; }
+  newRows.forEach(r=>{
+    const o=oldBy[String(r.trade_id)];
+    if(!o || o._tok!==r._tok ||
+       BL_COLKEYS.some(k=>(o[k]??"")!==(r[k]??""))) blPatchRow(r);
+  });
+  blApplyFilters();
+}
+function blSelApply(){
+  document.querySelectorAll("#bl_tbl td.selcell")
+    .forEach(td=>td.classList.remove("selcell"));
+  if(!blSel) return;
+  const td=blTd(blSel.id, blSel.k);
+  if(td){ td.classList.add("selcell");
+    if(td.scrollIntoView) td.scrollIntoView({block:"nearest",inline:"nearest"}); }
+}
+function blSelect(id,k){ blSel={id:String(id),k}; blSelApply(); }
+function blVisibleTrs(){
+  return [...document.querySelectorAll("#bl_tbl tbody tr")]
+    .filter(t=>t.style.display!=="none");
+}
+function blMoveSel(dr,dc){
+  if(!blSel) return;
+  const trs=blVisibleTrs();
+  const ri=trs.findIndex(t=>t.dataset.id===blSel.id);
+  const ci=BL_COLKEYS.indexOf(blSel.k);
+  const nr=Math.min(Math.max(ri+dr,0),trs.length-1);
+  const nc=Math.min(Math.max(ci+dc,0),BL_COLKEYS.length-1);
+  if(nr>=0 && trs[nr]) blSelect(trs[nr].dataset.id, BL_COLKEYS[nc]);
+}
+function blQueue(id, fieldsObj, before){
+  blQ[id]=(blQ[id]||Promise.resolve()).then(()=>blSend(id,fieldsObj,before))
+    .catch(()=>{});
+}
+async function blSend(id, fieldsObj, before){
+  const tr=document.querySelector(`#bl_tbl tr[data-id="${id}"]`);
+  const user=($('bl_user').value.trim()||"lagrange");
+  localStorage.setItem("lagrange.user",user);
+  try{
+    const r=await fetch('/api/blotter/edit',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({trade_id:+id, fields:fieldsObj,
+        token:tr?tr.dataset.tok:"", user})});
+    const j=await r.json();
+    const row=blRow(id);
+    Object.keys(fieldsObj).forEach(k=>{
+      const td=blTd(id,k); if(td) td.classList.remove("pend");
+    });
+    if(j.ok && j.nochange){
+      if(row && before) Object.assign(row,before), blPatchRow(row);
+      return;
+    }
+    if(j.ok){
+      if(row){ Object.assign(row, j.changes); row._tok=j.token; blPatchRow(row); }
+      const n=Object.keys(j.changes||{}).length,
+            m=Object.keys(fieldsObj).length;
+      setS('bl_status','Saved '+Object.keys(fieldsObj).join(", ")+
+        (n>m?' (+'+(n-m)+' auto-filled)':'')+
+        (j.via==="blotter-app"?' \u00b7 blotter screens updated live':' \u00b7 direct DB')
+        +'.','ok');
+    } else {
+      if(row && before){ Object.assign(row,before); blPatchRow(row);
+        const td=blTd(id,Object.keys(fieldsObj)[0]);
+        if(td){ td.classList.add("bederr");
+          setTimeout(()=>td.classList.remove("bederr"),900); } }
+      setS('bl_status', j.error, 'err');
+      if(r.status===409) blotterLoad(true);
+    }
+  }catch(e){ setS('bl_status','ERROR: '+e,'err'); }
+}
+function blCommitOptimistic(id, k, v){
+  const row=blRow(id); if(!row) return;
+  const before={[k]:row[k], _tok:row._tok};
+  row[k]=v;
+  blPatchRow(row);
+  const td=blTd(id,k); if(td) td.classList.add("pend");
+  blQueue(id, {[k]:v}, before);
+}
+function blOpenEd(td, seed){
+  if(!td || td.querySelector("input")) return;
+  const tr=td.closest("tr"), id=tr.dataset.id, k=td.dataset.k;
+  const row=blRow(id); if(!row) return;
+  const raw=row[k]??"";
+  td.classList.add("bed");
+  td.innerHTML=`<input data-bf="${k}" data-id="${id}">`;
+  const inp=td.querySelector("input");
+  inp.value = (seed!==undefined ? seed : raw);
+  inp.focus();
+  if(seed===undefined && inp.select) inp.select();
+  let doneFlag=false;
+  const close=()=>{ doneFlag=true; td.classList.remove("bed");
+    const st=blStatus(row);
+    td.innerHTML=blCellHTML(row,k,blKind(k),st);
+    td.className=blCellCls(row,k,blKind(k),blEditable.includes(k)); };
+  const commit=(mv)=>{
+    if(doneFlag) return; doneFlag=true;
+    let v=inp.value;
+    if(blKind(k)==="n") v=v.replace(/[,\s]/g,"");
+    td.classList.remove("bed");
+    if(String(v)!==String(raw)){
+      row[k]=v; const st=blStatus(row);
+      td.innerHTML=blCellHTML(row,k,blKind(k),st);
+      td.className=blCellCls(row,k,blKind(k),true)+" pend";
+      blQueue(id,{[k]:v},{[k]:raw,_tok:row._tok});
+    } else close();
+    if(mv) blMoveSel(mv[0],mv[1]);
+  };
+  inp.onkeydown=ev=>{
+    ev.stopPropagation();
+    if(ev.key==="Enter"){ ev.preventDefault(); commit([1,0]); }
+    else if(ev.key==="Tab"){ ev.preventDefault(); commit([0,ev.shiftKey?-1:1]); }
+    else if(ev.key==="Escape"){ close(); blSelApply(); }
+  };
+  inp.onblur=()=>setTimeout(()=>{ if(!doneFlag) commit(null); },40);
+}
+function blActivate(td, seed){
+  const k=td.dataset.k, id=td.closest("tr").dataset.id;
+  if(!blEditable.includes(k)) return;
+  const row=blRow(id); if(!row) return;
+  if(blKind(k)==="b"){
+    blCommitOptimistic(id,k, truthy(row[k])?"0":"1"); return;
+  }
+  if(k in BL_CYCLE){
+    const arr=BL_CYCLE[k], cur=(row[k]||arr[0]);
+    blCommitOptimistic(id,k, arr[(arr.indexOf(cur)+1)%arr.length]); return;
+  }
+  blOpenEd(td, seed);
+}
+function blCellClick(ev){
+  const td=ev.target.closest("td[data-k]");
+  if(!td || td.querySelector("input")) return;
+  const id=td.closest("tr").dataset.id, k=td.dataset.k;
+  const was=blSel && blSel.id===id && blSel.k===k;
+  blSelect(id,k);
+  if(was || blKind(k)==="b" || k in BL_CYCLE) blActivate(td);
+}
+document.addEventListener("keydown",ev=>{
+  if(window.curTab!=="blotter" || !blSel) return;
+  const ae=document.activeElement;
+  if(ae && ae.tagName==="INPUT") return;         // filters / editors own keys
+  const td=blTd(blSel.id, blSel.k);
+  if(!td) return;
+  if(ev.key==="ArrowDown"){ ev.preventDefault(); blMoveSel(1,0); }
+  else if(ev.key==="ArrowUp"){ ev.preventDefault(); blMoveSel(-1,0); }
+  else if(ev.key==="ArrowRight"){ ev.preventDefault(); blMoveSel(0,1); }
+  else if(ev.key==="ArrowLeft"){ ev.preventDefault(); blMoveSel(0,-1); }
+  else if(ev.key==="Enter"||ev.key==="F2"){ ev.preventDefault(); blActivate(td); }
+  else if(ev.key===" "&&(blKind(blSel.k)==="b"||blSel.k in BL_CYCLE)){
+    ev.preventDefault(); blActivate(td); }
+  else if(ev.key.length===1 && !ev.ctrlKey && !ev.metaKey
+          && blEditable.includes(blSel.k)
+          && blKind(blSel.k)!=="b" && !(blSel.k in BL_CYCLE)){
+    ev.preventDefault(); blActivate(td, ev.key);  // type-to-edit, excel style
+  }
+});
+$('bl_tbl').addEventListener("click", blCellClick);
+$('bl_load').onclick=()=>blotterLoad();
+$('bl_q').oninput=blApplyFilters;
+$('bl_reset').onclick=()=>{ blLay={w:{},sort:{k:"trade_id",dir:-1}};
+  blSave(); blRender();
+  setS('bl_status','Layout reset (widths + sort).','ok'); };
+
+/* ---- tab: RFQ Station (runs-format lines; upload comes later) ---- */
+const RFQ_COLS = [
+  ["status","Status"], ["refresh","Refresh"], ["imp_act","Improve"], ["hit","Hit"],
+  ["hist","H"], ["copy","\u29c9"],
+  ["rfq_id","ID"], ["trade_date","Date"],
+  ["isin","ISIN"], ["short_name","Security"],
+  ["style","Type"], ["sides","Side"], ["ord","Ord"],
+  ["ord_lb","Bid Lvl"], ["ord_la","Ask Lvl"],
+  ["qty","Qty"],
+  ["eff_vs","Vs"], ["eff_fx","Fx"], ["delta","Delta"],
+  ["client","Client"],
+  ["bid_px","Bid"], ["ask_px","Ask"],
+  ["stock_ref","OvdSpot"], ["fx_ref","OvdFx"], ["q_delta","Delta"],
+  ["nk_xb","XBid"], ["orb","orBs"], ["ora","orAs"],
+  ["nk_xa","XAsk"], ["nk_x","X"],
+  ["vs_usd","Vs$"],
+  ["live_bid","LBid"], ["live_ask","LAsk"],
+  ["live_spot","LVs"], ["live_und","LFx"], ["live_delta","Delta"],
+  ["live_qty","LQty"],
+  ["tol","Tol"],
+  ["diff_bid","dBid"], ["diff_ask","dAsk"],
+  ["flag","Drift"], ["ack","Ack"],
+  ["q_act","Q"], ["off_act","\u2298"], ["lv_act","L"], ["mt_act","Match"],
+  ["cx_act","\u2715"], ["ap_act","Algos"],
+  ["notes","Notes"], ["updated_by","By"]];
+const RFQ_COL_TOGGLE=[["trade_date","Date"],["isin","ISIN"],
+  ["eff_vs","Vs"],["eff_fx","Fx"],["delta","Delta"],["vs_usd","Vs$"],["nk_xb","XBid"],["orb","orBs"],["ora","orAs"],["nk_xa","XAsk"],["nk_x","X"],
+  ["live_bid","LBid"],["live_ask","LAsk"],["live_spot","LVs"],
+  ["live_und","LFx"],["live_qty","LQty"],["diff_bid","dBid"],
+  ["diff_ask","dAsk"],["tol","Tol"],["ord","Lvl"],["hist","H"],["copy","Copy"],
+  ["q_act","Q"],["off_act","Off"],["lv_act","Live"],
+  ["cx_act","Cxl"],["ap_act","Auto"],["notes","Notes"],["updated_by","By"]];
+const RFQ_GROUPS={status:"T",refresh:"T",hit:"T",hist:"T",ord:"T",
+  copy:"T",rfq_id:"T",
+  trade_date:"T",sides:"T",isin:"T",short_name:"T",style:"T",
+  qty:"T",eff_vs:"T",eff_fx:"T",client:"T",
+  bid_px:"Q",ask_px:"Q",stock_ref:"Q",fx_ref:"Q",vs_usd:"Q",
+  delta:"T",imp_act:"T",mt_act:"X",ord_lb:"T",ord_la:"T",q_delta:"Q",live_delta:"M",pd_bid:"Q",db1:"Q",db1s:"Q",db2:"Q",db2s:"Q",da1:"Q",da1s:"Q",da2:"Q",da2s:"Q",nk_xb:"Q",orb:"Q",ora:"Q",nk_xa:"Q",nk_x:"Q",pd_ask:"M",
+  live_bid:"M",live_ask:"M",live_spot:"M",live_und:"M",
+  live_qty:"M",
+  tol:"C",diff_bid:"C",diff_ask:"C",flag:"C",
+  ack:"X",q_act:"X",off_act:"X",lv_act:"X",cx_act:"X",ap_act:"X",
+  notes:"F",updated_by:"F"};
+const RFQ_GROUP_LAB={T:"ticket",Q:"QUOTE",
+  M:"model \u00b7 live",C:"check",X:"trader ctrl",F:"notes"};
+const RFQ_CFG_KEY="lagrange.cfg";
+const RFQ_CFG_DEF={density:"compact",font:"m",
+  cols:{isin:false,vs_usd:false},colfmt:{}};
+function rfqLoadCfg(){
+  try{
+    const j=JSON.parse(localStorage.getItem(RFQ_CFG_KEY)||"{}");
+    return {density:j.density||RFQ_CFG_DEF.density,
+      font:j.font||RFQ_CFG_DEF.font,
+      cols:Object.assign({},RFQ_CFG_DEF.cols,j.cols||{}),
+      colfmt:j.colfmt||{}};
+  }catch(e){
+    return JSON.parse(JSON.stringify(RFQ_CFG_DEF));
+  }
+}
+let RFQ_CFG=rfqLoadCfg();
+let _prefT=null;
+function prefPush(k,v){
+  clearTimeout(_prefT);
+  _prefT=setTimeout(()=>{
+    fetch('/api/pref',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({key:k,val:v})}).catch(()=>{});
+  },600);
+}
+function rfqSaveCfg(){
+  const s=JSON.stringify(RFQ_CFG);
+  localStorage.setItem(RFQ_CFG_KEY,s);
+  prefPush(RFQ_CFG_KEY,s);
+}
+function rfqColVis(k){
+  const c=RFQ_CFG.cols; return (k in c)?c[k]!==false:true;
+}
+function rfqVisCols(){
+  return RFQ_COLS.filter(([k])=>rfqColVis(k));
+}
+function rfqApplyColFmt(){
+  const vis=rfqVisCols(); let css="";
+  vis.forEach(([k],i)=>{
+    const f=(RFQ_CFG.colfmt||{})[k]; if(!f) return;
+    const th=`#rfq_tbl thead tr:last-child th:nth-child(${i+1})`;
+    const td=`#rfq_tbl tbody td:nth-child(${i+1})`;
+    if(f.w) css+=`${th},${td}{width:${f.w}px;min-width:${f.w}px}\n`+
+      `${td} input{width:${Math.max(20,f.w-14)}px}\n`;
+    const d=[];
+    if(f.fg) d.push("color:"+f.fg);
+    if(f.bg) d.push("background:"+f.bg+" !important");
+    if(f.bold) d.push("font-weight:700");
+    if(d.length) css+=`${td}{${d.join(";")}}\n`;
+  });
+  $('rfq_colcss').textContent=css;
+}
+function rfqApplyCfg(){
+  const t=$('rfq_tbl');
+  t.classList.toggle("den-c",RFQ_CFG.density==="compact");
+  t.classList.toggle("fs-s",RFQ_CFG.font==="s");
+  t.classList.toggle("fs-l",RFQ_CFG.font==="l");
+}
+const RFQ_EDIT_TXT = ["isin","qty","client","notes","trade_date"];
+const RFQ_STYLE_OPTS = [["outright","outright"],["vs","versus"],
+                        ["working","working stock"]];
+const RFQ_SIDE_OPTS = [["two_way","both"],["bid","bid"],
+                       ["ask","offer"]];
+const RFQ_NUM = ["qty","stock_ref","fx_ref","delta","tol","ord_level","ord_level2","req_vs","req_fx","q_delta","db1","db1s","db2","db2s","da1","da1s","da2","da2s"];
+let rfqRows=[], rfqTimer=null, rfqFilt="nocxl", rfqSig="";
+const RFQ_SEL=new Set();
+let rhId=null, rhSig="";
+let RFQ_SECMAP={};
+const rfqStCls={REQUESTED:"rq-open",QUOTED:"rq-quoted",
+                WORKING:"rq-work",HIT:"rq-hit",DONE:"rq-done",
+                CANCELLED:"rq-cxl"};
+const rqF=v=>parseFloat(String(v??"").replace(/,/g,""));
+const rqN=v=>{
+  if(v===""||v==null) return "";
+  const n=Number(String(v).replace(/,/g,""));
+  if(!isFinite(n)) return String(v);
+  return n.toLocaleString("en-US",{maximumFractionDigits:6});
+};
+const rqG=v=>{ const n=rqF(v); return isFinite(n)?String(+n.toFixed(4)):""; };
+const rqBA=v=>{ const n=rqF(v); if(!isFinite(n)) return "";
+  return (Math.round(n/0.05)*0.05).toFixed(2); };
+const rqQty=v=>{ const n=rqF(v);
+  return isFinite(n)?Math.round(n).toLocaleString("en-US"):""; };
+const effS=r=>{ const o=rqF(r.stock_ref);
+  return isFinite(o)?o:rqF(r.live_spot); };
+const effF=r=>{ const o=rqF(r.fx_ref);
+  return isFinite(o)?o:rqF(r.live_und); };
+const effD=r=>{ const o=rqF(r.delta);
+  return isFinite(o)?o:rqF(r.live_delta); };
+function rfqUser(){
+  return AUTH.user||($('bl_user')&&$('bl_user').value.trim())||
+    localStorage.getItem("lagrange.user")||"lagrange";
+}
+function rfqStatusPath(row){
+  return row.style==="working"
+    ? ["REQUESTED","QUOTED","WORKING","HIT","DONE","CANCELLED"]
+    : ["REQUESTED","QUOTED","HIT","DONE","CANCELLED"];
+}
+function rfqActive(r){
+  return ["REQUESTED","QUOTED","WORKING","IMPROVE"].includes(r.status);
+}
+function rfqOpen(r){
+  return rfqActive(r) || r.status==="HIT"; // dealt, awaiting ack
+}
+function rfqFieldPass(r){
+  const f=$('rf_f_from')&&$('rf_f_from').value;
+  const t=$('rf_f_to')&&$('rf_f_to').value;
+  const d=(r.trade_date||"").slice(0,10);
+  if(f&&(!d||d<f)) return false;
+  if(t&&(!d||d>t)) return false;
+  const q=($('rf_f_txt')&&$('rf_f_txt').value.trim().toUpperCase())||"";
+  if(q && !((r.isin||"").toUpperCase().includes(q)||
+            (r.short_name||"").toUpperCase().includes(q)||
+            (r.client||"").toUpperCase().includes(q)))
+    return false;
+  const ty=($('rf_f_type')&&$('rf_f_type').value)||"";
+  if(ty && r.style!==ty) return false;
+  return true;
+}
+function rfqShown(){
+  return rfqRows.filter(r=> (rfqFilt==="all" ? true
+    : rfqFilt==="nocxl" ? r.status!=="CANCELLED"
+    : rfqFilt==="done" ? r.status==="DONE" : rfqOpen(r))
+    && rfqFieldPass(r));
+}
+function rfqQuoteStr(r){
+  // Nuke-station copy grammar, adapted per style + requested side:
+  //  versus  two-way: NAME b / a vs S fx F Dd
+  //  versus  bid:     NAME b bid vs S fx F Dd
+  //  versus  offer:   NAME vs S fx F Dd a offer
+  //  outright two-way: NAME b / a ref S fx F
+  //  outright bid:     NAME b bid ref S fx F
+  //  outright offer:   NAME ref S fx F a offer
+  const nm=r.short_name||("#"+r.rfq_id);
+  const b=rqBA(r.bid_px!==""?r.bid_px:r.calc_bid);
+  const a=rqBA(r.ask_px!==""?r.ask_px:r.calc_ask);
+  const sE=effS(r); const s=isFinite(sE)?String(+sE.toFixed(4)):"";
+  const fE=effF(r); const f=isFinite(fE)?fE.toFixed(4):"";
+  const dE=effD(r);
+  const d=isFinite(dE)?" "+Math.round(dE)+"d":"";
+  const refs=(r.style==="outright"
+    ?((s?" ref "+s:"")+(f?" fx "+f:"")+d)
+    :((s?" vs "+s:"")+(f?" fx "+f:"")+d));
+  const askOnly=r.sides==="ask"||r.sides==="offer";
+  let q;
+  if(askOnly){
+    q = a ? nm+refs+" "+a+" offer" : nm+" no offer";
+  } else if(r.sides==="bid"){
+    q = b ? nm+" "+b+" bid"+refs : nm+" no bid";
+  } else {
+    if(!(b||a)) return nm+" (no px yet)";
+    q = nm+" "+(b||"?")+" / "+(a||"?")+refs;
+  }
+  if(r.style==="working") q+=" working stock";
+  return q.replace(/ +/g," ").trim();
+}
+async function rfqCopy(txt){
+  try{ await navigator.clipboard.writeText(txt); return true; }
+  catch(e){
+    const ta=document.createElement("textarea");
+    ta.style.position="fixed"; ta.style.left="-9999px"; ta.value=txt;
+    document.body.appendChild(ta); ta.select();
+    let ok=false; try{ ok=document.execCommand("copy"); }catch(_){}
+    ta.remove(); return ok;
+  }
+}
+function rfqSelHtml(field, v, opts, cls){
+  return `<select class="rq-sel${cls?" "+cls:""}" data-rs="${field}" onchange="rfqSel(this)">`+
+    opts.map(([val,lab])=>`<option value="${val}"${val===String(v)?" selected":""}>${lab}</option>`).join("")+
+    `</select>`;
+}
+async function rfqSel(sel){
+  const tr=sel.closest("tr");
+  const j=await rfqEditSend(tr.dataset.id, sel.dataset.rs, sel.value,
+                            tr.dataset.tok);
+  if(j.ok){ tr.dataset.tok=j.token;
+    const row=rfqRows.find(x=>x.rfq_id===tr.dataset.id);
+    if(row){ row[sel.dataset.rs]=j.value; row._tok=j.token; }
+    setS('rf_status','Saved '+sel.dataset.rs+' on RFQ '+tr.dataset.id+'.','ok');
+    rfqRender(); }
+  else{ setS('rf_status',j.error,'err'); rfqLoad(true); }
+}
+function rfqApplyGroupCss(){
+  const vis=rfqVisCols(); let css="";
+  vis.forEach(([k],i)=>{
+    const g=RFQ_GROUPS[k]||"T";
+    if(i>0 && (RFQ_GROUPS[vis[i-1][0]]||"T")!==g)
+      css+=`#rfq_tbl tbody td:nth-child(${i+1}){border-left:1px solid var(--border2) !important}\n`;
+  });
+  $('rfq_grpcss').textContent=css;
+}
+function rfqHeader(){
+  const vis=rfqVisCols();
+  let bands=[], cur=null;
+  vis.forEach(([k])=>{
+    const g=RFQ_GROUPS[k]||"T";
+    if(cur&&cur.g===g) cur.n++;
+    else { cur={g,n:1}; bands.push(cur); }
+  });
+  const bandTr="<tr>"+bands.map((b,i)=>
+    `<th class="rq-band bd-${b.g}${i>0?" gsep":""}" colspan="${b.n}">${RFQ_GROUP_LAB[b.g]}</th>`).join("")+"</tr>";
+  const colTr="<tr>"+vis.map(([k,l],i)=>
+    `<th class="g-${RFQ_GROUPS[k]||"T"}${(i>0&&(RFQ_GROUPS[vis[i-1][0]]||"T")!==(RFQ_GROUPS[k]||"T"))?" gsep":""}">${l}</th>`).join("")+"</tr>";
+  $('rfq_tbl').querySelector("thead").innerHTML=bandTr+colTr;
+  rfqApplyGroupCss();
+  rfqApplyColFmt();
+}
+let _rfqPtr=0;
+document.addEventListener('pointerdown',ev=>{
+  if(ev.target&&ev.target.closest&&ev.target.closest('#rfq_tbl')) _rfqPtr=Date.now();
+},true);
+function rfqRender(){
+  if(Date.now()-_rfqPtr<450){
+    window._rfqDefer=1;
+    setTimeout(()=>{ if(window._rfqDefer){window._rfqDefer=0; rfqRender(); } },500);
     return;
   }
-  const qesc = v => String(v ?? "").replace(/&/g,"&amp;").replace(/</g,"&lt;");
-  const lines = [];
-  for(const ri of rows){
-    const tr = trAt(ri); if(!tr) continue;
-    const txt = sel => { const el = tr.querySelector(sel);
-                         return el ? el.textContent.trim() : ""; };
-    const ivv = f => { const i = tr.querySelector(`input[data-f="${f}"]`);
-                       return i ? i.value.trim() : ""; };
-    const num = v => { const n = Number(String(v).replace(/[, ]/g, ""));
-                       return (v === "" || v == null || isNaN(n)) ? null : n; };
-    const name = (tr.querySelector('input[data-u="short_name"]') || {value:""})
-                   .value.trim()
-                 || txt("td.stick2") || String(tr.dataset.id);
-    const uxv = f => { const i = tr.querySelector(`input[data-u="${f}"]`);
-                       const n = parseFloat(i ? i.value : "");
-                       return isFinite(n) ? n : 0; };
-    const _ob = num(txt('td[data-c="ovdMktBid"]'));
-    const _oa = num(txt('td[data-c="ovdMktAsk"]'));
-    const bid = _ob == null ? null : _ob + uxv("x_bid") + uxv("x_both");
-    const ask = _oa == null ? null : _oa + uxv("x_ask") + uxv("x_both");
-    const spotN = num(ivv("ovdSpot")) ?? num(txt('td[data-c="nSpot"]'));
-    const fxN   = num(ivv("ovdUndFx")) ?? num(txt('td[data-c="nSpotFx"]'));
-    const dN    = num(txt('td[data-c="nDeltaPct"]').replace("%",""));
-    const usd   = num(txt('td[data-r="usd_qty_live"]')) ?? 0;
-    const uvv = f => { const i = tr.querySelector(`input[data-u="${f}"]`);
-                       return i ? i.value.trim() : ""; };
-    const sb = num(uvv("or_bid_sprd")) ?? 0;
-    const sa = num(uvv("or_ask_sprd")) ?? 0;
-    const p2 = v => v == null ? "?" : v.toFixed(2);
-    const spotS = spotN == null ? "?" : String(+spotN.toFixed(4));
-    const fxS   = fxN == null ? "?" : fxN.toFixed(4);
-    const dS    = dN == null ? "" : " " + Math.round(dN) + "d";
-    let q, priced = true;
-    if(mode === "or" || mode === "orbid" || mode === "orask"){
-      const ab = bid == null ? null : bid + sb;
-      const aa = ask == null ? null : ask + sa;
-      if(mode === "orask" && aa == null){ q = name + " no offer"; priced = false; }
-      else if(mode === "orask"){
-        q = name + " ref " + spotS + " fx " + fxS + " " + p2(aa) + " offer";
+  const ae=document.activeElement;
+  let keep=null;
+  if(ae&&ae.closest&&ae.closest('#rfq_tbl')&&
+     (ae.tagName==='INPUT'||ae.tagName==='SELECT')){
+    const tr=ae.closest('tr');
+    const key=ae.dataset.rf?('rf:'+ae.dataset.rf):
+      (ae.dataset.rs?('rs:'+ae.dataset.rs):null);
+    if(tr&&key) keep={id:tr.dataset.id,key,val:ae.value,
+      s:ae.selectionStart,e:ae.selectionEnd};
+  }
+  window._rfqDefer=0;
+  rfqHeader();
+  const shown=rfqShown();
+  $('rfq_tbl').querySelector("tbody").innerHTML = shown.map(row=>{
+    return `<tr data-id="${row.rfq_id}" data-tok="${blEsc(row._tok||"0")}"`+
+      ` class="${row.status==="DONE"?"bdone":row.status==="HIT"?"bnack":row.status==="WORKING"?((row.off_flag||String(row.adj_req||"")==="1")&&rfqActive(row)?"badj":"bwork"):row.status==="REQUESTED"?(row.off_flag&&rfqActive(row)?"badj":"breq"):row.status==="QUOTED"?"bqtd":row.status==="IMPROVE"?"bimp":row.status==="CANCELLED"?"bcxl":""}${(row.refresh_by&&rfqActive(row))?" brefr":""}${RFQ_SEL.has(String(row.rfq_id))?" rowsel":""}">`+
+      rfqVisCols().map(([k])=>{
+        const sales=AUTH.role==="sales"&&(AUTH.user||"")!=="jb33880";
+        const v=row[k]??"";
+        if(sales&&["orb","ora","live_bid","live_ask","live_spot","live_und","live_delta","pd_ask","nk_xb","nk_xa","nk_x"].includes(k))
+          return '<td class="rq-num" style="color:#c9c9c9" title="trader-only">\u2014</td>';
+        if(k==="status"){
+          const up=(v==="DONE"&&AUTH.role!=="sales")
+            ?' <span class="rq-up" data-up="1" title="stage for '+
+             'blotter upload (connection off)">&#8686;</span>':'';
+          const pend=!!(row.refresh_by&&rfqActive(row));
+          const adj=!pend&&row.off_flag&&(v==="REQUESTED"||v==="WORKING")&&
+            rfqActive(row);
+          const expd=!pend&&row.off_flag==="expired"&&
+            rfqActive(row);
+          const adjrq=!pend&&!adj&&!expd&&String(row.adj_req||"")==="1"&&rfqActive(row);
+          const ordreq=!pend&&!adj&&!adjrq&&row.ord_side&&
+            v==="REQUESTED";
+          const lab=pend?"REFRESH"
+            :expd?"EXPIRED"
+            :adj?"ADJUSTING"
+            :adjrq?"ADJ REQ"
+            :ordreq?"ORD REQ"
+            :(v==="HIT"&&row.hit)
+              ?"HIT "+String(row.hit).toUpperCase():String(v);
+          const scls=(rfqStCls[v]||"")+(pend?" rq-rfsh":"")+
+            (adj?" rq-adj":"");
+          return `<td class="rq-selc" `+
+            `title="RFQ #${blEsc(row.rfq_id)} \u00b7 status is driven by actions (Send / Q / Hit / ACK / REJ / \u2715)`+
+            `${row.ord_side?` \u00b7 WORKING ORDER: client ${row.ord_side==="buy"?"BUYS - improve the ASK":row.ord_side==="sell"?"SELLS - improve the BID":"two-way - work both"}${row.ord_level?" toward "+blEsc(rqG(row.ord_level)):""}${v==="REQUESTED"?" \u00b7 quote (Q) to start WORKING":""}`:""}`+
+            `${row.style==="working"?" \u00b7 working stock path":""}`+
+            `${pend?` \u00b7 REFRESH requested by ${blEsc(row.refresh_by)} at ${blEsc(row.refresh_at||"")} (underlying ${blEsc(v)}; Q / \u27f3 / \u2a2f answers it)`:""}`+
+            `${adj?` \u00b7 quote OFF ${row.off_flag==="auto"?"(model moved beyond Tol)":"by "+blEsc(row.off_by||"")} - trader is adjusting the price; Q re-quotes`:""}">`+
+            `<span class="rq-st ${scls}">${lab}</span>`+up+`</td>`;
+        }
+        if(k==="rfq_id")
+          return `<td class="rq-id" title="created ${blEsc(row.created_at||"")}`+
+            ` by ${blEsc(row.created_by||"")}">#${blEsc(v)}</td>`;
+        if(k==="trade_date")
+          return `<td class="bed" title="trade date (YYYY-MM-DD)">`+
+            `<input data-rf="trade_date" value="${blEsc(v)}" `+
+            `onchange="rfqEdit(this)"></td>`;
+        if(k==="sides")
+          return `<td class="rq-selc" title="what we show the client: `+
+            `bid / offer / both">`+
+            rfqSelHtml("sides", v, RFQ_SIDE_OPTS)+`</td>`;
+        if(k==="short_name")
+          return `<td title="sec ${blEsc(row.sec_id||"-")} \u00b7 ${blEsc(row.ric||"-")} \u00b7 ${blEsc(row.und_fx||"-")} \u00b7 ${blEsc(row.ccy||"-")}">${blEsc(v)}</td>`;
+        if(k==="style")
+          return `<td class="rq-selc" title="trade type">`+
+            rfqSelHtml("style", v, RFQ_STYLE_OPTS)+`</td>`;
+        if(k==="hit"){
+          if(sales&&!["QUOTED","WORKING"].includes(row.status))
+            return '<td class="rq-hitc"></td>';
+          const sd=String(row.sides||"two_way");
+          const canB=sd==="two_way"||sd==="bid";
+          const canA=sd==="two_way"||sd==="ask"||sd==="offer";
+          const mk=(s,lab,ttl)=>
+            `<b class="rq-hb${v===s?" on":""}" data-hit="${s}" `+
+            `title="${ttl}${v===s?" \u00b7 click again to clear":""}">${lab}</b>`;
+          return `<td class="rq-hitc">`+
+            (canB?mk("bid","B","hit bid \u00b7 client SOLD to us at our bid"):"")+
+            (canA?mk("ask","A","hit ask \u00b7 client BOUGHT from us at our ask"):"")+
+            `</td>`;
+        }
+        if(k==="eff_vs"||k==="eff_fx"){
+          const fld=k==="eff_vs"?"req_vs":"req_fx";
+          const typed=row[fld]??"";
+          const e=k==="eff_vs"?effS(row):effF(row);
+          const d=!isFinite(e)?"":(k==="eff_vs"?rqN(String(+e.toFixed(4)))
+                                              :e.toFixed(4));
+          if(!rfqActive(row))
+            return `<td class="rq-ref" title="ref on the quote `+
+              `(override wins, else live)">${blEsc(d)}</td>`;
+          return `<td class="bed" title="SALES-REQUESTED ref (the ticket) \u00b7 `+
+            `distinct from the trader\u2019s OvdSpot/OvdFx `+
+            `override \u00b7 prices the quote when no trader `+
+            `override stands \u00b7 ghost = effective ref now">`+
+            `<input data-rf="${fld}" style="width:64px" oninput="rqPrev(this)" `+
+            `value="${blEsc(rqG(typed))}" placeholder="${blEsc(d)}" `+
+            `onchange="rfqEdit(this)"></td>`;
+        }
+        if(k==="bid_px"||k==="ask_px"){
+          const calc=k==="bid_px"?row.calc_bid:row.calc_ask;
+          const nm=k==="bid_px"?"Bid":"Ask";
+          const side=k==="bid_px"?"bid":"ask";
+          if(v!==""){
+            const slip=k==="bid_px"?row.slip_bid:row.slip_ask;
+            const lt="standing "+nm+" \u00b7 rev "+(row.q_rev||"1")+(row.trace?" \u00b7 "+row.trace:"")+
+              " \u00b7 model now "+(rqBA(calc)||"-")+
+              (slip?(" \u00b7 slippage "+slip+" (+ve = favorable)"):"")+
+              " \u00b7 \u27f3 refresh this side, \u2a2f pull it, Q both";
+            const ch=(AUTH.role!=="sales")&&rfqActive(row)
+              ?`<span class="qc"><b class="qc-r" data-side="${side}" `+
+               `title="refresh ${side} to model">\u27f3</b>`+
+               `<b class="qc-x" data-side="${side}" `+
+               `title="pull ${side} (off the quote)">\u2a2f</b></span>`:"";
+            return `<td class="rq-q rq-qcell" title="${blEsc(lt)}">${ch}${rqBA(v)}</td>`;
+          }
+          if(k==="ask_px"){
+            const lq=parseFloat(String(row.live_qty||"").replace(/,/g,""));
+            if(isFinite(lq)&&lq===0)
+              return `<td class="rq-qd" title="LQty is 0 \u2014 no live quantity, ask suppressed"></td>`;
+          }
+          const lt="draft "+nm+" \u2014 model at your refs, not yet "+
+            "quoted to the client \u00b7 press Q to confirm rev 1";
+          return `<td class="rq-qd" title="${blEsc(lt)}">${rqBA(calc)}</td>`;
+        }
+        if(k==="stock_ref"||k==="fx_ref"){
+          const std=row.bid_px!==""||row.ask_px!=="";
+          const qref=k==="stock_ref"?row.q_spot:row.q_fx;
+          const lref=k==="stock_ref"?row.live_spot:row.live_und;
+          const ph=(std&&qref!==""&&qref!=null)?qref:lref;
+          const nm = k==="stock_ref"?"ovdSpot":"ovdUndFx";
+          const tt = nm+" override \u00b7 "+
+            ((std&&qref!==""&&qref!=null)
+              ?("refs behind standing quote rev "+
+                (row.q_rev||"1")+" ("+ph+") \u00b7 live now "+
+                (lref||"-"))
+              :("blank = live ("+(lref||"-")+")"))+
+            " \u00b7 type to PIN the model \u00b7 freezes when the client deals";
+          const dv=k==="fx_ref"
+            ?(v===""?"":rqF(v).toFixed(4)):rqN(rqG(v));
+          const dp=k==="fx_ref"
+            ?(ph===""?"":rqF(ph).toFixed(4)):rqN(ph||"");
+          const lc=(k==="stock_ref"&&AUTH.role!=="sales"&&
+            rfqActive(row)&&(row.live_spot||row.live_und))
+            ?`<span class="qc qr"><b class="qc-l" title="copy LiveVs / LiveFx into OvdSpot / OvdFx">\u2b05</b></span>`:"";
+          return `<td class="bed rq-qcell" title="${blEsc(tt)}">${lc}<input data-rf="${k}" `+
+            `value="${blEsc(dv)}" placeholder="${blEsc(dp||"\u2014")}" `+
+            `onchange="rfqEdit(this)"></td>`;
+        }
+        if(k==="delta"){
+          const tt = "delta % override \u00b7 blank = live nDelta% ("+
+            (row.live_delta||"-")+"%) \u00b7 prices the quote";
+          return `<td class="bed" title="${blEsc(tt)}"><input data-rf="delta" `+
+            `value="${blEsc(rqG(v))}" placeholder="" `+
+            `onchange="rfqEdit(this)" style="width:34px">%</td>`;
+        }
+        if(k==="vs_usd"){
+          const s=effS(row), f=effF(row);
+          const u=(isFinite(s)&&isFinite(f)&&f!==0)?(s/f).toFixed(2):"";
+          return `<td class="rq-ref" title="effective Vs / Fx">${u}</td>`;
+        }
+        if(k==="live_bid"||k==="live_ask")
+          return `<td class="rq-live" title="live model quote (0.05 grid) \u00b7 ${blEsc(row.live_ts||"")}">${rqBA(v)}</td>`;
+        if(k==="live_spot"||k==="live_und"){
+          const d=k==="live_und"
+            ?(v===""?"":rqF(v).toFixed(4)):rqN(rqG(v));
+          return `<td class="rq-live" title="live \u00b7 ${blEsc(row.live_ts||"")}">${blEsc(d)}</td>`;
+        }
+        if(k==="live_qty")
+          return `<td class="rq-qty" title="current position (eqrms)">${blEsc(rqN(v))}</td>`;
+        if(k==="diff_bid"||k==="diff_ask"){
+          const q=rqBA(k==="diff_bid"
+            ?(row.bid_px!==""?row.bid_px:row.calc_bid)
+            :(row.ask_px!==""?row.ask_px:row.calc_ask));
+          const l=rqBA(k==="diff_bid"?row.live_bid:row.live_ask);
+          let txt="", cls="rq-ref";
+          if(q!==""&&l!==""){
+            const d=+(q-l).toFixed(2);
+            txt=(d>0?"+":"")+d.toFixed(2);
+            if(d>0) cls+=" rq-dp"; else if(d<0) cls+=" rq-dn";
+          }
+          return `<td class="${cls}" title="quote minus live model `+
+            `(0.05 grid)">${txt}</td>`;
+        }
+        if(k==="qty")
+          return `<td class="bed" title="RFQ trade size"><input data-rf="qty" `+
+            `value="${blEsc(rqQty(v))}" onchange="rfqEdit(this)"></td>`;
+        if(k==="ack"){
+          if(row.status==="DONE"&&row.ack_by)
+            return `<td class="rq-ackd" title="confirmed DONE by ${blEsc(row.ack_by)} \u00b7 ${blEsc(row.ack_at||"")}">\u2713 ${blEsc(row.ack_by)}</td>`;
+          if(row.status==="HIT")
+            return AUTH.role==="sales"
+              ? `<td class="rq-ackn" title="client dealt - waiting for the trader to confirm"><span class="rq-await">awaiting</span></td>`
+              : `<td class="rq-ackn"><span class="rq-ab" title="confirm the dealt trade \u2192 books it DONE">ACK</span><span class="rq-rj" title="bust the hit \u2192 back to the standing quote">REJ</span></td>`;
+          if(row.status==="DONE")
+            return AUTH.role==="sales"
+              ? `<td class="rq-ackn"><span class="rq-await">awaiting</span></td>`
+              : `<td class="rq-ackn"><span class="rq-ab" title="confirm the dealt trade \u2192 books it DONE">ACK</span></td>`;
+          return `<td class="rq-na">\u2014</td>`;
+        }
+        if(k==="imp_act"){
+          if(!["QUOTED","WORKING"].includes(row.status))
+            return '<td class="rq-tbtn"></td>';
+          return `<td><button class="rq-adjb rq-impb" title="submit improve terms: fill the level(s) for the quoted side(s) first \u2014 missing cells go red">improve</button></td>`;
+        }
+        if(k==="mt_act"){
+          if(sales||!rfqActive(row))
+            return '<td class="rq-tbtn"></td>';
+          const has=(row.ord_level??"")!==""||(row.ord_level2??"")!=="";
+          return `<td>${has?`<button class="rq-mtb" title="match the sales improve terms: quote moves to the requested level(s)">match</button>`:""}</td>`;
+        }
+        if(k==="refresh"&&sales&&!["QUOTED","WORKING"].includes(row.status))
+          return '<td></td>';
+        if(k==="refresh"&&sales&&row.ord_side&&rfqActive(row)){
+          const on=String(row.adj_req||"")==="1";
+          return `<td><button class="rq-adjb${on?" on":""}" title="request the trader to adjust this working order">adj</button></td>`;
+        }
+        if(k==="refresh"){
+          if(!rfqActive(row))
+            return `<td class="rq-na">\u2014</td>`;
+          if(row.refresh_by)
+            return `<td class="rq-rfc"><span class="rq-rf rq-rfp" title="refresh requested by ${blEsc(row.refresh_by)} \u00b7 ${blEsc(row.refresh_at||"")} \u00b7 trader: Q / \u27f3 / \u2a2f clears it">\u27f3 ${blEsc(row.refresh_by)}</span></td>`;
+          return `<td class="rq-rfc"><span class="rq-rf" title="sales: ask the trader to refresh this quote">\u27f3 req</span></td>`;
+        }
+        if(k==="flag"){
+          let cd="";
+          if(row.status==="QUOTED"&&window._rfqTtl){
+            const t0=Date.parse((row.bid_at||row.ask_at||"")
+              .replace(" ","T"));
+            if(isFinite(t0)){
+              const rem=Math.max(0,window._rfqTtl-
+                (Date.now()-t0)/1000);
+              cd=" \u00b7 "+Math.floor(rem/60)+":"+
+                String(Math.floor(rem%60)).padStart(2,"0");
+            }
+          }
+          return `<td class="${blEsc(row.flag_cls||"")}" `+
+                 `title="${blEsc(row.flag_title||"")} \u00b7 quote expires after ${Math.round((window._rfqTtl||600)/60)}m; Q resets the clock">${blEsc(v)}${cd}</td>`;
+        }
+        if(k==="ord"){
+          if(!row.ord_side) return '<td class="rq-num"></td>';
+          const gl=row.ord_side==="buy"?"B"
+            :row.ord_side==="sell"?"S":"2w";
+          const hint=row.ord_side==="buy"
+            ?"client BUYS - work the ask down toward the bid level"
+            :row.ord_side==="sell"
+            ?"client SELLS - improve (raise) the BID toward the ask level"
+            :"two-way client order - work both sides";
+          return `<td class="rq-num" title="${hint}">${gl}</td>`;
+        }
+        if(k==="ord_lb"||k==="ord_la"){
+          const f=k==="ord_lb"?"ord_level":"ord_level2";
+          const en=rfqActive(row);
+          const vv=row[f]??"";
+          if(!en)
+            return `<td class="rq-num">${blEsc(rqG(vv))}</td>`;
+          return `<td class="bed"><input data-rf="${f}" style="width:48px" value="${blEsc(rqG(vv))}" placeholder="\u2014" onchange="rfqEdit(this)" title="${k==="ord_lb"?"bid level (compulsory when client BUYS / two-way)":"ask level (compulsory when client SELLS / two-way)"}"></td>`;
+        }
+        if(["nk_xb","orb","ora","nk_xa","nk_x"].includes(k)){
+          const NF={nk_xb:"x_bid",orb:"or_bid_sprd",ora:"or_ask_sprd",nk_xa:"x_ask",nk_x:"x_both"};
+          if(sales)
+            return '<td class="rq-num" style="color:#c9c9c9" title="trader-only">\u2014</td>';
+          return `<td class="bed"><input class="nkv" style="width:44px" data-nf="${NF[k]}" data-sid="${row.sec_id||""}" value="${blEsc(v)}" placeholder="0" onchange="nkEdit(this)" title="nuke ${NF[k]} \u00b7 edits sync LIVE to the Nuke station (and back)"></td>`;
+        }
+        if(k==="q_delta"){
+          if(!rfqActive(row)){
+            const dv=row.q_delta;
+            return `<td class="rq-num">${dv?blEsc(rqG(dv))+" %":""}</td>`;
+          }
+          const gh=(row.live_delta||"").replace(" %","");
+          return `<td class="bed"><input data-rf="q_delta" style="width:40px" value="${blEsc(rqG(row.q_delta??""))}" placeholder="${blEsc(gh)}" onchange="rfqEdit(this)" title="delta on the quote \u00b7 ghost = nuke nDelta% now \u00b7 FOLW stamps it live"></td>`;
+        }
+        if(k==="live_delta"){
+          return `<td class="rq-num" title="model delta now">${blEsc(row.live_delta||"")}</td>`;
+        }
+        if(k==="tol"){
+          if(sales||!rfqActive(row))
+            return `<td class="rq-num" title="off-the-quote tolerance (Drift)">${blEsc(v)}</td>`;
+          return `<td class="bed"><input data-rf="tol" style="width:36px" value="${blEsc(v)}" placeholder="0.05" onchange="rfqEdit(this)" title="per-line tolerance: if the model moves beyond this against a standing OUTRIGHT quote, the quote is auto-OFFed and the line shows ADJUSTING (blank = desk default 0.05)"></td>`;
+        }
+        if(k==="ap_act"){
+          if(sales||!rfqActive(row))
+            return '<td class="rq-tbtn"></td>';
+          const m2=String(row.auto_q||"");
+          if(sales||!rfqActive(row)||row.style!=="outright")
+            return '<td class="rq-tbtn"></td>';
+          const off='<span class="rq-tag" title="registry slot - not yet enabled (ALGOS panel, next phase)">';
+          return `<td class="rq-tbtn rq-algos">`+
+            `<span class="rq-ap rq-tag t-tol${m2==="1"?" on":""}" data-m="1" title="mode 1 \u00b7 OFF beyond Tol (ADJUSTING), re-quote when the model is back within Tol of the offed px \u00b7 never fires on HIT">TOL</span>`+
+            `<span class="rq-ap rq-tag t-tol${m2==="2"?" fw":""}" data-m="2" title="mode 2 \u00b7 FOLLOW: on every breach re-quote straight at live (no off gap) \u00b7 never fires on HIT">FOLW</span>`+
+            off+`SPRD</span>`+off+`STALE</span>`+off+`SKEW</span></td>`;
+        }
+        if(k==="hist")
+          return '<td class="rq-tbtn"><span class="rq-h" '+
+            'title="view quoting history + event log">H</span></td>';
+        if(k==="copy")
+          return '<td class="rq-tbtn"><span class="rq-cp" '+
+            'title="copy the client quote (same clipboard '+
+            'fallback as Nuke)">\u29c9</span></td>';
+        if(k==="q_act"){
+          const on=(!sales)&&rfqActive(row);
+          return `<td class="rq-tbtn">${on?'<span class="rq-qb" title="Quote it: confirm the current Bid/Ask as the standing client quote (rev '+((+row.q_rev||0)+1)+'); the previous rev is kept in history">Q</span>':""}</td>`;
+        }
+        if(k==="off_act"){
+          const on=(!sales)&&rfqActive(row)&&
+            (row.bid_px!==""||row.ask_px!=="");
+          return `<td class="rq-tbtn">${on?'<span class="rq-pb" title="OFF the quote: pull both sides for now (kept in history) - Q puts a fresh quote back">\u2298</span>':""}</td>`;
+        }
+        if(k==="lv_act"){
+          const on=(!sales)&&rfqActive(row)&&
+            (row.live_spot!==""||row.live_und!=="");
+          return `<td class="rq-tbtn">${on?'<span class="rq-lv" title="set OvdSpot / OvdFx to the live refs (LVs / LFx) and reprice">L</span>':""}</td>`;
+        }
+        if(k==="cx_act"&&!sales&&(row.status==="CANCELLED"||(row.status==="DONE"&&rfqUser()==="jb33880"))){
+          return `<td class="rq-tbtn"><span class="rq-x rq-del" title="delete this cancelled line permanently (removes quote history too)">\ud83d\uddd1</span></td>`;
+        }
+        if(k==="cx_act"){
+          const on=(!sales)&&rfqActive(row);
+          return `<td class="rq-tbtn">${on?'<span class="rq-x" title="cancel this quote - stops all updates">&#10005;</span>':""}</td>`;
+        }
+        if(k==="updated_by")
+          return `<td title="updated ${blEsc(row.last_updated||"")}">${blEsc(v)}</td>`;
+        if(RFQ_EDIT_TXT.includes(k))
+          return `<td class="bed"><input data-rf="${k}" `+
+            `value="${blEsc(v)}" onchange="rfqEdit(this)"></td>`;
+        return `<td>${blEsc(v)}</td>`;
+      }).join("")+"</tr>";
+  }).join("");
+  if(keep){ try{
+    const tr=document.querySelector('#rfq_tbl tr[data-id="'+keep.id+'"]');
+    const [kind,name]=keep.key.split(':');
+    const el=tr&&tr.querySelector((kind==='rf'?'[data-rf="':'[data-rs="')
+      +name+'"]');
+    if(el){ if(el.tagName==='INPUT'&&el.value!==keep.val) el.value=keep.val;
+      el.focus({preventScroll:true});
+      if(el.tagName==='INPUT'&&keep.s!=null)
+        try{ el.setSelectionRange(keep.s,keep.e); }catch(_){}
+    }
+  }catch(_){} }
+  const nOpen=rfqRows.filter(rfqOpen).length;
+  window._rfqNOpen=nOpen; rfqMeta();
+  if(window._rfqMs!=null&&$('rf_meta'))
+    $('rf_meta').textContent+=' \u00b7 pass '+window._rfqMs+'ms \u00b7 '+(window._rfqBuild||'old-build');
+  rfqMonRender();
+}
+function rfqMeta(){
+  const shown=rfqShown();
+  $('rf_meta').textContent=shown.length+"/"+rfqRows.length+
+    " shown \u00b7 "+(window._rfqNOpen||0)+" open"+
+    (RFQ_SEL.size?(" \u00b7 "+RFQ_SEL.size+" selected (Esc clears)"):"");
+}
+async function rfqSecs(){
+  try{
+    const j=await (await fetch('/api/rfq/secs')).json();
+    if(!j.ok) return;
+    RFQ_SECMAP={};
+    const opts=[];
+    for(const x of (j.secs||[])){
+      const sn=(x.short_name||"").trim(), isin=(x.isin||"").trim();
+      const rec={sec_id:String(x.sec_id||""), short_name:sn, isin:isin};
+      if(sn) RFQ_SECMAP[sn.toUpperCase()]=rec;
+      if(isin) RFQ_SECMAP[isin.toUpperCase()]=rec;
+      if(sn) opts.push(`<option value="${blEsc(sn)}">${blEsc(isin||x.sec_id)}</option>`);
+      if(isin) opts.push(`<option value="${blEsc(isin)}">${blEsc(sn||x.sec_id)}</option>`);
+    }
+    $('rf_secdl').innerHTML=opts.join("");
+  }catch(e){}
+}
+async function rfqLoad(quiet){
+  try{
+    if(!Object.keys(RFQ_SECMAP).length) rfqSecs();
+    if(!window._rfqSecT){ window._rfqSecT=1;
+      setInterval(rfqSecs, 15000); }
+    const j=await (await fetch('/api/rfq/list')).json();
+    if(!j.ok){ setS('rf_status','ERROR: '+j.error,'err'); return; }
+    const sig=JSON.stringify(j.rows||[]);
+    window._rfqMs=j.ms; window._rfqTtl=j.qttl||600;
+    window._rfqBuild=j.build||window._rfqBuild;
+    window.addEventListener('error',ev=>{try{setS('rf_status','ERROR: '+ev.message+' @'+(ev.lineno||'?')+' \u00b7 '+(window._rfqBuild||'old-build'),'err');}catch(_){}});
+window.addEventListener('unhandledrejection',ev=>{try{setS('rf_status','ERROR: '+(ev.reason&&ev.reason.message||ev.reason)+' \u00b7 '+(window._rfqBuild||'old-build'),'err');}catch(_){}});
+    if(!window._rfqFast){ window._rfqFast=1;
+      const FASTC={live_bid:"lb",live_ask:"la",live_spot:"lvs",live_und:"lfx"};
+      setInterval(async()=>{
+        if(document.hidden) return;
+        let j2; try{ j2=await (await fetch("/api/rfq/live")).json(); }catch(e){ return; }
+        if(!j2||!j2.ok||!j2.live) return;
+        const vis=rfqVisCols().map(c=>c[0]);
+        const idx={}; vis.forEach((k,i)=>idx[k]=i);
+        document.querySelectorAll("#rfq_tbl tr[data-id]").forEach(tr=>{
+          const lv=j2.live[tr.dataset.id]; if(!lv) return;
+          const row=rfqRows.find(x=>x.rfq_id===tr.dataset.id);
+          const tds=tr.children;
+          const setT=(k,v)=>{ const i=idx[k];
+            if(i==null||!tds[i]) return;
+            if(tds[i].querySelector("input,select,span.rq-st")) return;
+            tds[i].textContent=v; };
+          const f2=x=>x==null?"":Number(x).toFixed(2);
+          setT("live_bid",f2(lv.lb)); setT("live_ask",f2(lv.la));
+          setT("live_spot",lv.lvs==null?"":rqN(String(+Number(lv.lvs).toFixed(4))));
+          setT("live_und",lv.lfx==null?"":Number(lv.lfx).toFixed(4));
+          setT("live_delta",lv.ld==null?"":Math.round(lv.ld)+" %");
+          if(row){ row.live_bid=f2(lv.lb); row.live_ask=f2(lv.la);
+            const qb=parseFloat(row.bid_px), qa=parseFloat(row.ask_px);
+            if(isFinite(qb)&&lv.lb!=null) setT("diff_bid",(qb-lv.lb>=0?"+":"")+(qb-lv.lb).toFixed(2));
+            if(isFinite(qa)&&lv.la!=null) setT("diff_ask",(qa-lv.la>=0?"+":"")+(qa-lv.la).toFixed(2));
+          }
+        });
+      },250);
+    }
+    if(j.cold){
+      if(j.err) setS('rf_status',
+        'station init failed: '+j.err+' \u2014 retrying','err');
+      else setS('rf_status',
+        'station warming up \u2014 first data in a moment','ok');
+      setTimeout(()=>rfqLoad(true),1200);
+      if(rfqRows.length) return; }
+    if(!(quiet && sig===rfqSig)){ rfqRows=j.rows||[]; rfqRender(); }
+    else rfqMonRender();       // ages / order keep ticking
+    rfqSig=sig;
+    if(rhId && $('rfq_hist').classList.contains('on'))
+      rfqHist(rhId, true);
+    if(!quiet) setS('rf_status','Loaded '+rfqRows.length+' RFQs \u00b7 showing '+
+      rfqFilt.toUpperCase()+'. Status / Type / Side / Hit are dropdowns; '+
+      'Bid/Ask auto-price on the 0.05 grid at your amber refs; '+
+      '\u29c9 copies the quote; ACK confirms a hit+done trade.','ok');
+    if(rfqTimer) clearInterval(rfqTimer);
+    rfqTimer=setInterval(()=>{
+      if(window.curTab==='rfq' && !document.hidden) rfqLoad(true);
+    },1000);
+    if(!window._rfqVisT){ window._rfqVisT=1;
+      document.addEventListener('visibilitychange',()=>{
+        if(!document.hidden && window.curTab==='rfq') rfqLoad(true);});
+      document.addEventListener('focusout',ev=>{
+        if(window._rfqDefer && ev.target && ev.target.closest &&
+           ev.target.closest('#rfq_tbl'))
+          setTimeout(()=>{ if(window._rfqDefer){ window._rfqDefer=0;
+            rfqRender(); } },80);
+      },true); }
+  }catch(e){ setS('rf_status','ERROR: '+e,'err'); }
+}
+async function rfqSend(){
+  const typed=($('rf_sec').value||"").trim().toUpperCase();
+  const rec=RFQ_SECMAP[typed];
+  if(!rec){
+    setS('rf_status','Unknown security \u2014 type or pick a short name '+
+      'or ISIN from the list.','err');
+    return;
+  }
+  const R=rfqBarReq();
+  const miss=Object.entries(R).filter(([id,req])=>req&&
+    !($(id).value||'').trim()).map(([id])=>id);
+  if(miss.length){
+    miss.forEach(id=>$(id).classList.add('miss'));
+    setS('rf_status','Working order needs: '+miss.map(i=>
+      i==='rf_lvl'?'bid level':i==='rf_lvl2'?'ask level':'vs ref').join(' + '),'err');
+    return;
+  }
+  const user=rfqUser();
+  try{
+    const r=await fetch('/api/rfq/create',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({sec_id:rec.sec_id,
+        short_name:rec.short_name,
+        style:$('rf_style').value, sides:$('rf_sides').value,
+        ord_side:$('rf_ord')?$('rf_ord').value:'',
+        ord_level:$('rf_lvl')?$('rf_lvl').value.trim():'',
+        ord_level2:$('rf_lvl2')?$('rf_lvl2').value.trim():'',
+        vs:$('rf_vs')?$('rf_vs').value.trim():'',
+        fx:$('rf_fx')?$('rf_fx').value.trim():'',
+        delta:$('rf_delta')?$('rf_delta').value.trim():'',
+        qty:$('rf_qty').value.trim(), client:$('rf_client').value.trim(),
+        user})});
+    const j=await r.json();
+    if(j.ok){
+      const wasOrd=$('rf_ord')&&$('rf_ord').value;
+      $('rf_qty').value=""; $('rf_client').value="";
+      if($('rf_ord')){ $('rf_ord').value=''; rfqOrdLab(); }
+      if($('rf_lvl')) $('rf_lvl').value='';
+      setS('rf_status',(wasOrd?'WORK ORDER #':'RFQ #')+
+        j.rfq_id+' sent.','ok'); rfqLoad(true);
+    }
+    else setS('rf_status',j.error,'err');
+  }catch(e){ setS('rf_status','ERROR: '+e,'err'); }
+}
+async function rfqEditSend(id, field, value, tok){
+  const user=rfqUser();
+  const r=await fetch('/api/rfq/edit',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({rfq_id:+id, field, value, token:tok, user})});
+  return r.json();
+}
+let _rqPvT={};
+function rqPrev(inp){
+  const tr=inp.closest("tr"); if(!tr) return;
+  const id=tr.dataset.id;
+  clearTimeout(_rqPvT[id]);
+  _rqPvT[id]=setTimeout(async()=>{
+    const row=rfqRows.find(x=>x.rfq_id===id); if(!row) return;
+    const gv=f=>{const i2=tr.querySelector(
+      'input[data-rf="'+f+'"]');return i2?i2.value.trim():"";};
+    let j; try{ j=await (await fetch("/api/rfq/reprice",{
+      method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({sec_id:String(row.sec_id||""),
+        style:row.style||"",ovd_spot:gv("stock_ref"),
+        ovd_fx:gv("fx_ref"),ovd_delta:gv("delta")})})).json(); }catch(e){ return; }
+    if(!j||!j.ok) return;
+    const f2=x=>x==null?"":Number(x).toFixed(2);
+    row.calc_bid=f2(j.bid); row.calc_ask=f2(j.ask);
+    const vis=rfqVisCols().map(c=>c[0]);
+    const idx={}; vis.forEach((k,i)=>idx[k]=i);
+    const _lq0=parseFloat(String(row.live_qty||"").replace(/,/g,""));
+    [["bid_px",row.calc_bid],["ask_px",row.calc_ask]].forEach(([k,val])=>{
+      if(k==="ask_px"&&isFinite(_lq0)&&_lq0===0) return;
+      const i3=idx[k]; const td=tr.children[i3];
+      if(td&&td.classList.contains("rq-qd")) td.textContent=rqBA(val);
+    });
+  },180);
+}
+async function nkEdit(inp){
+  const [ok,j]=await post('/api/rfq/nkedit',{
+    sec_id:inp.dataset.sid, field:inp.dataset.nf,
+    value:inp.value.trim()});
+  setS('rf_status', j.ok?('nuke '+inp.dataset.nf+' saved \u2014 synced to Nuke station'):(j.error||'save failed'),
+    j.ok?'ok':'err');
+}
+async function rfqEdit(inp){
+  const tr=inp.closest("tr");
+  let v=inp.value;
+  if(RFQ_NUM.includes(inp.dataset.rf)) v=v.replace(/[,\s]/g,"");
+  const j=await rfqEditSend(tr.dataset.id, inp.dataset.rf, v, tr.dataset.tok);
+  if(j.ok){ tr.dataset.tok=j.token; inp.value=j.value;
+    const row=rfqRows.find(x=>x.rfq_id===tr.dataset.id);
+    if(row){ row[inp.dataset.rf]=j.value; row._tok=j.token; }
+    setS('rf_status','Saved '+inp.dataset.rf+' on RFQ '+tr.dataset.id+'.','ok');
+    if(["stock_ref","fx_ref","delta"].includes(inp.dataset.rf))
+      rfqLoad(true); }
+  else{ setS('rf_status',j.error,'err'); rfqLoad(true); }
+}
+async function rfqHist(id, quiet){
+  rhId=id;
+  const row=rfqRows.find(x=>x.rfq_id===String(id))||{};
+  $('rh_title').textContent="RFQ #"+id+" \u00b7 "+
+    (row.short_name||"");
+  if(!quiet) $('rh_meta').textContent="loading\u2026";
+  $('rfq_hist').classList.add("on");
+  $('rfq_mon').classList.remove('on');
+  try{
+    const j=await (await fetch('/api/rfq/history?rfq_id='+id)).json();
+    if(!j.ok){ if(!quiet) $('rh_meta').textContent=j.error; return; }
+    const sig=JSON.stringify(j);
+    if(quiet && sig===rhSig) return;
+    rhSig=sig;
+    const rows=j.rows||[];
+    $('rh_meta').textContent=rows.length+" revision(s) \u00b7 "+
+      "newest first \u00b7 Move = bid change vs previous rev";
+    $('rh_tbl').querySelector("tbody").innerHTML=
+      rows.map((r,i)=>{
+        const prev=rows[i+1];
+        let mv="";
+        if(prev){
+          const d=rqF(r.bid)-rqF(prev.bid);
+          if(isFinite(d)&&d!==0) mv=(d>0?"+":"")+d.toFixed(2);
+          else if(isFinite(d)) mv="0.00";
+        }
+        return `<tr><td>r${blEsc(r.rev)}</td>`+
+          `<td class="${String(r.action||"").startsWith("pull")?"rq-dn":""}">${blEsc(r.action||"both")}</td>`+
+          `<td>${blEsc(String(r.quoted_at||"").slice(11,19))}</td>`+
+          `<td>${blEsc(r.quoted_by||"")}</td>`+
+          `<td>${rqBA(r.bid)}</td><td>${rqBA(r.ask)}</td>`+
+          `<td class="${mv.startsWith("+")?"rq-dp":mv.startsWith("-")?"rq-dn":""}">${mv}</td>`+
+          `<td>${blEsc(rqG(r.spot))}</td>`+
+          `<td>${blEsc(r.fx===""?"":rqF(r.fx).toFixed(4))}</td>`+
+          `<td>${blEsc(rqG(r.delta))}${r.delta!==""?"%":""}</td></tr>`;
+      }).join("")||
+      '<tr><td colspan="10">no revisions yet - press Q on the line</td></tr>';
+    const evs=(j.events||[]).filter(e=>e.field!=="quote");
+    $('rh_ev').querySelector("tbody").innerHTML=
+      evs.map(e=>{
+        const cut=s=>blEsc(String(s??"").slice(0,30));
+        const chg=e.field==="created"?cut(e.new)
+          :cut(e.old||"\u2205")+" \u2192 "+cut(e.new||"\u2205");
+        return `<tr><td>${blEsc(String(e.at||"").slice(5,16))}</td>`+
+          `<td>${blEsc(e.by||"")}</td>`+
+          `<td class="${e.field==="status"?"rh-st":""}">${blEsc(e.field)}</td>`+
+          `<td>${chg}</td></tr>`;
+      }).join("")||
+      '<tr><td colspan="4">no events yet</td></tr>';
+  }catch(e){ $('rh_meta').textContent=String(e); }
+}
+function rmCap(m,cap){ return Math.min(m,cap); }
+function rmAge(ts){
+  if(!ts) return 0;
+  const t=new Date(String(ts).replace(' ','T'));
+  const m=(Date.now()-t.getTime())/60000;
+  return isFinite(m)&&m>0?m:0;
+}
+function rmAgeTxt(m){
+  if(m<1) return '<1m';
+  if(m<60) return Math.round(m)+'m';
+  return (m/60).toFixed(1)+'h';
+}
+function rfqMonItems(){
+  if(AUTH.role==='sales') return [];
+  const out=[];
+  rfqRows.forEach(r=>{
+    const id=r.rfq_id, sec=r.short_name||'';
+    if(r.status==='HIT'){
+      const qp=Number(r.hit==='ask'?r.ask_px:r.bid_px);
+      const lp=Number(r.hit==='ask'?r.live_ask:r.live_bid);
+      const mv=(isFinite(qp)&&isFinite(lp))?lp-qp:0;
+      const a=rmAge(r.ack_at||r.last_updated||r.quoted);
+      out.push({k:'hit',id,sec,
+        why:'hit '+String(r.hit||'?').toUpperCase()+
+          ' \u00b7 ACK / REJ \u00b7 mkt '+(mv>=0?'+':'')+
+          mv.toFixed(2)+' vs deal \u00b7 '+rmAgeTxt(a),
+        score:1000+rmCap(a,120)*1.5+rmCap(Math.abs(mv)*100,100)});
+      return;
+    }
+    if(!rfqActive(r)) return;
+    if(r.refresh_by){
+      const a=rmAge(r.refresh_at);
+      out.push({k:'rf',id,sec,
+        why:'refresh req by '+r.refresh_by+' \u00b7 '+
+          rmAgeTxt(a),score:600+rmCap(a,120)*3});
+    }
+    const sb=parseFloat(r.slip_bid), sa=parseFloat(r.slip_ask);
+    const worst=Math.min(isFinite(sb)?sb:0, isFinite(sa)?sa:0);
+    const std=r.bid_px!==''||r.ask_px!=='';
+    if(std&&String(r.flag||'').indexOf('PULL')===0){
+      out.push({k:'pl',id,sec,
+        why:'moved '+worst.toFixed(2)+' against \u00b7 pull / '+
+          'requote',score:500+rmCap(Math.abs(worst)*100,90)});
+    } else if(std&&String(r.flag||'').indexOf('REQUOTE')===0){
+      out.push({k:'re',id,sec,
+        why:'refs drifted \u00b7 requote',
+        score:300+rmCap(Math.abs(worst)*50,90)});
+    }
+    if(r.status==='REQUESTED'&&!std){
+      const a=rmAge(r.created_at||r.last_updated);
+      if(r.off_flag){
+        out.push({k:'aj',id,sec,
+          why:'quote OFF '+(r.off_flag==='auto'?'(>tol)'
+            :'(trader)')+' \u00b7 re-quote',
+          score:495+rmCap(a,4)});
+      } else if(!r.ord_side){
+        out.push({k:'rq',id,sec,
+          why:'no quote yet \u00b7 waiting '+rmAgeTxt(a),
+          score:400+rmCap(a,90)});
       }
-      else{
-        const core = mode === "or"
-            ? (usd === 0 ? p2(ab) + " /"
-               : (aa != null ? p2(ab) + " / " + p2(aa) : p2(ab)))
-            : p2(ab) + " bid";
-        q = name + " " + core + " ref " + spotS + " fx " + fxS;
-      }
-    }else{
-      if(mode === "ask"){
-        q = name + " vs " + spotS + " fx " + fxS + dS + " " +
-            p2(ask != null ? ask : bid) + " offer";
+    }
+    if(r.ord_side&&!std&&!r.off_flag){
+      const a=rmAge(r.created_at||r.last_updated);
+      out.push({k:'wk',id,sec,
+        why:'work the order \u00b7 client '+
+          (r.ord_side==='buy'?'BUYS':r.ord_side==='sell'
+            ?'SELLS':'2-way')+
+          (r.ord_level?' @ '+rqG(r.ord_level):'')+
+          ' \u00b7 '+rmAgeTxt(a),
+        score:400+rmCap(a,90)+3});
+    }
+    if(std&&String(r.flag||'').indexOf('GOOD')===0){
+      const a=rmAge(r.quoted);
+      if(a>10) out.push({k:'st',id,sec,
+        why:'standing quote '+rmAgeTxt(a)+' old',
+        score:100+rmCap(a,180)/2});
+    }
+  });
+  const _ts=id=>{const r=rfqRows.find(x=>x.rfq_id===id)||{};
+    return String(r.last_updated||r.created||'');};
+  out.sort((a,b)=>_ts(b.id).localeCompare(_ts(a.id)));
+  return out;
+}
+const RM_LAB={hit:'HIT',rf:'RFRSH',pl:'PULL',aj:'ADJ',
+  wk:'WORK',rq:'REQ',re:'RQTE',st:'STALE'};
+const RM_CLS={hit:'rm-hit',rf:'rm-rf',pl:'rm-pl',aj:'rm-aj',
+  wk:'rm-re',rq:'rm-rq',re:'rm-re',st:'rm-st'};
+function rfqMonRender(){
+  const el=$('rm_list'); if(!el) return;
+  let items=rfqMonItems();
+  const _f=($('rf_f_from')||{}).value||'';
+  const _t=($('rf_f_to')||{}).value||'';
+  if(_f||_t){ items=items.filter(it=>{
+    const r=rfqRows.find(x=>x.rfq_id===it.id)||{};
+    const d=String(r.last_updated||r.created||'').slice(0,10);
+    return (!_f||d>=_f)&&(!_t||d<=_t); }); }
+  $('rf_mon_n').textContent=items.length;
+  el.innerHTML=items.map(it=>{
+    const R=rfqRows.find(x=>x.rfq_id===it.id)||{};
+    const tm=String(R.last_updated||R.created||"")
+      .slice(5,16).replace("T"," ");
+    return `<div class="rm-it" data-k="${it.k}" data-id="${it.id}" title="score ${Math.round(it.score)}">`+
+    `<span class="rm-t">${tm}</span>`+
+    `<span class="rm-b ${RM_CLS[it.k]}">${RM_LAB[it.k]}`+
+    `</span><span class="rm-sec">#${it.id} `+
+    `${blEsc(it.sec)}</span>`+
+    `<span class="rm-isin">${blEsc(R.isin||"")}</span>`+
+    `<span class="rm-ty">${blEsc(R.style||"")}</span>`+
+    `<span class="rm-sd">${blEsc(R.sides||"")}</span>`+
+    `<span class="rm-by">${blEsc(R.by||R.updated_by||"")}</span>`+
+    `<span class="rm-why">${blEsc(it.why)}</span></div>`;})
+    .join('')||'<div class="rm-meta">nothing needs you - '+
+    'all quiet</div>';
+}
+(function(){
+  const _amu=()=>((window.AUTH&&AUTH.user)||'');
+  const AK=k=>'rfq.'+k+'.'+_amu();
+  const dk=localStorage.getItem(AK('amdock'));
+  if(dk==='b') document.body.classList.add('amdock-b');
+  const z=parseFloat(localStorage.getItem(AK('amz'))||'11');
+  const ap=v=>{const l=$('rm_list');
+    if(l) l.style.fontSize=v+'px';
+    localStorage.setItem(AK('amz'),String(v));};
+  ap(z);
+  const dkb=$('rm_dock');
+  const lab=()=>{ if(dkb) dkb.innerHTML=
+    document.body.classList.contains('amdock-b')
+    ?'&#8680;':'&#8681;'; };
+  lab();
+  if(dkb) dkb.onclick=ev=>{ ev.stopPropagation();
+    document.body.classList.toggle('amdock-b');
+    localStorage.setItem(AK('amdock'),
+      document.body.classList.contains('amdock-b')?'b':'r');
+    lab(); };
+  if($('rm_zi')) $('rm_zi').onclick=()=>ap(Math.min(15,
+    (parseFloat($('rm_list').style.fontSize)||11)+1));
+  if($('rm_zo')) $('rm_zo').onclick=()=>ap(Math.max(8,
+    (parseFloat($('rm_list').style.fontSize)||11)-1));
+  const mon=$('rfq_mon');
+  const sz=()=>{ if(!mon) return;
+    const w=localStorage.getItem(AK('amw'));
+    const h=localStorage.getItem(AK('amh'));
+    if(w) mon.style.width=w+'px';
+    if(h&&document.body.classList.contains('amdock-b'))
+      mon.style.height=h+'px'; };
+  sz();
+  const gr=$('rm_grip');
+  if(gr&&mon){
+    let drag=false;
+    gr.addEventListener('pointerdown',ev=>{ drag=true;
+      gr.setPointerCapture(ev.pointerId);
+      ev.preventDefault(); });
+    gr.addEventListener('pointermove',ev=>{ if(!drag) return;
+      if(document.body.classList.contains('amdock-b')){
+        const H=Math.min(window.innerHeight*.7,
+          Math.max(90,window.innerHeight-ev.clientY));
+        mon.style.height=H+'px';
+        localStorage.setItem(AK('amh'),String(Math.round(H)));
       } else {
-        const core = mode === "vs"
-            ? (usd === 0 ? p2(bid) + " /"
-               : (ask != null ? p2(bid) + " / " + p2(ask) : p2(bid)))
-            : p2(bid) + " bid";
-        q = name + " " + core + " vs " + spotS + " fx " + fxS + dS;
+        const W=Math.min(window.innerWidth*.6,
+          Math.max(220,window.innerWidth-ev.clientX));
+        mon.style.width=W+'px';
+        localStorage.setItem(AK('amw'),String(Math.round(W)));
+      } });
+    const end=ev=>{ drag=false; };
+    gr.addEventListener('pointerup',end);
+    gr.addEventListener('pointercancel',end);
+  }
+  if($('rm_dock')){ const _od=$('rm_dock').onclick;
+    $('rm_dock').onclick=ev=>{ _od(ev);
+      mon.style.height=''; mon.style.width=''; sz(); }; }
+})();
+function rfqJump(id){
+  if(!rfqShown().some(r=>String(r.rfq_id)===String(id))){
+    rfqFilt='all';
+    document.querySelectorAll('#rf_filt .rf-f').forEach(x=>
+      x.classList.toggle('on',x.dataset.f==='all'));
+    ['rf_f_from','rf_f_to','rf_f_txt'].forEach(i=>{
+      if($(i)) $(i).value='';
+    });
+    if($('rf_f_type')) $('rf_f_type').value='';
+    rfqRender();
+  }
+  const tr=document.querySelector(
+    `#rfq_tbl tbody tr[data-id="${id}"]`);
+  if(!tr) return;
+  if(tr.scrollIntoView) tr.scrollIntoView({block:'center'});
+  tr.classList.remove('rflash'); void tr.offsetWidth;
+  tr.classList.add('rflash');
+}
+$('rf_mon').onclick=()=>{
+  rfqMonRender();
+  const opening=!$('rfq_mon').classList.contains('on');
+  $('rfq_mon').classList.toggle('on');
+  if(opening){ $('rfq_hist').classList.remove('on'); rhId=null; }
+};
+$('rm_close').onclick=()=>$('rfq_mon').classList.remove('on');
+$('rm_list').addEventListener('click',ev=>{
+  const it=ev.target.closest('.rm-it');
+  if(it) rfqJump(it.dataset.id);
+});
+$('rh_close').onclick=()=>{
+  $('rfq_hist').classList.remove("on"); rhId=null;
+};
+document.addEventListener('keydown',ev=>{
+  if(ev.key==='Escape'&&RFQ_SEL.size){
+    RFQ_SEL.clear(); rfqRender();
+  }
+});
+(function(){
+  const P=$('rfq_hist'), H=$('rh_rz'), KEY='lagrange.rhw';
+  const saved=parseInt(localStorage.getItem(KEY)||'',10);
+  if(saved>=260&&saved<=720) P.style.width=saved+'px';
+  let drag=false;
+  H.addEventListener('mousedown',e=>{drag=true;e.preventDefault();});
+  window.addEventListener('mousemove',e=>{
+    if(!drag) return;
+    const w=Math.min(720,Math.max(260,window.innerWidth-e.clientX));
+    P.style.width=w+'px';
+  });
+  window.addEventListener('mouseup',()=>{
+    if(!drag) return; drag=false;
+    const wv=String(parseInt(P.style.width)||360);
+    localStorage.setItem(KEY,wv); prefPush(KEY,wv);
+  });
+  H.addEventListener('dblclick',()=>{P.style.width='360px';
+    localStorage.setItem(KEY,'360');});
+})();
+async function rfqCopyLive(tr){
+  const row=rfqRows.find(x=>x.rfq_id===tr.dataset.id);
+  if(!row) return;
+  if(row.live_spot==="" && row.live_und===""){
+    setS('rf_status','No live refs to copy yet.','err'); return;
+  }
+  let tok=tr.dataset.tok, ok=true;
+  if(row.live_spot!==""){
+    const j=await rfqEditSend(tr.dataset.id,"stock_ref",
+      row.live_spot,tok);
+    if(j.ok) tok=j.token;
+    else { ok=false; setS('rf_status',j.error,'err'); }
+  }
+  if(ok && row.live_und!==""){
+    const j2=await rfqEditSend(tr.dataset.id,"fx_ref",
+      row.live_und,tok);
+    if(!j2.ok){ ok=false; setS('rf_status',j2.error,'err'); }
+  }
+  if(ok && row.live_delta!==""){
+    const dv=String(row.live_delta).replace("%","").trim();
+    const j3=await rfqEditSend(tr.dataset.id,"delta",dv,tok);
+    if(j3.ok) tok=j3.token;
+    else { ok=false; setS('rf_status',j3.error,'err'); }
+  }
+  if(ok) setS('rf_status','OvdSpot / OvdFx / Delta set to live (Delta = nDelta%) - repriced.','ok');
+  rfqLoad(true);
+}
+async function rfqSideOp(tr, url, side){
+  const j=await (await fetch(url,{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({rfq_id:+tr.dataset.id,
+      token:tr.dataset.tok, user:rfqUser(), side})})).json();
+  if(j.ok){
+    const act=url.includes("pull")?"pulled":"refreshed";
+    setS('rf_status','RFQ '+tr.dataset.id+' '+side+' '+act+
+      ' (rev '+j.rev+')'+(j.status?' \u00b7 '+j.status:'')+'.','ok');
+    rfqLoad(true);
+  } else { setS('rf_status',j.error,'err'); rfqLoad(true); }
+}
+$('rfq_tbl').addEventListener('focusout',()=>{
+  if(window._rfqDefer){ window._rfqDefer=0;
+    setTimeout(rfqRender,60); }
+});
+$('rfq_tbl').addEventListener("click", async ev=>{
+  const delb=ev.target.closest('.rq-del');
+  if(delb){
+    const tr=delb.closest('tr');
+    if(!confirm('Delete cancelled RFQ #'+tr.dataset.id+
+      ' permanently?')) return;
+    post('/api/rfq/delete',{rfq_id:tr.dataset.id})
+      .then(([ok,j])=>{ if(j.ok){
+        rfqRows=rfqRows.filter(x=>x.rfq_id!==tr.dataset.id);
+        rfqRender(); setS('rf_status','Deleted #'+
+        tr.dataset.id+'.','ok'); }
+        else setS('rf_status',j.error||'delete failed','err'); });
+    return;
+  }
+  const ipb=ev.target.closest('.rq-impb');
+  if(ipb){
+    const tr=ipb.closest('tr');
+    const row=rfqRows.find(x=>x.rfq_id===tr.dataset.id)||{};
+    const sides=row.sides||'two_way';
+    const gvL=f=>{const inp=tr.querySelector(
+      'input[data-rf="'+f+'"]');
+      return inp?String(inp.value).trim()!=='':
+        String(row[f]||'').trim()!=='';};
+    const hasB=gvL('ord_level'), hasA=gvL('ord_level2');
+    const markR=f=>{const inp=tr.querySelector(
+      'input[data-rf="'+f+'"]');
+      if(inp){ inp.classList.add('missb');
+        inp.addEventListener('input',()=>
+          inp.classList.remove('missb'),{once:true}); }};
+    let bad=false, msg='';
+    if(sides==='two_way'){
+      if(!hasB&&!hasA){ bad=true; markR('ord_level');
+        markR('ord_level2');
+        msg='improve on two-way needs at least one level '+
+          '(bid or ask) \u2014 fill a red cell'; }
+    } else if(sides==='bid'){
+      if(!hasB){ bad=true; markR('ord_level');
+        msg='improve needs the bid level \u2014 fill the '+
+          'red cell'; }
+    } else {
+      if(!hasA){ bad=true; markR('ord_level2');
+        msg='improve needs the ask level \u2014 fill the '+
+          'red cell'; }
+    }
+    if(bad){ setS('rf_status',msg,'err'); return; }
+    setS('rf_status','improve: sending…','ok');
+    post('/api/rfq/impreq',{rfq_id:tr.dataset.id})
+      .then(([ok,j])=>{ if(j&&j.ok){ row.status='IMPROVE';
+        rfqRender(); setS('rf_status','improve sent — row '+
+          'is now IMPROVE; trader answers with match or Q','ok');
+        setTimeout(()=>rfqLoad(true),400); }
+        else setS('rf_status',(j&&(j.error||JSON.stringify(j)))||'rejected','err'); })
+      .catch(e=>setS('rf_status',
+        'improve failed: '+e+' \u00b7 '+(window._rfqBuild||'old-build'),'err'));
+    ev.stopPropagation(); return;
+  }
+  const mtb=ev.target.closest('.rq-mtb');
+  if(mtb){
+    const tr=mtb.closest('tr');
+    post('/api/rfq/match',{rfq_id:tr.dataset.id})
+      .then(([ok,j])=>{ setS('rf_status',
+        j.ok?'matched \u2014 quote at the improve terms'
+        :(j.error||'match failed'), j.ok?'ok':'err');
+        if(j.ok) rfqLoad(true); });
+    ev.stopPropagation(); return;
+  }
+  const ajb=ev.target.closest('.rq-adjb');
+  if(ajb){
+    const tr=ajb.closest('tr');
+    const row=rfqRows.find(x=>x.rfq_id===tr.dataset.id);
+    const nv=String(row&&row.adj_req||'')==='1'?false:true;
+    post('/api/rfq/adjreq',{rfq_id:tr.dataset.id,on:nv})
+      .then(([ok,j])=>{ if(j.ok&&row){ row.adj_req=nv?'1':'';
+        rfqRender(); } });
+    return;
+  }
+  const apb=ev.target.closest('.rq-ap');
+  if(apb){
+    const tr=apb.closest('tr');
+    const row=rfqRows.find(x=>x.rfq_id===tr.dataset.id);
+    const cur=String(row&&row.auto_q||'0');
+    const mm=apb.dataset.m||'1';
+    const nv=cur===mm?'0':mm;
+    if(nv!=='0'){
+      const ti=tr.querySelector('input[data-rf="tol"]');
+      const hasTol=(ti&&String(ti.value).trim()!=='')||
+        String(row&&row.tol||'').trim()!=='';
+      if(!hasTol){
+        if(ti){ ti.classList.add('missb');
+          ti.addEventListener('input',()=>
+            ti.classList.remove('missb'),{once:true}); }
+        setS('rf_status','set a tolerance first \u2014 the '+
+          'Tol cell is required to arm TOL / FOLW','err');
+        return;
       }
     }
-    if(priced){
-      if(usd === 0)            q += " no offer";
-      else if(usd < 1000000)   q += " scrappy " + fmt0(usd);
-    }
-    lines.push(q.replace(/ +/g, " ").trim());
+    rfqEditSend(tr.dataset.id,'auto_q',nv,tr.dataset.tok)
+      .then(j=>{ if(j.ok&&row){ row.auto_q=nv;
+        row._tok=j.token; rfqRender(); } });
+    return;
   }
-  const out = lines.join(String.fromCharCode(10));
-  copyText(out).then(ok => setStatus(
-      (ok ? '<span class="ok">copied:</span> '
-          : '<span class="warn">copy blocked - string below:</span> ')
-      + lines.map(qesc).join("<br>")));
-}
-
-function copyTable(){
-  const heads = [...document.querySelectorAll("#tbl tr:nth-child(2) th")]
-    .map(th=>th.textContent.trim() || "sel");
-  const lines = [heads.join("\\t")];
-  document.querySelectorAll("#tbl tr[data-id]").forEach((tr,ri)=>{
-    const cells = [rowSel.has(ri) ? "x" : ""];
-    tr.querySelectorAll("td").forEach(td=>{
-      if(td.classList.contains("stick0")) return;
-      const inp = td.querySelector("input");
-      cells.push(inp ? inp.value : td.textContent.trim());
+  const hitb=ev.target.closest("b.rq-hb");
+  if(hitb){
+    const tr=hitb.closest("tr");
+    const row=rfqRows.find(x=>x.rfq_id===tr.dataset.id);
+    if(row&&(row.status==="DONE"||row.status==="CANCELLED")){
+      setS('rf_status','Line is booked / cancelled - hit is locked.','err');
+      ev.stopPropagation(); return;
+    }
+    const nv=(row && row.hit===hitb.dataset.hit)?"":hitb.dataset.hit;
+    const j=await rfqEditSend(tr.dataset.id,"hit",nv,tr.dataset.tok);
+    if(j.ok){
+      if(row){
+        row.hit=j.value; row._tok=j.token;
+        if(j.value){                       // dealt -> HIT now
+          row.status="HIT";
+          row.flag="HIT "+String(j.value).toUpperCase();
+          row.flag_cls="fl-moved";
+          row.refresh_by=""; row.refresh_at="";
+        } else if(row.status==="HIT"){     // un-hit -> revert
+          row.status=(row.style==="working"||row.ord_side)
+            ?"WORKING"
+            :((row.bid_px!==""||row.ask_px!=="")
+              ?"QUOTED":"REQUESTED");
+          row.flag=""; row.flag_cls="";
+        }
+      }
+      setS('rf_status','RFQ '+tr.dataset.id+' hit = '+
+        (j.value||'cleared')+'.','ok');
+      rfqRender(); rfqLoad(true);          // reconcile in 1 RTT
+    }
+    else { setS('rf_status',j.error,'err'); rfqLoad(true); }
+    ev.stopPropagation(); return;
+  }
+  const rfb=ev.target.closest("span.rq-rf");
+  if(rfb && !rfb.classList.contains("rq-rfp")){
+    const tr=rfb.closest("tr");
+    const j=await (await fetch('/api/rfq/refresh',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({rfq_id:+tr.dataset.id,
+        token:tr.dataset.tok, user:rfqUser()})})).json();
+    if(j.ok){ setS('rf_status','RFQ '+tr.dataset.id+': refresh '+
+        'requested by '+j.refresh_by+' - the trader will see it '+
+        'amber.','ok'); rfqLoad(true); }
+    else { setS('rf_status',j.error,'err'); rfqLoad(true); }
+    ev.stopPropagation(); return;
+  }
+  if(rfb){ ev.stopPropagation(); return; }
+  const pbb=ev.target.closest("span.rq-pb");
+  if(pbb){
+    rfqSideOp(pbb.closest("tr"), '/api/rfq/pull', "both");
+    ev.stopPropagation(); return;
+  }
+  const lvb=ev.target.closest("span.rq-lv");
+  if(lvb){
+    rfqCopyLive(lvb.closest("tr"));
+    ev.stopPropagation(); return;
+  }
+  const lcb=ev.target.closest("b.qc-l");
+  if(lcb){
+    rfqCopyLive(lcb.closest("tr"));
+    ev.stopPropagation(); return;
+  }
+  const qr=ev.target.closest("b.qc-r");
+  if(qr){
+    rfqSideOp(qr.closest("tr"), '/api/rfq/quote', qr.dataset.side);
+    ev.stopPropagation(); return;
+  }
+  const qx=ev.target.closest("b.qc-x");
+  if(qx){
+    rfqSideOp(qx.closest("tr"), '/api/rfq/pull', qx.dataset.side);
+    ev.stopPropagation(); return;
+  }
+  const qb=ev.target.closest("span.rq-qb");
+  if(qb){
+    const tr=qb.closest("tr");
+    let missq=false;
+    ["stock_ref","fx_ref"].forEach(f=>{
+      const inp=tr.querySelector('input[data-rf="'+f+'"]');
+      if(inp&&String(inp.value).trim()===""){ missq=true;
+        inp.classList.add("missb");
+        inp.addEventListener("input",()=>
+          inp.classList.remove("missb"),{once:true}); }
     });
-    lines.push(cells.join("\\t"));
-  });
-  copyText(lines.join("\\n")).then(ok =>
-    setStatus(ok ? "Table copied as TSV &mdash; paste into Excel."
-      : '<span class="err">Copy blocked by the browser &mdash; ' +
-        'use Ctrl+C on a selection instead.</span>'));
+    if(missq){ setS('rf_status',
+      'cannot quote: OvdSpot and OvdFx are required '+
+      '\u2014 fill the red cells','err');
+      ev.stopPropagation(); return; }
+    const j=await (await fetch('/api/rfq/quote',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({rfq_id:+tr.dataset.id,
+        token:tr.dataset.tok, user:rfqUser(), side:"both"})})).json();
+    if(j.ok){ setS('rf_status','RFQ '+tr.dataset.id+' quoted rev '+
+        j.rev+': '+(j.bid??"-")+' / '+(j.ask??"-")+'.','ok');
+      rfqLoad(true); }
+    else { setS('rf_status',j.error,'err'); rfqLoad(true); }
+    ev.stopPropagation(); return;
+  }
+  const selTr=ev.target.closest("#rfq_tbl tbody tr");
+  if(selTr && !ev.target.closest(
+      "input,select,button,b,span,svg")
+     && (ev.ctrlKey||ev.metaKey||
+         ev.target.closest("td.rq-id"))){
+    const id=String(selTr.dataset.id);
+    if(RFQ_SEL.has(id)) RFQ_SEL.delete(id);
+    else RFQ_SEL.add(id);
+    selTr.classList.toggle("rowsel", RFQ_SEL.has(id));
+    rfqMeta();
+    ev.stopPropagation(); return;
+  }
+  const hb=ev.target.closest("span.rq-h");
+  if(hb){
+    rfqHist(hb.closest("tr").dataset.id);
+    ev.stopPropagation(); return;
+  }
+  const cp=ev.target.closest("span.rq-cp");
+  if(cp){
+    const tr=cp.closest("tr");
+    const row=rfqRows.find(x=>x.rfq_id===tr.dataset.id);
+    if(row){
+      const s=rfqQuoteStr(row);
+      const ok=await rfqCopy(s);
+      setS('rf_status',(ok?'copied: ':'copy blocked \u2014 ')+s,
+           ok?'ok':'err');
+    }
+    ev.stopPropagation(); return;
+  }
+  const rj=ev.target.closest("span.rq-rj");
+  if(rj){
+    const tr=rj.closest("tr");
+    fetch('/api/rfq/reject',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({rfq_id:+tr.dataset.id,
+        token:tr.dataset.tok,user:rfqUser()})})
+      .then(r=>r.json()).then(j=>{
+        if(j.ok){
+          const row=rfqRows.find(x=>x.rfq_id===tr.dataset.id);
+          if(row){
+            row.status=j.status||"REQUESTED"; row.hit="";
+            row.bid_px=""; row.ask_px="";
+            row.flag=""; row.flag_cls="";
+            if(j.token) row._tok=j.token;
+          }
+          rfqRender();
+        }
+        setS('rf_status', j.ok?('hit busted \u2192 '+j.status+
+          ' \u00b7 quote pulled')
+          :(j.error||'reject failed'), j.ok?'ok':'err');
+        rfqLoad(true);
+      });
+    ev.stopPropagation(); return;
+  }
+  const ab=ev.target.closest("span.rq-ab");
+  if(ab){
+    const tr=ab.closest("tr");
+    const j=await (await fetch('/api/rfq/ack',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({rfq_id:+tr.dataset.id,
+        token:tr.dataset.tok, user:rfqUser()})})).json();
+    if(j.ok){
+      const row=rfqRows.find(x=>x.rfq_id===tr.dataset.id);
+      if(row){ row.status="DONE"; row.ack_by=j.ack_by||rfqUser();
+        row.flag="DONE"; row.flag_cls="fl-none"; }
+      setS('rf_status','RFQ '+tr.dataset.id+' acknowledged by '+
+        j.ack_by+'.','ok'); rfqRender(); rfqLoad(true);
+    }
+    else { setS('rf_status',j.error,'err'); rfqLoad(true); }
+    ev.stopPropagation(); return;
+  }
+  const xb=ev.target.closest("span.rq-x");
+  if(xb){
+    const tr=xb.closest("tr");
+    const user=rfqUser();
+    const j=await rfqEditSend(tr.dataset.id,"status","CANCELLED",
+                              tr.dataset.tok);
+    if(j.ok){ setS('rf_status','RFQ '+tr.dataset.id+
+        ' cancelled - updates stopped.','ok'); rfqLoad(true); }
+    else { setS('rf_status',j.error,'err'); rfqLoad(true); }
+    ev.stopPropagation(); return;
+  }
+  const up=ev.target.closest("span.rq-up");
+  if(up){
+    const tr=up.closest("tr");
+    const user=rfqUser();
+    const j=await (await fetch('/api/rfq/upload',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({rfq_id:+tr.dataset.id,user})})).json();
+    if(j.ok) setS('rf_status','RFQ '+tr.dataset.id+' staged \u2192 '+
+      JSON.stringify(j.blotter_row)+'  ['+(j.note||'uploaded')+']','ok');
+    else setS('rf_status',j.error,'err');
+    ev.stopPropagation(); return;
+  }
+});
+$('rf_bcfg').addEventListener('click',ev=>{
+  ev.stopPropagation();
+  const on=$('rfq_bcfg').classList.toggle('hide');
+  if(!on) bcLoad();
+},true);
+document.querySelectorAll('#rf_filt .rf-f').forEach(b=>{
+  b.onclick=()=>{
+    rfqFilt=b.dataset.f;
+    document.querySelectorAll('#rf_filt .rf-f').forEach(x=>
+      x.classList.toggle('on', x===b));
+    rfqRender();
+  };
+});
+$('btn_logout').onclick=async()=>{
+  try{ await fetch('/api/auth/logout',{method:'POST'}); }catch(e){}
+  location.href='/login';
+};
+function rfqCfgPaint(){
+  document.querySelectorAll('input[name="cfg_den"]')
+    .forEach(r=>r.checked=r.value===RFQ_CFG.density);
+  document.querySelectorAll('input[name="cfg_fs"]')
+    .forEach(r=>r.checked=r.value===RFQ_CFG.font);
+  $('cfg_cols').innerHTML=RFQ_COL_TOGGLE.map(([k,lab])=>
+    `<label><input type="checkbox" data-col="${k}"`+
+    `${rfqColVis(k)?" checked":""}> ${lab}</label>`).join('');
 }
-
-function download(){
-  if(!lastResponse) return;
-  const rows = lastResponse.rows.map(r=>{
-    const tr = document.querySelector(`#tbl tr[data-id="${r.secId}"]`);
-    return {
-      ...r,
-      company_name: (refCache[r.secId]||{}).company_name || "",
-      ric:          (refCache[r.secId]||{}).ric          || "",
-      short_name:   tr ? uVal(tr,"short_name") : "",
-      und_fx:       tr ? uVal(tr,"und_fx")     : "",
-      expiry_date:  (refCache[r.secId]||{}).expiry_date  || "",
-      isin:         (refCache[r.secId]||{}).isin         || "",
-    };
-  });
-  const blob = new Blob([JSON.stringify(rows,null,2)],{type:"application/json"});
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  const ts = new Date().toISOString().replace(/[-:T]/g,"").slice(0,15);
-  a.download = `cb_nuked_${ts}.json`;
-  a.click();
+$('rf_cfg').onclick=()=>{
+  rfqCfgPaint(); $('rf_cfgp').classList.toggle('hide');
+};
+$('rf_cfg_x').onclick=()=>$('rf_cfgp').classList.add('hide');
+$('rf_cfgp').addEventListener('change',ev=>{
+  const t=ev.target;
+  if(t.name==='cfg_den') RFQ_CFG.density=t.value;
+  else if(t.name==='cfg_fs') RFQ_CFG.font=t.value;
+  else if(t.dataset.col)
+    RFQ_CFG.cols[t.dataset.col]=t.checked;
+  rfqSaveCfg(); rfqApplyCfg(); rfqRender();
+});
+$('cfg_reset').onclick=()=>{
+  RFQ_CFG=JSON.parse(JSON.stringify(RFQ_CFG_DEF));
+  rfqSaveCfg(); rfqApplyCfg(); rfqCfgPaint(); rfqRender();
+};
+function rfqCfPaint(){
+  const k=$('cf_col').value;
+  const f=(RFQ_CFG.colfmt||{})[k]||{};
+  $('cf_w').value=f.w||'';
+  $('cf_fg').value=f.fg||'#1c1c1c';
+  $('cf_bg').value=f.bg||'#ffffff';
+  $('cf_bold').checked=!!f.bold;
 }
+function rfqCfSet(patch){
+  const k=$('cf_col').value; if(!k) return;
+  RFQ_CFG.colfmt=RFQ_CFG.colfmt||{};
+  const f=Object.assign({},RFQ_CFG.colfmt[k]||{},patch);
+  Object.keys(f).forEach(x=>{
+    if(f[x]===null||f[x]===''||f[x]===false) delete f[x];});
+  if(Object.keys(f).length) RFQ_CFG.colfmt[k]=f;
+  else delete RFQ_CFG.colfmt[k];
+  rfqSaveCfg(); rfqApplyColFmt();
+}
+$('cf_col').innerHTML=RFQ_COLS.map(([k,l])=>
+  `<option value="${k}">${l||k}</option>`).join('');
+$('cf_col').onchange=rfqCfPaint;
+$('cf_w').onchange=()=>rfqCfSet({w:parseInt($('cf_w').value)||null});
+$('cf_fg').oninput=()=>rfqCfSet({fg:$('cf_fg').value});
+$('cf_bg').oninput=()=>rfqCfSet({bg:$('cf_bg').value});
+$('cf_fgx').onclick=()=>{rfqCfSet({fg:null}); rfqCfPaint();};
+$('cf_bgx').onclick=()=>{rfqCfSet({bg:null}); rfqCfPaint();};
+$('cf_bold').onchange=()=>rfqCfSet({bold:$('cf_bold').checked});
+$('cf_clear').onclick=()=>{
+  const k=$('cf_col').value;
+  if(RFQ_CFG.colfmt) delete RFQ_CFG.colfmt[k];
+  rfqSaveCfg(); rfqApplyColFmt(); rfqCfPaint();
+};
+(function(){
+  const TH=$('rfq_tbl').querySelector('thead');
+  let dc=null;
+  TH.addEventListener('mousemove',e=>{
+    const th=e.target.closest('th'); if(!th||dc){ return; }
+    const r=th.getBoundingClientRect();
+    th.style.cursor=(r.width&&r.right-e.clientX<6)?'col-resize':'';
+  });
+  TH.addEventListener('mousedown',e=>{
+    const th=e.target.closest('th');
+    if(!th||th.classList.contains('rq-band')) return;
+    const r=th.getBoundingClientRect();
+    if(!r.width||r.right-e.clientX>=6) return;
+    const idx=[...th.parentNode.children].indexOf(th);
+    const vis=rfqVisCols(); if(!vis[idx]) return;
+    dc={k:vis[idx][0], x:e.clientX, w:r.width};
+    e.preventDefault();
+  });
+  window.addEventListener('mousemove',e=>{
+    if(!dc) return;
+    RFQ_CFG.colfmt=RFQ_CFG.colfmt||{};
+    RFQ_CFG.colfmt[dc.k]=Object.assign({},
+      RFQ_CFG.colfmt[dc.k]||{},
+      {w:Math.max(24,Math.round(dc.w+e.clientX-dc.x))});
+    rfqApplyColFmt();
+  });
+  window.addEventListener('mouseup',()=>{
+    if(!dc) return; dc=null; rfqSaveCfg();
+  });
+})();
+['rf_f_from','rf_f_to','rf_f_txt','rf_f_type'].forEach(id=>{
+  const el=$(id); if(!el) return;
+  el.addEventListener('input',()=>rfqRender());
+  el.addEventListener('change',()=>rfqRender());
+});
+rfqCfPaint();
+rfqApplyCfg();
+async function bcLoad(){
+  const j=await (await fetch('/api/rfq/bondcfg')).json();
+  if(!j.ok) return;
+  $('bc_body').innerHTML=(j.rows||[]).map(r=>
+    `<tr><td>${blEsc(r.isin)}</td><td>${blEsc(r.short_name||'')}</td>`+
+    `<td>${blEsc(r.tol||'')}</td>`+
+    `<td>${r.autopilot?'ON':''}</td>`+
+    `<td><span class="bc-e" data-i="${blEsc(r.isin)}" data-n="${blEsc(r.short_name||'')}" data-t="${blEsc(r.tol||'')}" data-a="${r.autopilot?1:0}" style="cursor:pointer" title="load into the editor">\u270e</span></td></tr>`).join('')||
+    '<tr><td colspan="5" style="color:#8b919a">no per-bond defaults yet</td></tr>';
+}
+$('bc_body').addEventListener('click',ev=>{
+  const e=ev.target.closest('.bc-e'); if(!e) return;
+  $('bc_isin').value=e.dataset.i; $('bc_name').value=e.dataset.n;
+  $('bc_tol').value=e.dataset.t; $('bc_ap').checked=e.dataset.a==='1';
+});
+$('bc_add').onclick=async()=>{
+  const [ok,j]=await post('/api/rfq/bondcfg',{
+    isin:$('bc_isin').value.trim(),
+    short_name:$('bc_name').value.trim(),
+    tol:$('bc_tol').value.trim(),
+    autopilot:$('bc_ap').checked?'1':'0'});
+  $('bc_status').textContent=j.ok?'saved':('ERR '+(j.error||''));
+  if(j.ok) bcLoad();
+};
+async function twRun(){
+  $('twrun').disabled=true;
+  setS('twstatus','Pulling TWSE / TPEx / SFB feeds ...');
+  try{
+    const [ok,j]=await post('/api/twcb/run',
+      {mark_seen:$('twmark').checked});
+    if(!j.ok){ setS('twstatus',j.error||'failed','err'); return; }
+    const rows=(j.events||[]).map(e=>
+      `<tr><td>${e.is_new?'<b class="twnew">NEW</b>':''}</td>`+
+      `<td>${blEsc(e.source||'')}</td>`+
+      `<td>${blEsc(e.date||'')}</td>`+
+      `<td>${e.link?`<a href="${blEsc(e.link)}" target="_blank">${blEsc(e.company||'')}</a>`
+        :blEsc(e.company||'')}</td>`+
+      `<td>${blEsc(e.text||'')}</td>`+
+      `<td>${blEsc(e.text_en||'')}</td></tr>`).join('');
+    $('tw_body').innerHTML=rows||
+      '<tr><td colspan="6" style="color:#8b919a">No CB '+
+      'issuance events in today\u2019s feeds.</td></tr>';
+    const sh=(j.shelf_rows||[]);
+    $('tw_shelf_wrap').classList.toggle('hide',!sh.length);
+    $('tws_body').innerHTML=sh.map(v=>
+      `<tr><td${v.days_left<=7?' style="color:#a8231b"':''}>${v.days_left}d</td>`+
+      `<td>${blEsc(v.date||'')}</td>`+
+      `<td>${blEsc(v.company||'')}</td>`+
+      `<td>${blEsc(v.text||'')}</td>`+
+      `<td>${blEsc(v.text_en||'')}</td></tr>`).join('');
+    setS('twstatus',`${j.new} new \u00b7 shelf ${j.shelf_live} '+
+      'live \u00b7 ${j.stats}`+(j.errors.length?' \u00b7 '+
+      j.errors.length+' err':''),
+      j.errors.length?'err':'ok');
+    $('twmeta').textContent=j.errors.concat(j.warnings)
+      .slice(0,2).join(' | ');
+    $('twdraft').disabled=false; $('twsendnow').disabled=false;
+  }catch(e){ setS('twstatus','ERROR: '+e,'err'); }
+  finally{ $('twrun').disabled=false; }
+}
+async function twSend(sendNow){
+  if(sendNow && !confirm('Send the TW CB pipeline email NOW?')) return;
+  $('twdraft').disabled=true; $('twsendnow').disabled=true;
+  setS('twstatus',sendNow?'Sending via Outlook ...'
+    :'Opening Outlook draft ...');
+  try{
+    const [ok,j]=await post('/api/twcb/send',
+      {to:$('twto').value, cc:$('twcc').value, send:sendNow});
+    setS('twstatus',(j.ok?'Outlook: ':'Outlook ERROR: ')+
+      (j.message||j.error), j.ok?'ok':'err');
+    if(j.ok){ prefPush('lagrange.twto',$('twto').value);
+      localStorage.setItem('lagrange.twto',$('twto').value);
+      localStorage.setItem('lagrange.twcc',$('twcc').value); }
+  }catch(e){ setS('twstatus','ERROR: '+e,'err'); }
+  finally{ $('twdraft').disabled=false; $('twsendnow').disabled=false; }
+}
+async function twBackfill(){
+  if(!confirm('Walk ~92 days of SFB daily pages to seed the '+
+    'shelf?\nRuns in the background - a few minutes.')) return;
+  $('twbf').disabled=true;
+  try{
+    const [ok,j]=await post('/api/twcb/backfill',{days:92});
+    if(!j.ok){ setS('twstatus',j.error||'backfill failed','err');
+      $('twbf').disabled=false; return; }
+    setS('twstatus','Backfill running in the background '+
+      '\u2014 walking SFB history ...');
+    for(;;){
+      const r=await fetch('/api/twcb/backfill_status');
+      const s=await r.json();
+      if(!s.running){
+        if(s.error){ setS('twstatus','Backfill ERROR: '+
+          s.error,'err'); }
+        else { await twRun();
+          setS('twstatus',s.msg||'backfill done','ok'); }
+        break;
+      }
+      await new Promise(x=>setTimeout(x,3000));
+    }
+  }catch(e){ setS('twstatus','ERROR: '+e,'err'); }
+  finally{ $('twbf').disabled=false; }
+}
+$('twbf').onclick=twBackfill;
+$('twrun').onclick=twRun;
+$('twdraft').onclick=()=>twSend(false);
+$('twsendnow').onclick=()=>twSend(true);
+$('twto').value=localStorage.getItem('lagrange.twto')||'';
+$('twcc').value=localStorage.getItem('lagrange.twcc')||'';
+function rfqBarReq(){
+  const ord=($('rf_ord')&&$('rf_ord').value)||'';
+  const vsty=['vs','versus'].includes($('rf_style').value);
+  const R={rf_lvl:ord==='buy'||ord==='two',
+    rf_lvl2:ord==='sell'||ord==='two',
+    rf_vs:false,
+    rf_fx:false, rf_delta:false, rf_qty:false, rf_client:false};
+  Object.entries(R).forEach(([id,req])=>{
+    const el=$(id); if(!el) return;
+    el.classList.remove('miss');
+    el.classList.toggle('req',req);
+    el.classList.toggle('opt',!req);
+  });
+  return R;
+}
+function rfqOrdLab(){
+  const o=$('rf_ord');
+  $('rf_send').textContent=(o&&o.value)?'Send Order':'Send RFQ';
+  rfqBarReq();
+}
+if($('rf_ord')) $('rf_ord').onchange=rfqOrdLab;
+$('rf_style').addEventListener('change',rfqBarReq);
+$('rf_sides').addEventListener('change',rfqBarReq);
+rfqBarReq();
+$('rf_send').onclick=rfqSend;
+$('rf_reload').onclick=()=>rfqLoad();
 
-initColPicker();
-wireSideResizer();
-sidePaint();
-document.getElementById("ids").value = DEFAULT_IDS.join("\\n");
-buildTable();
-loadCfgForm();
-NS.connect();
-</script>
-</body>
-</html>"""
+/* ---- tab 4: Nuke Station embed ---- */
+let nukeLoaded=false;
+async function nukeConnect(){
+  try{
+    setS('nstatus','Checking / starting Nuke Station ...');
+    let [ok,j]=await post('/api/nuke/start');
+    $('nopen').href=j.url; $('nstat').textContent=j.url;
+    for(let i=0; i<8 && !j.up; i++){          // give a fresh child ~8s to bind
+      await new Promise(r=>setTimeout(r,1000));
+      const r2=await fetch('/api/nuke/status'); j=await r2.json();
+    }
+    if(j.up){
+      if(!nukeLoaded){ $('nframe').src=j.url; nukeLoaded=true; }
+      setS('nstatus','Connected - live Nuke Station below.'+
+        (j.child==='running'?' (auto-started by Lagrange; closes with it)':''),'ok');
+    }else{
+      nukeLoaded=false; $('nframe').src='about:blank';
+      setS('nstatus','Nuke Station NOT running at '+j.url+'.\n'+
+        'Autostart says: '+(j.note||'no info')+'\n'+
+        'Fix the cause, then press Connect (it retries the start).','err');
+    }
+  }catch(e){ setS('nstatus','ERROR: '+e,'err'); }
+}
+$('nretry').onclick=()=>{ nukeLoaded=false; nukeConnect(); };
+</script></body></html>"""
 
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return (PAGE.replace("__DEFAULT_IDS__", json.dumps(STATE["ids"]))
-                .replace("__IDS_SRC__", "shared"))
-
-
-def preflight_port_check(port: int = None) -> None:
-    """Fail fast with clear remediation if the port is already taken,
-    BEFORE uvicorn's noisy startup/shutdown cycle and the browser open."""
-    import socket as _socket
-    port = PORT if port is None else port
-    probe = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
-    try:
-        probe.bind((HOST, port))
-        probe.close()
-        return
-    except OSError as exc:
-        probe.close()
-        hint = "Another application is using this port."
-        try:
-            import urllib.request
-            page = urllib.request.urlopen(
-                f"http://127.0.0.1:{port}/", timeout=2).read(4000)
-            if b"cb nuke station" in page.lower():
-                hint = ("A CB Nuke Station instance is ALREADY serving on this "
-                        "port -- probably an earlier session that never exited. "
-                        "Your browser may be showing that OLD version.")
-        except Exception:
-            hint = ("Another process holds the port but does not answer HTTP "
-                    "(could be a stuck/half-dead process).")
-        logger.error("Cannot start: port %s is already in use (%s)", port, exc)
-        logger.error(hint)
-        logger.error("Find it:   netstat -ano | findstr :%s", port)
-        logger.error("Kill it:   taskkill /PID <pid-from-netstat> /F")
-        logger.error("Or run this instance on another port:  set APP_PORT=59998")
-        if port >= 49152:
-            logger.error(
-                "NOTE: port %s is inside Windows' dynamic range (49152-65535), "
-                "so ANY app can grab it as an ephemeral port at random.", port)
-            logger.error(
-                "Permanent fix (admin, while the port is free):  netsh int ipv4 "
-                "add excludedportrange protocol=tcp startport=%s "
-                "numberofports=1", port)
-        raise SystemExit(1)
+    return PAGE
 
 
 if __name__ == "__main__":
-    # Convenience launcher: `python app.py`.
-    # Port/host come from APP_PORT / APP_HOST (defaults 59999 / 0.0.0.0).
-    import webbrowser
-    from threading import Timer
-
-    preflight_port_check()
-    browser_url = resolve_browser_url()
-    share_url = f"http://{SERVER_FQDN}:{PORT}/" if _running_on_server() \
-        else f"http://<this-machine>:{PORT}/"
-    logger.info("Opening browser at: %s", browser_url)
-    logger.info("Share with the desk: %s", share_url)
-
-    def _open_browser() -> None:
-        # Shortly after launch so the server has time to bind first.
+    import uvicorn
+    if NUKE_EMBED:
+        _embed_nuke()
         try:
-            webbrowser.open_new(browser_url)
-        except Exception as exc:
-            logger.warning("Could not open browser: %s", exc)
-
-    if os.environ.get("NUKE_NO_BROWSER"):
-        logger.info("NUKE_NO_BROWSER set - not opening a browser tab "
-                    "(started by Lagrange)")
+            import socket
+            print("[nuke] desk URL: http://%s:%d/nuke/"
+                  % (socket.getfqdn(), PORT))
+        except Exception:
+            pass
     else:
-        Timer(1.5, _open_browser).start()
+        _maybe_start_nuke()
+    print("LAGRANGE build %s | mode: %s | ONE port: %d (no 59999)"
+          % (LAGRANGE_BUILD,
+             "EMBEDDED /nuke/" if NUKE_EMBED else "external Nuke Station",
+             PORT))
+    import socket as _sock
+    import webbrowser as _wb
+    from threading import Timer as _Timer
+    BIND_HOST = os.environ.get("LAGRANGE_HOST", "0.0.0.0")
+    SERVER_FQDN = os.environ.get(
+        "LAGRANGE_FQDN", "apachkgfiwx507.apac.nsroot.net")
+    SERVER_SHORT = SERVER_FQDN.split(".")[0]
 
-    if os.environ.get("LAGRANGE_CHILD"):
-        # Die with the parent: Lagrange holds our stdin pipe; when the
-        # Lagrange process ends FOR ANY REASON the pipe closes, the read
-        # returns EOF, and we exit. Works on Windows and POSIX alike.
-        import threading as _th
+    def _running_on_server():
+        try:
+            th = _sock.gethostname().lower()
+        except Exception:
+            th = ""
+        try:
+            tf = _sock.getfqdn().lower()
+        except Exception:
+            tf = ""
+        cand = {th, tf, th.split(".")[0]}
+        return (SERVER_FQDN.lower() in cand
+                or SERVER_SHORT.lower() in cand)
 
-        def _parent_watch():
+    if os.environ.get("BROWSER_URL"):
+        BROWSER_URL = os.environ["BROWSER_URL"]
+    elif _running_on_server():
+        BROWSER_URL = "http://%s:%d/" % (SERVER_FQDN, PORT)
+    else:
+        BROWSER_URL = "http://localhost:%d/" % PORT
+    print("CB Recon Web -> binding %s:%d" % (BIND_HOST, PORT))
+    print("desk URL to share: http://%s:%d/  (login required)"
+          % (SERVER_FQDN, PORT))
+    print("NOTE: keep workers=1 - sessions + list snapshot "
+          "are in-memory")
+    _Timer(1.5, lambda: _wb.open_new(BROWSER_URL)).start()
+    def _rfq_engine_loop():
+        _hz = float(os.environ.get("RFQ_ENGINE_SEC", "0.3"))
+        while True:
             try:
-                import sys as _sys
-                _sys.stdin.buffer.read()
+                if os.environ.get("LAGRANGE_TEST_LIVE") != "FILE":
+                    api_rfq_list(_bg=1)
             except Exception:
                 pass
-            logger.info("Lagrange parent gone - shutting down Nuke Station")
-            os._exit(0)
-
-        _th.Thread(target=_parent_watch, daemon=True).start()
-
-    # NOTE: reload must stay OFF (single process) so the in-memory
-    # WebSocket hub works, and so the browser only opens once.
+            time.sleep(_hz)
+    threading.Thread(target=_rfq_engine_loop,
+                     daemon=True).start()
     print("=" * 62)
-    print("  NUKE STATION  BUILD borrow.b8  \u00b7  %s"
-          % os.path.abspath(__file__))
-    print("  port %s \u00b7 if this banner is missing, an OLD file is\n  running \u2014 kill that process first." % PORT)
+    print("  LAGRANGE  BUILD r79  ·  %s" % os.path.abspath(__file__))
+    print("  port %s  ·  if this banner is missing, you are" % PORT)
+    print("  running an OLD file — kill that process first.")
     print("=" * 62)
-    uvicorn.run(app, host=HOST, port=PORT, workers=1)
+    _mount_dscan()
+    uvicorn.run(app, host=BIND_HOST, port=PORT, log_level="warning")
