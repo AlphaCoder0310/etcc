@@ -2468,7 +2468,8 @@ input.bwv.bwred{background:#fde7e5 !important;border-color:#b3261e !important;co
 #tbl.hb-dcalc th[data-band="dcalc"]:not(.bfirst),#tbl.hb-dcalc td[data-band="dcalc"]:not(.bfirst){display:none}
 #tbl.hb-dcalc .bfirst[data-band="dcalc"]{font-size:0;padding:0;width:14px;min-width:14px;max-width:14px;background:#f3f2ef;border-left:1px solid #d8d4cc}
 #tbl.hb-dcalc .bfirst[data-band="dcalc"] input{display:none}
-input.dcv{width:74px}
+input.dcv{width:100%;box-sizing:border-box}
+.dc{background:#f6f3ea}
 td[data-c="dc_shares"],td[data-c="dc_usd"]{background:#f6f3ea;font-weight:600;text-align:right}
 #tbl.hb-inp th[data-band="inp"]:not(.bfirst),#tbl.hb-inp td[data-band="inp"]:not(.bfirst){display:none}
 #tbl.hb-live th[data-band="live"]:not(.bfirst),#tbl.hb-live td[data-band="live"]:not(.bfirst){display:none}
@@ -2553,7 +2554,7 @@ h2{font-size:10.5px;font-weight:700;color:var(--muted);margin:0;
 <body>
 <header>
   <h1>CB nuke station</h1>
-  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b9</b></span>
+  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b10</b></span>
   <span id="conn" class="conn warn" title="Connection">&#9679;</span>
   <span id="online" class="sub"></span>
   <div class="tabs">
@@ -2807,7 +2808,8 @@ const COL_DEFS = [
 ];
 const COL_KEYS = COL_DEFS.map(d=>d[0]);
 const DEF_W = {secId:97, company:180, short_name:110, und_fx:92,
-               ovdSpot:96, ovdCbFx:96, ovdUndFx:96};
+               ovdSpot:96, ovdCbFx:96, ovdUndFx:96,
+               dc_notl:96, dc_delta:64, dc_shares:92, dc_usd:96};
 const SIDE_W_DEF = 172;   // left secid panel; LAYOUT._side overrides
 const SIDE_RAIL = 18;     // collapsed rail width
 let SIDE_HID = localStorage.getItem("nukestation.sidehide")==="1";
@@ -3487,6 +3489,7 @@ function buildTable(idsOpt){
     `<td colspan="13" class="go grp bandhd" id="band-res" onclick="bandToggle('res')">override result &#9662;</td>` +
     `<td colspan="7" class="fb grp bandhd" id="band-flags" onclick="bandToggle('flags')">flags &#9662;</td>` +
     `<td colspan="6" class="vb grp bandhd" id="band-vol" onclick="bandToggle('vol')">vol &#9662;</td>` +
+    `<td colspan="4" class="dc grp bandhd" id="band-dcalc" onclick="bandToggle('dcalc')">delta calc &#9662;</td>` +
     `<td colspan="3" class="in grp bandhd" id="band-inp" onclick="bandToggle('inp')">override inputs &#9662;</td>` +
     `<td colspan="5" class="gl grp bandhd" id="band-live" onclick="bandToggle('live')">live &#9662;</td>` +
     `<td colspan="5" class="ge grp bandhd" id="band-eod" onclick="bandToggle('eod')">eod &#9662;</td>` +
@@ -5176,7 +5179,7 @@ if __name__ == "__main__":
     # NOTE: reload must stay OFF (single process) so the in-memory
     # WebSocket hub works, and so the browser only opens once.
     print("=" * 62)
-    print("  NUKE STATION  BUILD borrow.b9  \u00b7  %s"
+    print("  NUKE STATION  BUILD borrow.b10  \u00b7  %s"
           % os.path.abspath(__file__))
     print("  port %s \u00b7 if this banner is missing, an OLD file is\n  running \u2014 kill that process first." % PORT)
     print("=" * 62)
