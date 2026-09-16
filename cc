@@ -2554,7 +2554,7 @@ h2{font-size:10.5px;font-weight:700;color:var(--muted);margin:0;
 <body>
 <header>
   <h1>CB nuke station</h1>
-  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b11</b></span>
+  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b12</b></span>
   <span id="conn" class="conn warn" title="Connection">&#9679;</span>
   <span id="online" class="sub"></span>
   <div class="tabs">
@@ -3589,7 +3589,7 @@ function buildTable(idsOpt){
            title="realised vol, annualised (\u221a252), from daily closes"></td>`).join("") +
       `<td class="gc uinp grp bfirst" data-band="dcalc"><input class="gridcell dcv" data-dc="notl" data-id="${id}" data-row="${ri}" data-col="6" oninput="dcChg(this)" inputmode="decimal" autocomplete="off" placeholder="&#8212;" title="bond notional (face) - session only, blank at launch"></td>` +
       `<td class="gc uinp" data-band="dcalc"><input class="gridcell dcv" data-dc="delta" data-id="${id}" data-row="${ri}" data-col="7" oninput="dcChg(this)" inputmode="decimal" autocomplete="off" placeholder="&#8212;" title="delta % (e.g. 56)"></td>` +
-      `<td data-c="dc_shares" data-band="dcalc" class="rowclick" title="notional x (ovdCbFx/ovdUndFx) x delta% x PARITY% / ovdSpot"></td>` +
+      `<td data-c="dc_shares" data-band="dcalc" class="rowclick" title="notional x (ovdUndFx/ovdCbFx) x delta% x PARITY% / ovdSpot"></td>` +
       `<td data-c="dc_usd" data-band="dcalc" class="rowclick" title="notional x delta% x PARITY% / ovdCbFx"></td>` +
       FIELDS.map((f,ci)=>
         `<td class="gc inp${ci===0?" grp bfirst":""}" data-band="inp">` +
@@ -4070,8 +4070,8 @@ function updDeltaCalc(tr){
   const base = notl * dl * par;
   const fmt = v => isFinite(v) ? Math.round(v).toLocaleString("en-US") : "\u2014";
   const ok = isFinite(notl) && isFinite(dl) && isFinite(par);
-  if(shT) shT.textContent = (ok && isFinite(sp) && sp>0 && isFinite(cb)
-    && isFinite(uf) && uf>0) ? fmt(base*(cb/uf)/sp) : "\u2014";
+  if(shT) shT.textContent = (ok && isFinite(sp) && sp>0 && isFinite(uf)
+    && isFinite(cb) && cb>0) ? fmt(base*(uf/cb)/sp) : "\u2014";
   if(usT) usT.textContent = (ok && isFinite(cb) && cb>0) ? fmt(base/cb) : "\u2014";
 }
 function updParityAll(){
@@ -5188,7 +5188,7 @@ if __name__ == "__main__":
     # NOTE: reload must stay OFF (single process) so the in-memory
     # WebSocket hub works, and so the browser only opens once.
     print("=" * 62)
-    print("  NUKE STATION  BUILD borrow.b11  \u00b7  %s"
+    print("  NUKE STATION  BUILD borrow.b12  \u00b7  %s"
           % os.path.abspath(__file__))
     print("  port %s \u00b7 if this banner is missing, an OLD file is\n  running \u2014 kill that process first." % PORT)
     print("=" * 62)
