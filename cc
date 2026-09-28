@@ -1830,7 +1830,8 @@ def api_idb_compare(date: str = "", source: str = ""):
                         "repriced": (ref is not None and nkr.get("ref") == ref)}
             else:
                 mk0 = _idb_mark_from_nuke(sid) or {}
-                mark = {"my_bid": mk0.get("my_bid"), "my_offer": mk0.get("my_offer"),
+                mark = {"my_bid": idb_round_quote(_fnum(mk0.get("my_bid"))),
+                        "my_offer": idb_round_quote(_fnum(mk0.get("my_offer"))),
                         "ref": None, "repriced": False}
         mkt = dict(mkt); mkt["sec_id"] = sid
         row = idb_compare_one(key, mkt, mark, now_t)
@@ -1921,14 +1922,26 @@ def _idb_ovd_set(sid, fields, user):
     return row
 
 
+IDB_QUOTE_STEP = 0.05          # same as Nuke Station's QuoteBid/QuoteAsk (fmtBA)
+
+
+def idb_round_quote(v, step=IDB_QUOTE_STEP):
+    """Nuke's rule: nearest step, both sides (Math.round(v/step)*step)."""
+    if v is None:
+        return None
+    import math as _m
+    return round(_m.floor(float(v) / step + 0.5) * step, 2)   # exactly Math.round(v/step)*step
+
+
 def _idb_quote_from(res, row):
-    """Desk quote = engine mkt bid/ask + X, same arithmetic as _rfq_live."""
+    """Desk quote = engine mkt bid/ask + X (same arithmetic as _rfq_live),
+    then rounded to 0.05 exactly as Nuke Station shows QuoteBid/QuoteAsk."""
     if not res:
         return None, None
     x2 = _fnum(row.get("x_both")) or 0.0
     mb, ma = _fnum(res.get("ovdMktBid")), _fnum(res.get("ovdMktAsk"))
-    qb = None if mb is None else round(mb + (_fnum(row.get("x_bid")) or 0.0) + x2, 4)
-    qa = None if ma is None else round(ma + (_fnum(row.get("x_ask")) or 0.0) + x2, 4)
+    qb = None if mb is None else idb_round_quote(mb + (_fnum(row.get("x_bid")) or 0.0) + x2)
+    qa = None if ma is None else idb_round_quote(ma + (_fnum(row.get("x_ask")) or 0.0) + x2)
     return qb, qa
 
 
@@ -2098,8 +2111,11 @@ def _idb_grid_rows(tdate):
     _want = []
     for _sid, _rec in master.items():
         _want += [_rec.get("ric") or "", (_rec.get("und_fx") or "").strip()]
-    rfx, _rfx_src = idb_rfx(_want) if _want else ((st.get("rfx") or {}), "nuke")
-    RFX_SRC = {"src": _rfx_src}
+    if _IDB_RD["data"] and time.time() - _IDB_RD["ts"] < 600:   # never opens a session here
+        rfx, _rfx_src = {**(st.get("rfx") or {}), **_IDB_RD["data"]}, "idb-session (cached)"
+    else:
+        rfx, _rfx_src = (st.get("rfx") or {}), "nuke cache (IDB session opens on Last/Close)"
+    _IDB_RD["last_src"] = _rfx_src
     if _IDB_HIST_CACHE["rev"] != IDB_REV["n"] or _IDB_HIST_CACHE["board"] is None:
         _IDB_HIST_CACHE["board"], _ = _idb_board(None)   # once per IDB write
         _IDB_HIST_CACHE["rev"] = IDB_REV["n"]
@@ -2160,7 +2176,8 @@ def _idb_grid_rows(tdate):
                 repriced = (ref is not None and nkr.get("ref") == ref)
                 mark = {"my_bid": qb, "my_offer": qa, "ref": nkr.get("ref"), "repriced": repriced}
             else:
-                mark = {"my_bid": det["quote_bid"], "my_offer": det["quote_ask"],
+                mark = {"my_bid": idb_round_quote(det["quote_bid"]),
+                        "my_offer": idb_round_quote(det["quote_ask"]),
                         "ref": None, "repriced": False}
             if manual.get(key):
                 mm_ = manual[key]; mark = {"my_bid": mm_.get("my_bid"), "my_offer": mm_.get("my_offer"),
@@ -2206,8 +2223,7 @@ def api_idb_grid(date: str = ""):
     meta = (mod.STATE.get("nukeMeta") if mod else None) or {}
     return {"ok": err is None, "error": err, "date": tdate, "rows": rows,
             "nuke_ts": meta.get("ts", ""), "nuke_by": meta.get("by", ""),
-            "rfx_src": ("idb-session" if _IDB_RD["ts"] and not _IDB_RD["err"] else
-                        (_IDB_RD["err"][:80] and "idb-session down: " + _IDB_RD["err"][:80]) or "idb-session")}
+            "rfx_src": _IDB_RD.get("last_src", "") + ((" · last error: " + _IDB_RD["err"][:80]) if _IDB_RD.get("err") else "")}
 
 
 def _nk_write(sid, fields, user):
@@ -2366,7 +2382,8 @@ def api_idb_fill(req: IdbFill, request: Request):
         return JSONResponse(status_code=503, content={"ok": False, "error": "nuke module not loaded"})
     st = mod.snapshot()
     master = _conv_master().get("by_sid", {})
-    ids = req.sec_ids or list(_idb_mapped_sids().keys())
+    mapped = _idb_mapped_sids()
+    ids = req.sec_ids or list(mapped.keys())
     want = []
     for sid in ids:
         row = (st.get("rows") or {}).get(sid) or {}
@@ -2393,6 +2410,14 @@ def api_idb_fill(req: IdbFill, request: Request):
             f = {"ovdSpot": sp, "ovdUndFx": fx, "ovdCbFx": (fx if van else nk.get("liveCbFx"))}
         elif req.kind == "clear":
             f = {"ovdSpot": "", "ovdCbFx": "", "ovdUndFx": ""}
+        elif req.kind == "bref":
+            ref, _side, _d = _idb_ref_for(mapped.get(sid) or {})
+            if ref is None:
+                continue
+            # ovdSpot = the ref used; FX overrides from Nuke's LIVE section
+            f = {"ovdSpot": ref, "ovdCbFx": nk.get("liveCbFx"), "ovdUndFx": nk.get("liveUndFx")}
+            if van and f.get("ovdUndFx") is not None:
+                f["ovdCbFx"] = f["ovdUndFx"]          # vanilla: cbFx follows undFx
         else:
             return JSONResponse(status_code=400, content={"ok": False, "error": "kind?"})
         f = {k: v for k, v in f.items() if v is not None}
@@ -2428,10 +2453,17 @@ def api_idb_nuke(req: IdbFill, request: Request):
             ov = IDB_OVD.get(sid, {})
             nk = (st.get("nuke") or {}).get(sid) or {}
             spot = ref if ref is not None else (_nk_num(ov.get("ovdSpot")) or _nk_num(nk.get("liveSpot")))
-            if ref is not None:
-                _idb_ovd_set(sid, {"ovdSpot": ref}, user)          # step 2: REF -> OVDSPOT (IDB only)
-            cb = _nk_num(ov.get("ovdCbFx")) or _nk_num(nk.get("liveCbFx")) or 0.0
-            uf = _nk_num(ov.get("ovdUndFx")) or _nk_num(nk.get("liveUndFx")) or 0.0
+            row0 = (st.get("rows") or {}).get(sid) or {}
+            van = (row0.get("bond_type") or "").lower().startswith("vanil")
+            uf = _nk_num(nk.get("liveUndFx")) or _nk_num(ov.get("ovdUndFx")) or 0.0
+            cb = (uf if van else (_nk_num(nk.get("liveCbFx")) or _nk_num(ov.get("ovdCbFx")) or 0.0))
+            if ref is not None:                                  # step 2: REF + live FX -> IDB overrides
+                fset = {"ovdSpot": ref}
+                if uf:
+                    fset["ovdUndFx"] = uf
+                if cb:
+                    fset["ovdCbFx"] = cb
+                _idb_ovd_set(sid, fset, user)
             if spot is None:
                 continue
             entries.append({"secId": sid, "ovdSpot": float(spot), "ovdCbFx": float(cb), "ovdUndFx": float(uf)})
@@ -4519,7 +4551,7 @@ def _ensure_rfq():
                 "ALTER TABLE cba_app.rfq ADD COLUMN req_fx DECIMAL(14,6) NULL",
                 "ALTER TABLE cba_app.rfq ADD COLUMN q_delta DECIMAL(8,2) NULL",
                 "ALTER TABLE cba_app.rfq ADD COLUMN q_delta_ovd TINYINT DEFAULT 0",
-                # r100 repair: rows given the terminal status EXPIRED by
+                # r104 repair: rows given the terminal status EXPIRED by
                 # the r80/r81 E button become the correct quote-expired
                 # state (open, off_flag=expired). Idempotent.
                 "UPDATE cba_app.rfq SET status='REQUESTED', "
@@ -5360,7 +5392,7 @@ def api_rfq_list(_bg: int = 0):
             payload = {"ok": True, "rows": rows,
                        "ms": int((time.time() - _t0) * 1000),
                        "qttl": RFQ_QUOTE_TTL,
-                       "build": "r100",
+                       "build": "r104",
                        "editable": sorted(RFQ_EDITABLE)}
             RFQ_SNAP["data"] = payload
             RFQ_SNAP["ts"] = time.time()
@@ -6929,7 +6961,24 @@ tr.bimp td{background:#fdf3d7}
 #ib_tbl td.nsec{background:#fafafa}#ib_tbl td.gM{background:#ffe082;font-weight:700}#ib_tbl td.pc{background:#fff9c4}
 #ib_tbl td.qcell{background:#c8e6c9;font-weight:700}#ib_tbl td.uinp{background:#fff3cd}#ib_tbl td.uinp input{width:70px;background:transparent;border:0;font:inherit;text-align:right}
 #ib_tbl td.lv{background:#e0f7fa}#ib_tbl td.eo{background:#eef2f7}#ib_tbl td.stk{background:#b2ebf2;font-weight:700}#ib_tbl td.fxc{background:#e1bee7;font-weight:700}
-#ib_tbl td.ibq{background:#f4faf7}#ib_tbl td.ibc{background:#e3f1ea;font-weight:600}
+/* section palette: pale tint on cells, darker shade on the band header, rule between sections */
+#ib_tbl td.mapc{background:#fdf8ec}#ib_tbl tr.band td.b-mapc{background:#f3e7c3;color:#5a4a1c}
+#ib_tbl td.nsec{background:#f7f7f7}#ib_tbl tr.band td.b-nsec{background:#e2e2e2;color:#333}
+#ib_tbl td.mdl{background:#eef3fb}#ib_tbl tr.band td.b-mdl{background:#cfdcf3;color:#1e3a6e}
+#ib_tbl td.res{background:#eef7f0}#ib_tbl tr.band td.b-res{background:#cde7d3;color:#1f4d2b}
+#ib_tbl td.ibq{background:#f3effa}#ib_tbl tr.band td.b-ibq{background:#dcd3f0;color:#3b2a6e}
+#ib_tbl td.ibc{background:#e2f0e6;font-weight:600}#ib_tbl tr.band td.b-myq{background:#cde7d3;color:#1f4d2b}#ib_tbl td.myq{background:#eef7f0}
+#ib_tbl td.uinp{background:#fff3cd}#ib_tbl tr.band td.b-uinp{background:#f5dd8a;color:#5a4300}
+#ib_tbl td.lv{background:#e9f6f8}#ib_tbl tr.band td.b-lv{background:#c4e5ec;color:#0d4a56}
+#ib_tbl td.eo{background:#eff2f5}#ib_tbl tr.band td.b-eo{background:#d3dbe3;color:#2b3a49}
+#ib_tbl td.stk{background:#fbf8e7}#ib_tbl tr.band td.b-stk{background:#efe4a8;color:#5a4d0a}
+#ib_tbl td.fxc{background:#faeff0}#ib_tbl tr.band td.b-fxc{background:#efcdd1;color:#6b1f28}
+#ib_tbl td.chk{background:#f6f6f6}#ib_tbl tr.band td.b-chk{background:#dedede;color:#333}
+#ib_tbl td.trd{background:#fbf8e7}#ib_tbl tr.band td.b-trd{background:#efe4a8;color:#5a4d0a}
+#ib_tbl tr.band td{border-left:2px solid #fff}#ib_tbl td.gcol,#ib_tbl th.gcol{border-left:2px solid #c9c9c9}
+#ib_tbl thead{position:sticky;top:0;z-index:3}#ib_tbl th{background:#fafafa;color:#222;border-bottom:2px solid #888}
+#ib_tbl tbody tr:nth-child(even) td{filter:brightness(0.975)}#ib_tbl tbody tr:hover td{filter:brightness(0.93)}
+#ib_tbl td.qcell{background:#cfe9d3;font-weight:700}
 #ib_tbl .cvacc{font-size:10px;padding:0 5px;background:#0b6e66;color:#fff;border-color:#0b6e66;cursor:pointer}#ib_tbl td.mapc{background:#fbfbf7}
 #cv_tbl{font-size:10px;line-height:1.15;border-collapse:collapse}
 #cv_tbl th{font-size:8.5px;padding:2px 4px;letter-spacing:.4px;text-align:right}
@@ -7158,7 +7207,7 @@ body.amdock-b #rm_grip{left:0;right:0;top:0;bottom:auto;
  .btnrow{display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap}
  .btnrow .hint{color:#6e6a63;font-size:12px}
 </style></head><body>
-<header>LAGRANGE <small>CB Runs desk console &middot; build 2026-08-19.r100 &middot; one port (59988)</small>
+<header>LAGRANGE <small>CB Runs desk console &middot; build 2026-08-19.r104 &middot; one port (59988)</small>
   <small id="built"></small></header>
 <div id="tabs">
   <div class="tab active" id="tabbtn-recon" onclick="showTab('recon')">TRADE BOOKING RECONCILIATION</div>
@@ -7471,8 +7520,8 @@ coming later).</div>
     <textarea id="ib_paste" rows="4" placeholder="paste a broker run here (Bloomberg chat text, Ctrl+V) - one quote per line, e.g.  09:20:05 ANTA 29 96.75 offered r 71.95" style="width:46%;font:10.5px Consolas,Menlo,monospace"></textarea>
     <div style="display:flex;flex-direction:column;gap:4px">
       <div><label>source</label> <input type="text" id="ib_src" value="IDB1" size="6"> <label>date</label> <input type="date" id="ib_date"> <button id="ib_ingest">Ingest run</button></div>
-      <div><button id="ib_nuke" class="k" title="re-nuke every mapped bond at the broker's @REF (IDB tab only - Nuke Station untouched)">Re-nuke @ broker REF</button> <button data-fill="live">Live &rarr; ovd</button> <button data-fill="eod">EOD &rarr; ovd</button> <button data-fill="last">Last &rarr; ovd</button> <button id="ib_auto">AUTO last: OFF</button> <button data-fill="close">Close &rarr; ovd</button> <button data-fill="clear">Clear overrides</button></div>
-      <div><button id="ib_accall" title="accept every suggested mapping (rows keep ASSUMED status until you confirm)">Accept all suggestions</button> <span class="sm">IDB tab r100</span></div>
+      <div><button id="ib_nuke" class="k" title="re-nuke every mapped bond at the broker's @REF (IDB tab only - Nuke Station untouched)">Re-nuke @ broker REF</button> <button data-fill="live">Live &rarr; ovd</button> <button data-fill="eod">EOD &rarr; ovd</button> <button data-fill="last">Last &rarr; ovd</button> <button id="ib_auto">AUTO last: OFF</button> <button data-fill="close">Close &rarr; ovd</button> <button data-fill="bref" title="ovdSpot = broker @REF (ref used, more recently quoted side); ovdCbFx / ovdUndFx = Nuke LIVE fx - IDB tab only, no re-nuke">Broker Ref &rarr; ovd</button> <button data-fill="clear">Clear overrides</button></div>
+      <div><button id="ib_accall" title="accept every suggested mapping (rows keep ASSUMED status until you confirm)">Accept all suggestions</button> <span class="sm">IDB tab r104</span></div>
       <div><button id="ib_v_grid" class="on">Grid</button> <button id="ib_v_cmp">Compare</button> <button id="ib_v_board">Board</button> <button id="ib_v_alias">Aliases</button> <button id="ib_v_unp">Unparsed</button> <button id="ib_reload">&#8635;</button></div>
       <span class="status" id="ib_meta">workflow: parse broker @REF &rarr; IDB ovdSpot := REF &rarr; re-nuke (IDB overrides only, Nuke Station untouched) &rarr; compare desk quote @REF vs broker levels as quoted &middot; amber = IDB-tab overrides</span>
     </div>
@@ -9310,15 +9359,15 @@ async function idbLoad(){
 }
 const IB_SECT=[
  ["idb \u2192 my bond","mapc",[["idb_name","idb name"],["my_short","my short_name"],["map","map"]]],
- ["securities \u00b7 yours","",[["secId","secid"],["company","company"],["short_name","short_name"],["bond_type","bond_t"],["ric","ric"],["expiry","expiry"],["isin","isin"],["sec_fx","sec_fx"],["und_fx","und_fx"]]],
- ["model (last nuke)","",[["n_bid","nbid"],["n_gamma","ngamma"],["n_spread","nspread"],["n_spot","nspot"],["n_spotfx","nspotfx"],["n_delta","ndelta%"],["parityPct","parity%"]]],
- ["override result","",[["x_bid","xbid"],["or_bid_sprd","orbidsprd"],["ovd_bid","bid"],["ovd_ask","ask"],["or_ask_sprd","oraskspr"],["x_ask","xask"],["x_both","x"],["quote_bid","quotebid"],["quote_ask","quoteask"],["stk_move","stk%"]]],
+ ["securities \u00b7 yours","nsec",[["secId","secid"],["company","company"],["short_name","short_name"],["bond_type","bond_t"],["ric","ric"],["expiry","expiry"],["isin","isin"],["sec_fx","sec_fx"],["und_fx","und_fx"]]],
+ ["model (last nuke)","mdl",[["n_bid","nbid"],["n_gamma","ngamma"],["n_spread","nspread"],["n_spot","nspot"],["n_spotfx","nspotfx"],["n_delta","ndelta%"],["parityPct","parity%"]]],
+ ["override result","res",[["x_bid","xbid"],["or_bid_sprd","orbidsprd"],["ovd_bid","bid"],["ovd_ask","ask"],["or_ask_sprd","oraskspr"],["x_ask","xask"],["x_both","x"],["quote_bid","quotebid"],["quote_ask","quoteask"],["stk_move","stk%"]]],
  ["idb quotes \u00b7 mkt = broker as quoted \u00b7 my = re-nuked @ broker ref","ibq",[["idb_bid","mkt bid"],["idb_bref","@ref"],["idb_btime","time"],["idb_ask","mkt offer"],["idb_aref","@ref"],["idb_atime","time"],["idb_ref","ref used"],["idb_rb","my bid @ref"],["idb_ra","my offer @ref"],["idb_gap","gap"],["idb_flag","flags"]]],
  ["override inputs","uinp",[["ovdSpot","ovdspot"],["ovdCbFx","ovdcbfx"],["ovdUndFx","ovdundfx"]]],
- ["live","",[["live_bid","bid"],["live_ask","ask"],["live_spot","spot"],["live_cbfx","cbfx"],["live_undfx","undfx"]]],
- ["eod","",[["eod_bid","bid"],["eod_ask","ask"],["eod_spot","spot"],["eod_cbfx","cbfx"],["eod_undfx","undfx"]]],
- ["stock","",[["stk_last","last"],["stk_time","time"],["stk_date","date"],["stk_close","close"],["stk_closedt","close dt"]]],
- ["fx","",[["fx_last","fx last"],["fx_time","fx time"],["fx_date","fx date"],["fx_close","fx close"],["fx_closedt","fx close dt"]]]];
+ ["live","lv",[["live_bid","bid"],["live_ask","ask"],["live_spot","spot"],["live_cbfx","cbfx"],["live_undfx","undfx"]]],
+ ["eod","eo",[["eod_bid","bid"],["eod_ask","ask"],["eod_spot","spot"],["eod_cbfx","cbfx"],["eod_undfx","undfx"]]],
+ ["stock","stk",[["stk_last","last"],["stk_time","time"],["stk_date","date"],["stk_close","close"],["stk_closedt","close dt"]]],
+ ["fx","fxc",[["fx_last","fx last"],["fx_time","fx time"],["fx_date","fx date"],["fx_close","fx close"],["fx_closedt","fx close dt"]]]];
 const IB_LEFT=new Set(["idb_name","my_short","map","idb_nuked","company","short_name","ric","isin","bond_type","idb_flag","idb_btime","idb_atime","stk_time","stk_date","stk_closedt","fx_time","fx_date","fx_closedt"]);
 function ibCell(k,v,sect){
   const cls=sect[1]+(IB_LEFT.has(k)?" l":"")+(k==="quote_bid"||k==="quote_ask"?" qcell":"")+(["idb_rb","idb_ra","idb_gap","idb_ref"].includes(k)?" ibc":"");
@@ -9331,13 +9380,17 @@ function ibCell(k,v,sect){
   if(k==="idb_flag") return '<td class="'+cls+'">'+ibFlags(v)+'</td>';
   if(k==="short_name") return '<td class="'+cls+'"><b>'+blEsc(v==null?"":v)+'</b></td>';
   if(k==="secId") return '<td class="'+cls+'">'+blEsc(v==null?"":String(v))+'</td>';
-  let s; if(v==null||v==="") s=""; else if(typeof v==="number") s=(["stk_last","stk_close","idb_bref","idb_aref","live_spot","eod_spot","n_spot"].includes(k)||Math.abs(v)>=1000)?Number(v).toLocaleString("en-US",{maximumFractionDigits:2}):(k==="idb_gap"?((v>0?"+":"")+v.toFixed(3)):(["idb_rb","idb_ra"].includes(k)?v.toFixed(3):(k==="n_delta"?v.toFixed(1)+"%":v.toFixed(2)))); else s=String(v);
+  let s; if(v==null||v==="") s=""; else if(typeof v==="number") s=(["stk_last","stk_close","idb_bref","idb_aref","live_spot","eod_spot","n_spot"].includes(k)||Math.abs(v)>=1000)?Number(v).toLocaleString("en-US",{maximumFractionDigits:2}):(k==="idb_gap"?((v>0?"+":"")+v.toFixed(3)):(["idb_rb","idb_ra"].includes(k)?v.toFixed(2):(k==="n_delta"?v.toFixed(1)+"%":v.toFixed(2)))); else s=String(v);
   return '<td class="'+cls+'">'+blEsc(s)+'</td>';
 }
 function idbRenderGrid(){
   const th=$('ib_tbl').querySelector('thead'), tb=$('ib_tbl').querySelector('tbody');
-  th.innerHTML='<tr class="band">'+IB_SECT.map(s=>'<td colspan="'+s[2].length+'">'+s[0]+' &#9662;</td>').join('')+'</tr><tr>'+IB_SECT.map((s,si)=>s[2].map(([k,l],ci)=>'<th class="'+(IB_LEFT.has(k)?'l':'')+(ci===0&&si>0?' gcol':'')+'">'+l+'</th>').join('')).join('')+'</tr>';
+  const ae=document.activeElement; let keep=null;
+  if(ae && ae.closest && ae.closest('#ib_tbl') && ae.tagName==='INPUT'){ const tr=ae.closest('tr'); keep={bk:tr&&tr.dataset.bk, f:ae.dataset.f||(ae.dataset.ms?'ms':null), val:ae.value, s:ae.selectionStart, e:ae.selectionEnd}; }
+  th.innerHTML='<tr class="band">'+IB_SECT.map(s=>'<td class="b-'+(s[1]||'chk')+'" colspan="'+s[2].length+'">'+s[0]+' &#9662;</td>').join('')+'</tr><tr>'+IB_SECT.map((s,si)=>s[2].map(([k,l],ci)=>'<th class="'+(IB_LEFT.has(k)?'l':'')+(ci===0&&si>0?' gcol':'')+'">'+l+'</th>').join('')).join('')+'</tr>';
   tb.innerHTML=IB.rows.map(r=>{ CUR_BK=r.broker_key; return '<tr data-id="'+(r.secId||'')+'" data-bk="'+blEsc(r.broker_key||'')+'">'+IB_SECT.map((s,si)=>s[2].map(([k],ci)=>ibCell(k,r[k],s).replace('<td class="','<td class="'+(ci===0&&si>0?'gcol ':''))).join('')).join('')+'</tr>'; }).join('');
+  if(keep && keep.bk && keep.f){ try{ const tr=tb.querySelector('tr[data-bk="'+keep.bk+'"]'); const el=tr && (keep.f==='ms'?tr.querySelector('input[data-ms]'):tr.querySelector('input[data-f="'+keep.f+'"]'));
+    if(el){ if(el.value!==keep.val) el.value=keep.val; el.focus({preventScroll:true}); if(keep.s!=null) try{ el.setSelectionRange(keep.s,keep.e); }catch(_){} } }catch(_){} }
 }
 let CUR_BK='';
 async function ibAccept(el){ const tr=el.closest('tr'); const r=IB.rows.find(x=>x.broker_key===tr.dataset.bk); if(!r||!r.suggest) return;
@@ -9351,28 +9404,28 @@ async function ibMapShort(el){ const tr=el.closest('tr'); const [ok,j]=await pos
   else setS('ib_meta',(j&&j.error)||'map failed','err'); }
 async function ibOvd(el){ if(!el.closest('tr').dataset.id){ setS('ib_meta','map this row to a Nuke bond first','err'); return; } const tr=el.closest('tr'); const [ok,j]=await post('/api/idb/ovd',{sec_id:tr.dataset.id,field:el.dataset.f,value:el.value});
   if(j&&j.ok){ setS('ib_meta','override saved \u2192 Nuke state ('+el.dataset.f+' on '+tr.dataset.id+')','ok'); setTimeout(idbLoad,400); } else setS('ib_meta',(j&&j.error)||'override failed','err'); }
-async function ibFill(kind){ const [ok,j]=await post('/api/idb/fill',{kind}); if(j&&j.ok){ setS('ib_meta',kind+' \u2192 ovd applied to '+j.n+' rows (shared with Nuke Station)','ok'); idbLoad(); } else setS('ib_meta',(j&&j.error)||'fill failed','err'); }
+async function ibFill(kind){ const [ok,j]=await post('/api/idb/fill',{kind}); if(j&&j.ok){ setS('ib_meta',(kind==='bref'?'Broker Ref':kind)+' \u2192 ovd applied to '+j.n+' row(s) (IDB tab only'+(j.src?' \u00b7 refinitiv: '+j.src:'')+')','ok'); idbLoad(); } else setS('ib_meta',(j&&j.error)||'fill failed','err'); }
 async function ibNuke(){ setS('ib_meta','re-nuking at broker refs\u2026 (IDB overrides only)',''); const [ok,j]=await post('/api/idb/nuke',{}); if(j&&j.ok){ setS('ib_meta','re-nuked '+j.n+' mapped bond(s) at their broker @REF in '+(j.elapsed||'?')+'s'+(j.note?' - '+j.note:''),'ok'); idbLoad(); } else setS('ib_meta',(j&&j.error)||'re-nuke failed','err'); }
 let IB_AUTO=null; function ibAutoToggle(){ const b=$('ib_auto'); if(IB_AUTO){ clearInterval(IB_AUTO); IB_AUTO=null; b.textContent='AUTO last: OFF'; b.className=''; } else { IB_AUTO=setInterval(async()=>{ await ibFill('last'); await ibNuke(); },15000); ibFill('last').then(ibNuke); b.textContent='AUTO last: ON'; b.className='g'; } }
 function idbRender(){
   const th=$('ib_tbl').querySelector('thead'), tb=$('ib_tbl').querySelector('tbody'); const v=IB.view;
   if(v==='grid'){ idbRenderGrid(); return; }
-  const hd=(bands,cols)=>'<tr class="band">'+bands.map(([l,n])=>'<td colspan="'+n+'">'+l+'</td>').join('')+'</tr><tr>'+cols.map(c=>'<th class="'+(c[1]||'')+'">'+c[0]+'</th>').join('')+'</tr>';
+  const hd=(bands,cols)=>'<tr class="band">'+bands.map(([l,n,b])=>'<td class="b-'+(b||'chk')+'" colspan="'+n+'">'+l+'</td>').join('')+'</tr><tr>'+cols.map(c=>'<th class="'+(c[1]||'')+'">'+c[0]+'</th>').join('')+'</tr>';
   if(v==='cmp'){
-    th.innerHTML=hd([["idb \u2192 my bond",3],["mkt (broker as quoted)",6],["my quote (re-nuked @ broker ref)",3],["check",3]],
+    th.innerHTML=hd([["idb \u2192 my bond",3,"mapc"],["mkt (broker as quoted)",6,"ibq"],["my quote (re-nuked @ broker ref)",3,"myq"],["check",3,"chk"]],
       [["idb name","l"],["my short_name","l"],["map",""],["mkt bid","gcol"],["@ref",""],["time",""],["mkt offer",""],["@ref",""],["time",""],["ref used","gcol"],["my bid",""],["my offer",""],["gap","gcol"],["src",""],["flags","l"]]);
     tb.innerHTML=IB.rows.map((r,i)=>'<tr data-i="'+i+'"><td class="mapc l"><b>'+blEsc((r.spellings||[r.broker_key]).join(', '))+'</b></td><td class="mapc l">'+blEsc(r.my_short||'')+'</td>'
       +'<td class="mapc">'+(r.sec_id?'<span class="confirmed">mapped</span>':'<span class="assumed">unmapped</span>')+'</td>'
       +'<td class="ibq gcol">'+ibN(r.mkt_bid,2)+'</td><td class="ibq">'+ibN(r.bid_ref,2)+'</td><td class="ibq l">'+blEsc(r.bid_time||'')+'</td><td class="ibq">'+ibN(r.mkt_offer,2)+'</td><td class="ibq">'+ibN(r.offer_ref,2)+'</td><td class="ibq l">'+blEsc(r.offer_time||'')+'</td>'
-      +'<td class="ibc gcol">'+ibN(r.ref_used,2)+'</td><td class="qcell">'+ibN(r.my_bid,2)+'</td><td class="qcell">'+ibN(r.my_offer,2)+'</td>'
-      +'<td class="ibc gcol">'+(r.gap==null?'\u2014':(r.gap>0?'+':'')+Number(r.gap).toFixed(3))+'</td><td>'+blEsc(r.mark_src||'')+'</td><td class="l">'+ibFlags(r.flags)+'</td></tr>').join('');
+      +'<td class="myq gcol">'+ibN(r.ref_used,2)+'</td><td class="qcell">'+ibN(r.my_bid,2)+'</td><td class="qcell">'+ibN(r.my_offer,2)+'</td>'
+      +'<td class="chk ibc gcol">'+(r.gap==null?'\u2014':(r.gap>0?'+':'')+Number(r.gap).toFixed(3))+'</td><td class="chk">'+blEsc(r.mark_src||'')+'</td><td class="chk l">'+ibFlags(r.flags)+'</td></tr>').join('');
   } else if(v==='board'){
-    th.innerHTML=hd([["idb \u2192 my bond",3],["latest bid",3],["latest offer",3],["latest trade",2],["",2]],
+    th.innerHTML=hd([["idb \u2192 my bond",3,"mapc"],["latest bid",3,"ibq"],["latest offer",3,"ibq"],["latest trade",2,"trd"],["",2,"chk"]],
       [["idb name","l"],["my short_name","l"],["map",""],["bid","gcol"],["@ref",""],["time",""],["offer","gcol"],["@ref",""],["time",""],["trade","gcol"],["time",""],["quotes",""],["last",""]]);
     tb.innerHTML=IB.rows.map(r=>{ const a=(IB.aliases||{})[r.broker_key]||{}; return '<tr><td class="mapc l"><b>'+blEsc((r.spellings||[r.broker_key]).join(', '))+'</b></td><td class="mapc l">'+blEsc(a.my_short||'')+'</td><td class="mapc">'+(r.sec_id||a.my_short?'<span class="confirmed">mapped</span>':'<span class="assumed">unmapped</span>')+'</td>'
-      +'<td class="ibq gcol">'+ibN(r.bid,2)+'</td><td class="ibq">'+ibN(r.bid_ref,2)+'</td><td class="ibq l">'+blEsc(r.bid_time||'')+'</td><td class="ibq gcol">'+ibN(r.offer,2)+'</td><td class="ibq">'+ibN(r.offer_ref,2)+'</td><td class="ibq l">'+blEsc(r.offer_time||'')+'</td><td class="ibq gcol">'+ibN(r.trade,2)+'</td><td class="ibq l">'+blEsc(r.trade_time||'')+'</td><td>'+r.n+'</td><td class="l">'+blEsc(r.last_time||'')+'</td></tr>'; }).join('');
+      +'<td class="ibq gcol">'+ibN(r.bid,2)+'</td><td class="ibq">'+ibN(r.bid_ref,2)+'</td><td class="ibq l">'+blEsc(r.bid_time||'')+'</td><td class="ibq gcol">'+ibN(r.offer,2)+'</td><td class="ibq">'+ibN(r.offer_ref,2)+'</td><td class="ibq l">'+blEsc(r.offer_time||'')+'</td><td class="trd gcol">'+ibN(r.trade,2)+'</td><td class="trd l">'+blEsc(r.trade_time||'')+'</td><td class="chk gcol">'+r.n+'</td><td class="chk l">'+blEsc(r.last_time||'')+'</td></tr>'; }).join('');
   } else if(v==='alias'){
-    th.innerHTML=hd([["BROKER",2],["MY BOND (edit)",4]],[["broker key","l"],["spellings seen","l"],["secid","gcol"],["my short_name",""],["note",""],["status",""]]);
+    th.innerHTML=hd([["broker",2,"ibq"],["my bond (edit)",4,"mapc"]],[["broker key","l"],["spellings seen","l"],["secid","gcol"],["my short_name",""],["note",""],["status",""]]);
     tb.innerHTML=IB.rows.map(r=>{ const a=IB.aliases[r.broker_key]||{};
       return '<tr data-bk="'+blEsc(r.broker_key)+'"><td class="l"><b>'+blEsc(r.broker_key)+'</b></td><td class="l"><span class="sm">'+blEsc((r.spellings||[]).join(', '))+'</span></td>'
       +'<td class="gcol"><input class="ibi" data-k="sec_id" value="'+blEsc(a.sec_id||'')+'" onchange="ibAlias(this)" title="SECID from Nuke"></td>'
@@ -9380,7 +9433,7 @@ function idbRender(){
       +'<td><input class="ibi w" data-k="note" value="'+blEsc(a.note||'')+'" onchange="ibAlias(this)"></td>'
       +'<td><select data-k="status" onchange="ibAlias(this)"><option'+(a.status==='CONFIRMED'?'':' selected')+'>ASSUMED</option><option'+(a.status==='CONFIRMED'?' selected':'')+'>CONFIRMED</option></select></td></tr>'; }).join('');
   } else {
-    th.innerHTML=hd([["LINES TO REVIEW",3]],[["#",""],["line","l"],["reason","l"]]);
+    th.innerHTML=hd([["lines to review",3,"chk"]],[["#",""],["line","l"],["reason","l"]]);
     tb.innerHTML=IB.rows.map(r=>'<tr><td>'+r.id+'</td><td class="l">'+blEsc(r.line)+'</td><td class="l">'+blEsc(r.reason)+'</td></tr>').join('');
   }
 }
@@ -9402,7 +9455,10 @@ document.querySelectorAll('#tab-idb button[data-fill]').forEach(b=>b.onclick=()=
 if($('ib_nuke')) $('ib_nuke').onclick=ibNuke; if($('ib_auto')) $('ib_auto').onclick=ibAutoToggle;
 function ibAutoToggleIdb(){ /* IDB-only auto-last: re-fill from Refinitiv last every 15s, then re-nuke */ }
 if($('ib_accall')) $('ib_accall').onclick=ibAcceptAll;
-setInterval(()=>{ if(window.curTab==='idb' && IB.view==='grid' && !document.hidden) idbLoad(); },5000);
+function ibEditing(){ const a=document.activeElement; return !!(a && a.closest && a.closest('#ib_tbl') && (a.tagName==='INPUT'||a.tagName==='SELECT')); }
+function idbTick(){ if(window.curTab!=='idb' || document.hidden) return false; if(ibEditing()) return false; if(Date.now()-(window._ibLastEdit||0)<3000) return false; idbLoad(); return true; }
+setInterval(idbTick,5000);
+document.addEventListener('input',ev=>{ if(ev.target && ev.target.closest && ev.target.closest('#ib_tbl')) window._ibLastEdit=Date.now(); },true);
 if($('ib_date')&&!$('ib_date').value) $('ib_date').value=new Date().toISOString().slice(0,10);
 if($('ib_paste')) $('ib_paste').addEventListener('keydown',ev=>{ if(ev.key==='Enter'&&(ev.ctrlKey||ev.metaKey)) ibIngest(); });
 
@@ -10252,7 +10308,7 @@ if __name__ == "__main__":
     threading.Thread(target=_rfq_engine_loop,
                      daemon=True).start()
     print("=" * 62)
-    print("  LAGRANGE  BUILD r100  ·  %s" % os.path.abspath(__file__))
+    print("  LAGRANGE  BUILD r104  ·  %s" % os.path.abspath(__file__))
     print("  port %s  ·  if this banner is missing, you are" % PORT)
     print("  running an OLD file — kill that process first.")
     print("=" * 62)
