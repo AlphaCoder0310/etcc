@@ -54,6 +54,7 @@ import asyncio
 import json
 import logging
 import os
+import sys
 from contextlib import asynccontextmanager
 from datetime import datetime, date, timedelta
 from collections import deque
@@ -656,79 +657,33 @@ def _clean(v) -> Any:
         return str(v)
 
 
-_RFX_DIAG = {"session": "", "pricing": "", "datagrid": "", "last": ""}
+_RFX_LAST_RESET = {"t": 0.0}
+_RFX_RESET_GAP = 600.0          # never recycle the session more than once / 10 min
 
 
-def _rfx_pricing(rd, rics):
-    """CF_* via the pricing pipe only; snapshot endpoint as fallback."""
+def _rfx_may_reset() -> bool:
     import time as _t
-    flds = ["CF_LAST", "CF_TIME", "CF_DATE", "CF_CLOSE"]
-    for attempt in (1, 2):
-        try:
-            df = rd.get_data(universe=rics, fields=flds)
-            if df is not None and not getattr(df, "empty", True) and \
-                    df.get("CF_LAST") is not None and df["CF_LAST"].notna().any():
-                _RFX_DIAG["pricing"] = "get_data ok (%d rows)" % len(df)
-                return df
-            _RFX_DIAG["pricing"] = "get_data empty (attempt %d)" % attempt
-        except Exception as e:
-            _RFX_DIAG["pricing"] = "get_data error: %s" % str(e)[:160]
-        _t.sleep(1.5)                       # stream warm-up after open
-    try:                                    # explicit pricing snapshot
-        resp = rd.content.pricing.Definition(universe=rics, fields=flds).get_data()
-        df = resp.data.df
-        if df is not None and not df.empty:
-            _RFX_DIAG["pricing"] = "pricing snapshot ok (%d rows)" % len(df)
-            return df
-        _RFX_DIAG["pricing"] = "pricing snapshot empty"
-    except Exception as e:
-        _RFX_DIAG["pricing"] = "pricing snapshot error: %s" % str(e)[:160]
-    return None
-
-
-def _rfx_closes(rd, rics):
-    """TR.PriceClose via Datagrid only; failure here never blanks pricing."""
-    try:
-        df = rd.get_data(universe=rics, fields=["TR.PriceClose", "TR.PriceClose.date"])
-        if df is not None and not getattr(df, "empty", True):
-            _RFX_DIAG["datagrid"] = "ok (%d rows)" % len(df)
-            return df
-        _RFX_DIAG["datagrid"] = "empty"
-    except Exception as e:
-        _RFX_DIAG["datagrid"] = "error: %s" % str(e)[:160]
-    return None
+    if _t.time() - _RFX_LAST_RESET["t"] < _RFX_RESET_GAP:
+        return False
+    _RFX_LAST_RESET["t"] = _t.time()
+    return True
 
 
 def fetch_refinitiv(rics: List[str]) -> List[Dict[str, Any]]:
-    global _RD
     rd = _get_rd()
     try:
-        s = rd.session.get_default()
-        _RFX_DIAG["session"] = "%s / %s" % (type(s).__name__, getattr(s, "open_state", ""))
+        df = rd.get_data(universe=rics, fields=REFINITIV_FIELDS)
     except Exception:
-        pass
-    df = _rfx_pricing(rd, rics)
-    if df is None:
-        try:                                # one session recycle, then retry
+        global _RD
+        if not _rfx_may_reset():
+            raise                    # back off instead of a reopen storm
+        try:
             rd.close_session()
         except Exception:
             pass
         _RD = None
         rd = _get_rd()
-        df = _rfx_pricing(rd, rics)
-    dfc = _rfx_closes(rd, rics)
-    if df is not None and dfc is not None:
-        try:
-            ic = [c for c in df.columns if str(c).strip().lower() == "instrument"][0]
-            jc = [c for c in dfc.columns if str(c).strip().lower() == "instrument"][0]
-            df = df.merge(dfc, left_on=ic, right_on=jc, how="left", suffixes=("", "_dg"))
-        except Exception as e:
-            _RFX_DIAG["datagrid"] += " (merge skipped: %s)" % str(e)[:80]
-    elif df is None and dfc is not None:
-        df = dfc                            # closes only, better than nothing
-    _RFX_DIAG["last"] = "%s | pricing: %s | datagrid: %s" % (
-        _RFX_DIAG["session"], _RFX_DIAG["pricing"], _RFX_DIAG["datagrid"])
-    logger.info("rfx: %s", _RFX_DIAG["last"])
+        df = rd.get_data(universe=rics, fields=REFINITIV_FIELDS)
 
     out: List[Dict[str, Any]] = []
     if df is None or getattr(df, "empty", True) or len(df.columns) == 0:
@@ -839,10 +794,10 @@ def _van_mirror(row) -> bool:
 def snapshot() -> Dict[str, Any]:
     for _r in (STATE.get("rows") or {}).values():
         _van_mirror(_r)
-    STATE.setdefault("rfxMeta", {})["diag"] = _RFX_DIAG.get("last", "")
     return {"version": STATE["version"], "ids": STATE["ids"],
             "rows": STATE["rows"], "nuke": STATE["nuke"],
             "nukeMeta": STATE["nukeMeta"], "rfx": STATE["rfx"],
+            "rfxBanner": STATE.get("rfxBanner", ""),
             "rfxTs": STATE["rfxTs"], "rfxErr": STATE["rfxErr"],
             "refreshSec": STATE["refreshSec"],
             "autosaveSec": STATE["autosaveSec"],
@@ -1264,23 +1219,42 @@ async def rfx_poller():
                                  else max(30, STATE["refreshSec"] * 4)))
                     if not rows:
                         STATE["_rfxEmpty"] = STATE.get("_rfxEmpty", 0) + 1
+                        n_e = STATE["_rfxEmpty"]
                         err = ("Refinitiv returned no data "
-                               f"({STATE['_rfxEmpty']}x) - Workspace warming "
+                               f"({n_e}x) - Workspace warming "
                                "up or logged out on the server; retrying")
                         if STATE["rfxErr"] != err:
                             STATE["rfxErr"] = err
                             await broadcast({"type": "rfxErr", "error": err})
-                        if STATE["_rfxEmpty"] == 5:
+                        if n_e >= 3:
+                            # exponential back-off: 60s, 120s, 240s ... max 300s
+                            hold = min(300, 60 * (2 ** min(n_e - 3, 3)))
+                            cooldown_until = asyncio.get_event_loop().time() + hold
+                            ban = ("Workspace not serving data (%d empty responses) "
+                                   "- restart Workspace: tray icon > Exit, check Task "
+                                   "Manager, relaunch, sign in, then click \u21bb. "
+                                   "Retrying in %ds." % (n_e, hold))
+                            if STATE.get("rfxBanner") != ban:
+                                STATE["rfxBanner"] = ban
+                                logger.warning(ban)
+                                await broadcast({"type": "rfxBanner", "text": ban})
+                        if n_e == 5 and _rfx_may_reset():
                             logger.warning("5 empty Refinitiv responses - "
-                                           "one session reset")
+                                           "one session reset (max once / 10 min)")
                             try:
                                 _RD.close_session()
                             except Exception:
                                 pass
                             _RD = None
-                            STATE["_rfxEmpty"] = 0
                     else:
+                        was_down = STATE.get("_rfxEmpty", 0) >= 3 or bool(STATE.get("rfxBanner"))
                         STATE["_rfxEmpty"] = 0
+                        cooldown_until = 0.0
+                        if STATE.get("rfxBanner"):
+                            STATE["rfxBanner"] = ""
+                            await broadcast({"type": "rfxBanner", "text": ""})
+                        if was_down and VOL_WAKE is not None:
+                            VOL_WAKE.set()          # vol child retries now, not next hour
                         for r in rows:
                             if r.get("ric"):
                                 STATE["rfx"][r["ric"]] = r
@@ -1313,6 +1287,18 @@ async def rfx_poller():
                         await broadcast({"type": "rfxErr", "error": err})
                 except Exception as exc:
                     err = f"Refinitiv fetch failed: {exc}"
+                    if "502" in str(exc) or "Bad Gateway" in str(exc):
+                        STATE["_rfxEmpty"] = STATE.get("_rfxEmpty", 0) + 1
+                        hold = min(300, 60 * (2 ** min(max(STATE["_rfxEmpty"] - 1, 0), 3)))
+                        cooldown_until = asyncio.get_event_loop().time() + hold
+                        ban = ("Workspace 502 (Bad Gateway) - the local API proxy cannot "
+                               "reach LSEG. Restart Workspace: tray icon > Exit, check Task "
+                               "Manager, relaunch, sign in, confirm a quote loads, then click "
+                               "\u21bb. Retrying in %ds." % hold)
+                        if STATE.get("rfxBanner") != ban:
+                            STATE["rfxBanner"] = ban
+                            logger.warning(ban)
+                            await broadcast({"type": "rfxBanner", "text": ban})
                     if STATE["rfxErr"] != err:
                         STATE["rfxErr"] = err
                         logger.error(err)
@@ -1748,6 +1734,9 @@ except Exception as exc:
 """
 
 
+VOL_WAKE = None
+
+
 def fetch_vol_history_now(rics: List[str]) -> Dict[str, list]:
     """Daily close history in a SEPARATE PROCESS with its own session -
     identical isolation to the div fetch; a hang is hard-killed and the
@@ -1793,8 +1782,11 @@ async def vol_poller():
     delay = int(os.environ.get("NUKE_VOL_DELAY", "120"))
     logger.info("vol poller started (first fetch in %ss, then hourly "
                 "check, once per day)", delay)
+    global VOL_WAKE
+    VOL_WAKE = asyncio.Event()
     await asyncio.sleep(delay)
     while True:
+        VOL_WAKE.clear()
         try:
             rics = sorted({r for r in STATE["stockRics"].values() if r})
             today = date.today().isoformat()
@@ -1802,9 +1794,15 @@ async def vol_poller():
                          any(r not in _VOL_CACHE["map"] for r in rics)):
                 out = await run_in_threadpool(fetch_vol_history_now, rics)
                 if not out:
-                    logger.warning("vol child returned no data for %d rics "
-                                   "- Workspace get_history entitlement? "
-                                   "retrying next hour", len(rics))
+                    healthy = (STATE.get("_rfxEmpty", 0) == 0 and not STATE.get("rfxErr")
+                               and not STATE.get("rfxBanner"))
+                    if healthy:
+                        logger.warning("vol child returned no data for %d rics "
+                                       "- Workspace get_history entitlement? "
+                                       "retrying next hour", len(rics))
+                    else:
+                        logger.info("vol child: no data while pricing is down - "
+                                    "will retry as soon as Refinitiv recovers")
                 if out:
                     _VOL_CACHE["map"].update(out)
                     _VOL_CACHE["day"] = today
@@ -1814,7 +1812,10 @@ async def vol_poller():
                         REFDATA_WAKE.set()
         except Exception as exc:
             logger.info("vol poll skipped: %s", exc)
-        await asyncio.sleep(3600)
+        try:                         # hourly, or immediately when RFX recovers
+            await asyncio.wait_for(VOL_WAKE.wait(), timeout=3600)
+        except asyncio.TimeoutError:
+            pass
 
 
 async def div_poller():
@@ -2615,7 +2616,7 @@ h2{font-size:10.5px;font-weight:700;color:var(--muted);margin:0;
 <body>
 <header>
   <h1>CB nuke station</h1>
-  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b16</b></span>
+  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b17</b></span>
   <span id="conn" class="conn warn" title="Connection">&#9679;</span>
   <span id="online" class="sub"></span>
   <div class="tabs">
@@ -4387,6 +4388,7 @@ const NS = {
       return;
     }
     if(m.type === "snapshot"){
+      if(m.state && typeof rfxBanner==="function") rfxBanner(m.state.rfxBanner || "");   // banner survives reconnects
       try{
         const uc=((m.state||{}).userCfg||{})[CFG.user]||{};
         Object.entries(uc).forEach(([k,v])=>cfgApply(k,v,true));
@@ -4456,6 +4458,7 @@ const NS = {
       this.rfxErrMsg = null;
       applyRfx();
     }
+    else if(m.type === "rfxBanner"){ rfxBanner(m.text || ""); }
     else if(m.type === "rfxErr"){
       this.rfxErrMsg = m.error;
       const b = document.getElementById("rfxts");
@@ -5006,6 +5009,13 @@ function bwFlag(el){
 function bwFlagAll(){
   document.querySelectorAll('input[data-u^="bw_"]').forEach(bwFlag);
 }
+function rfxBanner(text){
+  let b = document.getElementById("rfxban");
+  if(!b){ b = document.createElement("div"); b.id = "rfxban";
+    b.style.cssText = "position:sticky;top:0;z-index:50;background:#c62828;color:#fff;font:12px/1.4 Segoe UI,system-ui,sans-serif;padding:6px 12px;font-weight:600";
+    document.body.insertBefore(b, document.body.firstChild); }
+  b.textContent = text || ""; b.style.display = text ? "block" : "none";
+}
 function sprdChanged(el){
   const sid = Number(el.dataset.id), f = el.dataset.u, v = el.value.trim();
   if(!sid || !f) return;
@@ -5203,7 +5213,57 @@ def preflight_port_check(port: int = None) -> None:
         raise SystemExit(1)
 
 
+def rfx_diag(rics):
+    """`python app.py --rfx-diag 6886.HK 3711.TW HKD= TWD=`
+    Names the failing stage of the Refinitiv path without starting the
+    server: session type/state, mixed get_data (what the poller calls),
+    pricing pipe only, pricing snapshot endpoint, Datagrid closes."""
+    import time as _t
+    rics = rics or ["6886.HK", "3711.TW", "HKD=", "TWD="]
+    import refinitiv.data as rd
+    cfg = "refinitiv-data.config.json"
+    print("cwd:", os.getcwd(), "| config json:",
+          "FOUND" if os.path.exists(cfg) else "MISSING (default desktop session)")
+    t0 = _t.time()
+    try:
+        rd.open_session(config_name=cfg) if os.path.exists(cfg) else rd.open_session()
+    except TypeError:
+        rd.open_session()
+    s = rd.session.get_default()
+    print("session:", type(s).__name__, "| state:", getattr(s, "open_state", "?"),
+          "| opened in %.1fs" % (_t.time() - t0))
+
+    def show(label, fn):
+        try:
+            df = fn()
+            if df is None or df.empty:
+                print(f"{label}: EMPTY  (shape={None if df is None else df.shape})")
+            else:
+                print(f"{label}: OK  {df.shape}")
+                print(df.head(len(rics)).to_string())
+        except Exception as e:
+            print(f"{label}: ERROR {type(e).__name__}: {str(e)[:300]}")
+    show("1) mixed get_data CF_*+TR.*  (what the poller calls)",
+         lambda: rd.get_data(universe=rics, fields=REFINITIV_FIELDS))
+    show("2) pricing pipe only CF_*",
+         lambda: rd.get_data(universe=rics, fields=["CF_LAST", "CF_TIME", "CF_DATE", "CF_CLOSE"]))
+    show("3) pricing snapshot endpoint",
+         lambda: rd.content.pricing.Definition(universe=rics, fields=["CF_LAST", "CF_CLOSE"]).get_data().data.df)
+    show("4) Datagrid closes TR.PriceClose",
+         lambda: rd.get_data(universe=rics, fields=["TR.PriceClose", "TR.PriceClose.date"]))
+    print("\nReading: 2 or 3 OK -> the poller will fill rfx. 2+3 EMPTY/502 with state Opened -> "
+          "Workspace not serving data: exit it from the tray, check Task Manager, relaunch, sign in. "
+          "4 ERROR alone -> Datagrid entitlement (closes then come from CF_CLOSE).")
+    try:
+        rd.close_session()
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
+    if "--rfx-diag" in sys.argv:
+        rfx_diag([a for a in sys.argv[sys.argv.index("--rfx-diag") + 1:] if not a.startswith("-")])
+        raise SystemExit(0)
     # Convenience launcher: `python app.py`.
     # Port/host come from APP_PORT / APP_HOST (defaults 59999 / 0.0.0.0).
     import webbrowser
@@ -5249,7 +5309,7 @@ if __name__ == "__main__":
     # NOTE: reload must stay OFF (single process) so the in-memory
     # WebSocket hub works, and so the browser only opens once.
     print("=" * 62)
-    print("  NUKE STATION  BUILD borrow.b16  \u00b7  %s"
+    print("  NUKE STATION  BUILD borrow.b17  \u00b7  %s"
           % os.path.abspath(__file__))
     print("  port %s \u00b7 if this banner is missing, an OLD file is\n  running \u2014 kill that process first." % PORT)
     print("=" * 62)
