@@ -4519,7 +4519,7 @@ def _ensure_rfq():
                 "ALTER TABLE cba_app.rfq ADD COLUMN req_fx DECIMAL(14,6) NULL",
                 "ALTER TABLE cba_app.rfq ADD COLUMN q_delta DECIMAL(8,2) NULL",
                 "ALTER TABLE cba_app.rfq ADD COLUMN q_delta_ovd TINYINT DEFAULT 0",
-                # r99 repair: rows given the terminal status EXPIRED by
+                # r100 repair: rows given the terminal status EXPIRED by
                 # the r80/r81 E button become the correct quote-expired
                 # state (open, off_flag=expired). Idempotent.
                 "UPDATE cba_app.rfq SET status='REQUESTED', "
@@ -5360,7 +5360,7 @@ def api_rfq_list(_bg: int = 0):
             payload = {"ok": True, "rows": rows,
                        "ms": int((time.time() - _t0) * 1000),
                        "qttl": RFQ_QUOTE_TTL,
-                       "build": "r99",
+                       "build": "r100",
                        "editable": sorted(RFQ_EDITABLE)}
             RFQ_SNAP["data"] = payload
             RFQ_SNAP["ts"] = time.time()
@@ -7158,7 +7158,7 @@ body.amdock-b #rm_grip{left:0;right:0;top:0;bottom:auto;
  .btnrow{display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap}
  .btnrow .hint{color:#6e6a63;font-size:12px}
 </style></head><body>
-<header>LAGRANGE <small>CB Runs desk console &middot; build 2026-08-19.r99 &middot; one port (59988)</small>
+<header>LAGRANGE <small>CB Runs desk console &middot; build 2026-08-19.r100 &middot; one port (59988)</small>
   <small id="built"></small></header>
 <div id="tabs">
   <div class="tab active" id="tabbtn-recon" onclick="showTab('recon')">TRADE BOOKING RECONCILIATION</div>
@@ -7472,7 +7472,7 @@ coming later).</div>
     <div style="display:flex;flex-direction:column;gap:4px">
       <div><label>source</label> <input type="text" id="ib_src" value="IDB1" size="6"> <label>date</label> <input type="date" id="ib_date"> <button id="ib_ingest">Ingest run</button></div>
       <div><button id="ib_nuke" class="k" title="re-nuke every mapped bond at the broker's @REF (IDB tab only - Nuke Station untouched)">Re-nuke @ broker REF</button> <button data-fill="live">Live &rarr; ovd</button> <button data-fill="eod">EOD &rarr; ovd</button> <button data-fill="last">Last &rarr; ovd</button> <button id="ib_auto">AUTO last: OFF</button> <button data-fill="close">Close &rarr; ovd</button> <button data-fill="clear">Clear overrides</button></div>
-      <div><button id="ib_accall" title="accept every suggested mapping (rows keep ASSUMED status until you confirm)">Accept all suggestions</button> <span class="sm">IDB tab r99</span></div>
+      <div><button id="ib_accall" title="accept every suggested mapping (rows keep ASSUMED status until you confirm)">Accept all suggestions</button> <span class="sm">IDB tab r100</span></div>
       <div><button id="ib_v_grid" class="on">Grid</button> <button id="ib_v_cmp">Compare</button> <button id="ib_v_board">Board</button> <button id="ib_v_alias">Aliases</button> <button id="ib_v_unp">Unparsed</button> <button id="ib_reload">&#8635;</button></div>
       <span class="status" id="ib_meta">workflow: parse broker @REF &rarr; IDB ovdSpot := REF &rarr; re-nuke (IDB overrides only, Nuke Station untouched) &rarr; compare desk quote @REF vs broker levels as quoted &middot; amber = IDB-tab overrides</span>
     </div>
@@ -9310,18 +9310,18 @@ async function idbLoad(){
 }
 const IB_SECT=[
  ["idb \u2192 my bond","mapc",[["idb_name","idb name"],["my_short","my short_name"],["map","map"]]],
- ["securities \u00b7 yours","nsec",[["secId","secid"],["company","company"],["short_name","short_name"],["bond_type","bond_t"],["ric","ric"],["expiry","expiry"],["isin","isin"],["sec_fx","sec_fx"],["und_fx","und_fx"]]],
+ ["securities \u00b7 yours","",[["secId","secid"],["company","company"],["short_name","short_name"],["bond_type","bond_t"],["ric","ric"],["expiry","expiry"],["isin","isin"],["sec_fx","sec_fx"],["und_fx","und_fx"]]],
  ["model (last nuke)","",[["n_bid","nbid"],["n_gamma","ngamma"],["n_spread","nspread"],["n_spot","nspot"],["n_spotfx","nspotfx"],["n_delta","ndelta%"],["parityPct","parity%"]]],
  ["override result","",[["x_bid","xbid"],["or_bid_sprd","orbidsprd"],["ovd_bid","bid"],["ovd_ask","ask"],["or_ask_sprd","oraskspr"],["x_ask","xask"],["x_both","x"],["quote_bid","quotebid"],["quote_ask","quoteask"],["stk_move","stk%"]]],
  ["idb quotes \u00b7 mkt = broker as quoted \u00b7 my = re-nuked @ broker ref","ibq",[["idb_bid","mkt bid"],["idb_bref","@ref"],["idb_btime","time"],["idb_ask","mkt offer"],["idb_aref","@ref"],["idb_atime","time"],["idb_ref","ref used"],["idb_rb","my bid @ref"],["idb_ra","my offer @ref"],["idb_gap","gap"],["idb_flag","flags"]]],
  ["override inputs","uinp",[["ovdSpot","ovdspot"],["ovdCbFx","ovdcbfx"],["ovdUndFx","ovdundfx"]]],
- ["live","lv",[["live_bid","bid"],["live_ask","ask"],["live_spot","spot"],["live_cbfx","cbfx"],["live_undfx","undfx"]]],
- ["eod","eo",[["eod_bid","bid"],["eod_ask","ask"],["eod_spot","spot"],["eod_cbfx","cbfx"],["eod_undfx","undfx"]]],
- ["stock","stk",[["stk_last","last"],["stk_time","time"],["stk_date","date"],["stk_close","close"],["stk_closedt","close dt"]]],
- ["fx","fxc",[["fx_last","fx last"],["fx_time","fx time"],["fx_date","fx date"],["fx_close","fx close"],["fx_closedt","fx close dt"]]]];
+ ["live","",[["live_bid","bid"],["live_ask","ask"],["live_spot","spot"],["live_cbfx","cbfx"],["live_undfx","undfx"]]],
+ ["eod","",[["eod_bid","bid"],["eod_ask","ask"],["eod_spot","spot"],["eod_cbfx","cbfx"],["eod_undfx","undfx"]]],
+ ["stock","",[["stk_last","last"],["stk_time","time"],["stk_date","date"],["stk_close","close"],["stk_closedt","close dt"]]],
+ ["fx","",[["fx_last","fx last"],["fx_time","fx time"],["fx_date","fx date"],["fx_close","fx close"],["fx_closedt","fx close dt"]]]];
 const IB_LEFT=new Set(["idb_name","my_short","map","idb_nuked","company","short_name","ric","isin","bond_type","idb_flag","idb_btime","idb_atime","stk_time","stk_date","stk_closedt","fx_time","fx_date","fx_closedt"]);
 function ibCell(k,v,sect){
-  const cls=sect[1]+(IB_LEFT.has(k)?" l":"")+(k==="n_delta"?" gM":"")+(k==="parityPct"?" pc":"")+(k==="quote_bid"||k==="quote_ask"?" qcell":"")+(["idb_rb","idb_ra","idb_gap","idb_ref"].includes(k)?" ibc":"");
+  const cls=sect[1]+(IB_LEFT.has(k)?" l":"")+(k==="quote_bid"||k==="quote_ask"?" qcell":"")+(["idb_rb","idb_ra","idb_gap","idb_ref"].includes(k)?" ibc":"");
   if(sect[1]==="uinp") return '<td class="'+cls+'"><input data-f="'+k+'" value="'+blEsc(v==null?"":v)+'" onchange="ibOvd(this)"></td>';
   if(k==="my_short") return '<td class="'+cls+' uinp"><input data-ms="1" value="'+blEsc(v==null?"":v)+'" placeholder="my short_name (as in Nuke)" onchange="ibMapShort(this)" style="width:110px;text-align:left"></td>';
   if(k==="map"){ const r=IB.rows.find(x=>x.broker_key===CUR_BK)||{};
@@ -9329,7 +9329,8 @@ function ibCell(k,v,sect){
     if(r.suggest) return '<td class="'+cls+'"><span class="assumed">suggest</span> <b>'+blEsc(r.suggest.short_name)+'</b> <button class="cvacc" onclick="ibAccept(this)" title="accept this mapping">&#10003;</button></td>';
     return '<td class="'+cls+'">'+(v==="NO MATCH"?'<span class="assumed">no match in Nuke</span>':'<span class="assumed">unmapped - type your short_name</span>')+'</td>'; }
   if(k==="idb_flag") return '<td class="'+cls+'">'+ibFlags(v)+'</td>';
-  if(k==="secId"||k==="short_name") return '<td class="'+cls+'"><b>'+blEsc(v==null?"":v)+'</b></td>';
+  if(k==="short_name") return '<td class="'+cls+'"><b>'+blEsc(v==null?"":v)+'</b></td>';
+  if(k==="secId") return '<td class="'+cls+'">'+blEsc(v==null?"":String(v))+'</td>';
   let s; if(v==null||v==="") s=""; else if(typeof v==="number") s=(["stk_last","stk_close","idb_bref","idb_aref","live_spot","eod_spot","n_spot"].includes(k)||Math.abs(v)>=1000)?Number(v).toLocaleString("en-US",{maximumFractionDigits:2}):(k==="idb_gap"?((v>0?"+":"")+v.toFixed(3)):(["idb_rb","idb_ra"].includes(k)?v.toFixed(3):(k==="n_delta"?v.toFixed(1)+"%":v.toFixed(2)))); else s=String(v);
   return '<td class="'+cls+'">'+blEsc(s)+'</td>';
 }
@@ -10251,7 +10252,7 @@ if __name__ == "__main__":
     threading.Thread(target=_rfq_engine_loop,
                      daemon=True).start()
     print("=" * 62)
-    print("  LAGRANGE  BUILD r99  ·  %s" % os.path.abspath(__file__))
+    print("  LAGRANGE  BUILD r100  ·  %s" % os.path.abspath(__file__))
     print("  port %s  ·  if this banner is missing, you are" % PORT)
     print("  running an OLD file — kill that process first.")
     print("=" * 62)
