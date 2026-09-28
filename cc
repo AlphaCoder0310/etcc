@@ -4632,7 +4632,7 @@ def _ensure_rfq():
                 "ALTER TABLE cba_app.rfq ADD COLUMN req_fx DECIMAL(14,6) NULL",
                 "ALTER TABLE cba_app.rfq ADD COLUMN q_delta DECIMAL(8,2) NULL",
                 "ALTER TABLE cba_app.rfq ADD COLUMN q_delta_ovd TINYINT DEFAULT 0",
-                # r106 repair: rows given the terminal status EXPIRED by
+                # r107 repair: rows given the terminal status EXPIRED by
                 # the r80/r81 E button become the correct quote-expired
                 # state (open, off_flag=expired). Idempotent.
                 "UPDATE cba_app.rfq SET status='REQUESTED', "
@@ -5473,7 +5473,7 @@ def api_rfq_list(_bg: int = 0):
             payload = {"ok": True, "rows": rows,
                        "ms": int((time.time() - _t0) * 1000),
                        "qttl": RFQ_QUOTE_TTL,
-                       "build": "r106",
+                       "build": "r107",
                        "editable": sorted(RFQ_EDITABLE)}
             RFQ_SNAP["data"] = payload
             RFQ_SNAP["ts"] = time.time()
@@ -7060,6 +7060,7 @@ tr.bimp td{background:#fdf3d7}
 #ib_tbl thead{position:sticky;top:0;z-index:3}#ib_tbl th{background:#fafafa;color:#222;border-bottom:2px solid #888}
 #ib_tbl tbody tr:nth-child(even) td{filter:brightness(0.975)}#ib_tbl tbody tr:hover td{filter:brightness(0.93)}
 #ib_tbl td.qcell{background:#cfe9d3;font-weight:700}
+#ib_tbl td.mktpx{font-size:12px;font-weight:700;color:#2b1a5e;background:#e9e2f7}#ib_tbl td.sub{font-size:9.5px;color:#777}
 #ib_tbl .cvacc{font-size:10px;padding:0 5px;background:#0b6e66;color:#fff;border-color:#0b6e66;cursor:pointer}#ib_tbl td.mapc{background:#fbfbf7}
 #cv_tbl{font-size:10px;line-height:1.15;border-collapse:collapse}
 #cv_tbl th{font-size:8.5px;padding:2px 4px;letter-spacing:.4px;text-align:right}
@@ -7172,6 +7173,7 @@ body.amdock-b #rfq_mon.on{transform:none}
 .rm-t{color:var(--faint)}
 .rm-why{color:var(--faint);white-space:nowrap;overflow:hidden;
   text-overflow:ellipsis;text-align:right}
+#rm_list .rm-x{margin-left:auto;padding:0 6px;color:#999;cursor:pointer;font-weight:700;flex:0 0 auto}#rm_list .rm-x:hover{color:#fff;background:#c62828;border-radius:2px}
 body.amdock-b #rm_list{display:grid;
   grid-template-columns:repeat(auto-fill,minmax(640px,1fr));
   gap:0 16px}
@@ -7288,7 +7290,7 @@ body.amdock-b #rm_grip{left:0;right:0;top:0;bottom:auto;
  .btnrow{display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap}
  .btnrow .hint{color:#6e6a63;font-size:12px}
 </style></head><body>
-<header>LAGRANGE <small>CB Runs desk console &middot; build 2026-08-19.r106 &middot; one port (59988)</small>
+<header>LAGRANGE <small>CB Runs desk console &middot; build 2026-08-19.r107 &middot; one port (59988)</small>
   <small id="built"></small></header>
 <div id="tabs">
   <div class="tab active" id="tabbtn-recon" onclick="showTab('recon')">TRADE BOOKING RECONCILIATION</div>
@@ -7602,7 +7604,7 @@ coming later).</div>
     <div style="display:flex;flex-direction:column;gap:4px">
       <div><label>source</label> <input type="text" id="ib_src" value="IDB1" size="6"> <label>date</label> <input type="date" id="ib_date"> <button id="ib_ingest">Ingest run</button></div>
       <div><button id="ib_nuke" class="k" title="re-nuke every mapped bond at the broker's @REF (IDB tab only - Nuke Station untouched)">Re-nuke @ broker REF</button> <button data-fill="live">Live &rarr; ovd</button> <button data-fill="eod">EOD &rarr; ovd</button> <button data-fill="last">Last &rarr; ovd</button> <button id="ib_auto">AUTO last: OFF</button> <button data-fill="close">Close &rarr; ovd</button> <button data-fill="bref" title="ovdSpot = broker @REF (ref used, more recently quoted side); ovdCbFx / ovdUndFx = Nuke LIVE fx - IDB tab only, no re-nuke">Broker Ref &rarr; ovd</button> <button data-fill="clear">Clear overrides</button></div>
-      <div><button id="ib_accall" title="accept every suggested mapping (rows keep ASSUMED status until you confirm)">Accept all suggestions</button> <span class="sm">IDB tab r106</span></div>
+      <div><button id="ib_accall" title="accept every suggested mapping (rows keep ASSUMED status until you confirm)">Accept all suggestions</button> <span class="sm">IDB tab r107</span></div>
       <div><button id="ib_v_grid" class="on">Grid</button> <button id="ib_v_cmp">Compare</button> <button id="ib_v_board">Board</button> <button id="ib_v_alias">Aliases</button> <button id="ib_v_unp">Unparsed</button> <button id="ib_reload">&#8635;</button></div>
       <span class="status" id="ib_meta">IDB tab prices with its OWN override inputs (amber): any change to a row's inputs re-nukes that row automatically (Nuke's engine + model/X settings; Nuke Station untouched); override result, my bid/offer, gap and flags come only from those runs</span>
     </div>
@@ -9272,7 +9274,9 @@ function rfqMonItems(){
     }
     if(r.status==='REQUESTED'&&!std){
       const a=rmAge(r.created_at||r.last_updated);
-      if(r.off_flag){
+      if(r.off_flag==='expired'){
+        /* expired quotes are a normal end state, not an adjustment alert */
+      } else if(r.off_flag){
         out.push({k:'aj',id,sec,
           why:'quote OFF '+(r.off_flag==='auto'?'(>tol)'
             :'(trader)')+' \u00b7 re-quote',
@@ -9303,8 +9307,13 @@ function rfqMonItems(){
   const _ts=id=>{const r=rfqRows.find(x=>x.rfq_id===id)||{};
     return String(r.last_updated||r.created||'');};
   out.sort((a,b)=>_ts(b.id).localeCompare(_ts(a.id)));
-  return out;
+  const dis=rmDismissed();
+  return out.filter(it=>{ const r=rfqRows.find(x=>x.rfq_id===it.id)||{}; return !dis[it.k+':'+it.id+':'+String(r.row_version||'')]; });
 }
+function rmDismissed(){ try{ return JSON.parse(localStorage.getItem('rfq.amdis.'+((window.AUTH&&AUTH.user)||''))||'{}'); }catch(_){ return {}; } }
+function rmDismiss(k,id){ const r=rfqRows.find(x=>x.rfq_id===id)||{}; const d=rmDismissed(); d[k+':'+id+':'+String(r.row_version||'')]=Date.now();
+  const keys=Object.keys(d); if(keys.length>400) keys.sort((a,b)=>d[a]-d[b]).slice(0,keys.length-400).forEach(x=>delete d[x]);
+  localStorage.setItem('rfq.amdis.'+((window.AUTH&&AUTH.user)||''),JSON.stringify(d)); rfqMonRender(); }
 const RM_LAB={hit:'HIT',rf:'RFRSH',pl:'PULL',aj:'ADJ',
   wk:'WORK',rq:'REQ',re:'RQTE',st:'STALE'};
 const RM_CLS={hit:'rm-hit',rf:'rm-rf',pl:'rm-pl',aj:'rm-aj',
@@ -9332,7 +9341,8 @@ function rfqMonRender(){
     `<span class="rm-ty">${blEsc(R.style||"")}</span>`+
     `<span class="rm-sd">${blEsc(R.sides||"")}</span>`+
     `<span class="rm-by">${blEsc(R.by||R.updated_by||"")}</span>`+
-    `<span class="rm-why">${blEsc(it.why)}</span></div>`;})
+    `<span class="rm-why">${blEsc(it.why)}</span>`+
+    `<span class="rm-x" title="dismiss this item (comes back only if the RFQ changes)" onclick="event.stopPropagation();rmDismiss('${it.k}',${it.id})">&#10005;</span></div>`;})
     .join('')||'<div class="rm-meta">nothing needs you - '+
     'all quiet</div>';
 }
@@ -9497,7 +9507,7 @@ function idbRender(){
       [["idb name","l"],["my short_name","l"],["map",""],["mkt bid","gcol"],["@ref",""],["time",""],["mkt offer",""],["@ref",""],["time",""],["ref used","gcol"],["my bid",""],["my offer",""],["gap","gcol"],["src",""],["flags","l"]]);
     tb.innerHTML=IB.rows.map((r,i)=>'<tr data-i="'+i+'"><td class="mapc l"><b>'+blEsc((r.spellings||[r.broker_key]).join(', '))+'</b></td><td class="mapc l">'+blEsc(r.my_short||'')+'</td>'
       +'<td class="mapc">'+(r.sec_id?'<span class="confirmed">mapped</span>':'<span class="assumed">unmapped</span>')+'</td>'
-      +'<td class="ibq gcol">'+ibN(r.mkt_bid,2)+'</td><td class="ibq">'+ibN(r.bid_ref,2)+'</td><td class="ibq l">'+blEsc(r.bid_time||'')+'</td><td class="ibq">'+ibN(r.mkt_offer,2)+'</td><td class="ibq">'+ibN(r.offer_ref,2)+'</td><td class="ibq l">'+blEsc(r.offer_time||'')+'</td>'
+      +'<td class="ibq mktpx gcol">'+ibN(r.mkt_bid,2)+'</td><td class="ibq sub">'+ibN(r.bid_ref,2)+'</td><td class="ibq sub l">'+blEsc(r.bid_time||'')+'</td><td class="ibq mktpx gcol">'+ibN(r.mkt_offer,2)+'</td><td class="ibq sub">'+ibN(r.offer_ref,2)+'</td><td class="ibq sub l">'+blEsc(r.offer_time||'')+'</td>'
       +'<td class="myq gcol">'+ibN(r.ref_used,2)+'</td><td class="qcell">'+ibN(r.my_bid,2)+'</td><td class="qcell">'+ibN(r.my_offer,2)+'</td>'
       +'<td class="chk ibc gcol">'+(r.gap==null?'\u2014':(r.gap>0?'+':'')+Number(r.gap).toFixed(3))+'</td><td class="chk">'+blEsc(r.mark_src||'')+'</td><td class="chk l">'+ibFlags(r.flags)+'</td></tr>').join('');
   } else if(v==='board'){
@@ -10389,7 +10399,7 @@ if __name__ == "__main__":
     threading.Thread(target=_rfq_engine_loop,
                      daemon=True).start()
     print("=" * 62)
-    print("  LAGRANGE  BUILD r106  ·  %s" % os.path.abspath(__file__))
+    print("  LAGRANGE  BUILD r107  ·  %s" % os.path.abspath(__file__))
     print("  port %s  ·  if this banner is missing, you are" % PORT)
     print("  running an OLD file — kill that process first.")
     print("=" * 62)
