@@ -1555,18 +1555,25 @@ def idb_compare_one(key, mkt, mark, now_time=None):
     else:
         if not mark.get("repriced"):
             flags.append("NOT REPRICED (inputs changed)")
-        rs, br = _fnum(mark.get("run_spot")), _fnum(mark.get("bref"))
-        if rs is not None and br is not None and abs(rs - br) > 1e-9:
-            flags.append("REF %.4g \u2260 BROKER %.4g" % (rs, br))
-        if mb is not None and myo is not None and mb > myo:
+        rs = _fnum(mark.get("run_spot"))
+        rb, ro = _fnum(mkt.get("bid_ref")), _fnum(mkt.get("offer_ref"))
+        same = lambda a, b: (a is None or b is None or abs(a - b) <= 1e-6 * max(1.0, abs(b)))
+        # a side is comparable only when it was quoted at the ref my quote was priced at
+        bid_ok = mb is not None and same(rs, rb)
+        ofr_ok = mo is not None and same(rs, ro)
+        if mb is not None and not bid_ok:
+            flags.append("BID @%.4g \u2260 REF %.4g (not compared)" % (rb, rs))
+        if mo is not None and not ofr_ok:
+            flags.append("OFR @%.4g \u2260 REF %.4g (not compared)" % (ro, rs))
+        if bid_ok and myo is not None and mb > myo:
             flags.append("MKT BID > MY OFFER")
-        if mo is not None and myb is not None and mo < myb:
+        if ofr_ok and myb is not None and mo < myb:
             flags.append("MKT OFFER < MY BID")
-        if mb is not None and mo is not None and myb is not None and myo is not None:
+        if bid_ok and ofr_ok and myb is not None and myo is not None:
             gap, basis = (mb + mo) / 2 - (myb + myo) / 2, "mid"
-        elif mb is not None and myb is not None:
+        elif bid_ok and myb is not None:
             gap, basis = mb - myb, "bid"
-        elif mo is not None and myo is not None:
+        elif ofr_ok and myo is not None:
             gap, basis = mo - myo, "offer"
         if gap is not None and abs(gap) > IDB_GAP_PTS:
             flags.append("GAP %+.2f (%s)" % (gap, basis))
@@ -1824,10 +1831,7 @@ def api_idb_compare(date: str = "", source: str = ""):
         al = aliases.get(mkt["broker_key"]) or {}
         sid = _nk_resolve(al) or mkt.get("sec_id")
         mark = {}
-        if manual.get(key):
-            mm_ = manual[key]; mark = {"my_bid": mm_.get("my_bid"), "my_offer": mm_.get("my_offer"),
-                                       "ref": mm_.get("spot"), "repriced": True}
-        elif sid:
+        if sid:
             nkr = IDB_NUKE.get(int(sid)); ref, _s, _d = _idb_ref_for(mkt)
             _idb_ovd_load()
             if nkr and nkr.get("res"):
@@ -1847,7 +1851,7 @@ def api_idb_compare(date: str = "", source: str = ""):
                     "spellings": mkt.get("spellings", []),
                     "alias_status": mkt.get("alias_status", ""),
                     "my_short": al.get("my_short", ""),
-                    "mark_src": ("manual" if manual.get(key) else ("idb-run" if mark.get("repriced") else ("stale" if sid else ""))),
+                    "mark_src": ("idb-run" if mark.get("repriced") else ("stale" if sid else "")),
                     "last_time": mkt.get("last_time")})
         out.append(row)
     out.sort(key=lambda r: (r["urg"], -(abs(r["gap"]) if r["gap"] is not None else -1), r["key"]))
@@ -2193,10 +2197,7 @@ def _idb_grid_rows(tdate):
                     det[_k] = None
                 mark = {"my_bid": None, "my_offer": None, "ref": None, "repriced": False,
                         "stale": True, "run_spot": None, "bref": ref}
-            if manual.get(key):
-                mm_ = manual[key]; mark = {"my_bid": mm_.get("my_bid"), "my_offer": mm_.get("my_offer"),
-                                           "ref": mm_.get("spot"), "repriced": True}
-            c = idb_compare_one(key, b, mark, now_t)
+            c = idb_compare_one(key, b, mark, now_t)      # my bid/offer == quotebid/quoteask, always
             r.update({k: v for k, v in det.items() if not k.startswith("_")})
             r.update({"idb_rb": c["my_bid"], "idb_ra": c["my_offer"], "idb_ref": c["ref_used"],
                       "idb_gap": c["gap"], "idb_flag": c["flags"],
@@ -4631,7 +4632,7 @@ def _ensure_rfq():
                 "ALTER TABLE cba_app.rfq ADD COLUMN req_fx DECIMAL(14,6) NULL",
                 "ALTER TABLE cba_app.rfq ADD COLUMN q_delta DECIMAL(8,2) NULL",
                 "ALTER TABLE cba_app.rfq ADD COLUMN q_delta_ovd TINYINT DEFAULT 0",
-                # r105 repair: rows given the terminal status EXPIRED by
+                # r106 repair: rows given the terminal status EXPIRED by
                 # the r80/r81 E button become the correct quote-expired
                 # state (open, off_flag=expired). Idempotent.
                 "UPDATE cba_app.rfq SET status='REQUESTED', "
@@ -5472,7 +5473,7 @@ def api_rfq_list(_bg: int = 0):
             payload = {"ok": True, "rows": rows,
                        "ms": int((time.time() - _t0) * 1000),
                        "qttl": RFQ_QUOTE_TTL,
-                       "build": "r105",
+                       "build": "r106",
                        "editable": sorted(RFQ_EDITABLE)}
             RFQ_SNAP["data"] = payload
             RFQ_SNAP["ts"] = time.time()
@@ -7287,7 +7288,7 @@ body.amdock-b #rm_grip{left:0;right:0;top:0;bottom:auto;
  .btnrow{display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap}
  .btnrow .hint{color:#6e6a63;font-size:12px}
 </style></head><body>
-<header>LAGRANGE <small>CB Runs desk console &middot; build 2026-08-19.r105 &middot; one port (59988)</small>
+<header>LAGRANGE <small>CB Runs desk console &middot; build 2026-08-19.r106 &middot; one port (59988)</small>
   <small id="built"></small></header>
 <div id="tabs">
   <div class="tab active" id="tabbtn-recon" onclick="showTab('recon')">TRADE BOOKING RECONCILIATION</div>
@@ -7601,7 +7602,7 @@ coming later).</div>
     <div style="display:flex;flex-direction:column;gap:4px">
       <div><label>source</label> <input type="text" id="ib_src" value="IDB1" size="6"> <label>date</label> <input type="date" id="ib_date"> <button id="ib_ingest">Ingest run</button></div>
       <div><button id="ib_nuke" class="k" title="re-nuke every mapped bond at the broker's @REF (IDB tab only - Nuke Station untouched)">Re-nuke @ broker REF</button> <button data-fill="live">Live &rarr; ovd</button> <button data-fill="eod">EOD &rarr; ovd</button> <button data-fill="last">Last &rarr; ovd</button> <button id="ib_auto">AUTO last: OFF</button> <button data-fill="close">Close &rarr; ovd</button> <button data-fill="bref" title="ovdSpot = broker @REF (ref used, more recently quoted side); ovdCbFx / ovdUndFx = Nuke LIVE fx - IDB tab only, no re-nuke">Broker Ref &rarr; ovd</button> <button data-fill="clear">Clear overrides</button></div>
-      <div><button id="ib_accall" title="accept every suggested mapping (rows keep ASSUMED status until you confirm)">Accept all suggestions</button> <span class="sm">IDB tab r105</span></div>
+      <div><button id="ib_accall" title="accept every suggested mapping (rows keep ASSUMED status until you confirm)">Accept all suggestions</button> <span class="sm">IDB tab r106</span></div>
       <div><button id="ib_v_grid" class="on">Grid</button> <button id="ib_v_cmp">Compare</button> <button id="ib_v_board">Board</button> <button id="ib_v_alias">Aliases</button> <button id="ib_v_unp">Unparsed</button> <button id="ib_reload">&#8635;</button></div>
       <span class="status" id="ib_meta">IDB tab prices with its OWN override inputs (amber): any change to a row's inputs re-nukes that row automatically (Nuke's engine + model/X settings; Nuke Station untouched); override result, my bid/offer, gap and flags come only from those runs</span>
     </div>
@@ -10388,7 +10389,7 @@ if __name__ == "__main__":
     threading.Thread(target=_rfq_engine_loop,
                      daemon=True).start()
     print("=" * 62)
-    print("  LAGRANGE  BUILD r105  ·  %s" % os.path.abspath(__file__))
+    print("  LAGRANGE  BUILD r106  ·  %s" % os.path.abspath(__file__))
     print("  port %s  ·  if this banner is missing, you are" % PORT)
     print("  running an OLD file — kill that process first.")
     print("=" * 62)
