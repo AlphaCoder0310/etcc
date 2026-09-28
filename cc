@@ -4632,7 +4632,7 @@ def _ensure_rfq():
                 "ALTER TABLE cba_app.rfq ADD COLUMN req_fx DECIMAL(14,6) NULL",
                 "ALTER TABLE cba_app.rfq ADD COLUMN q_delta DECIMAL(8,2) NULL",
                 "ALTER TABLE cba_app.rfq ADD COLUMN q_delta_ovd TINYINT DEFAULT 0",
-                # r107 repair: rows given the terminal status EXPIRED by
+                # r108 repair: rows given the terminal status EXPIRED by
                 # the r80/r81 E button become the correct quote-expired
                 # state (open, off_flag=expired). Idempotent.
                 "UPDATE cba_app.rfq SET status='REQUESTED', "
@@ -5473,7 +5473,7 @@ def api_rfq_list(_bg: int = 0):
             payload = {"ok": True, "rows": rows,
                        "ms": int((time.time() - _t0) * 1000),
                        "qttl": RFQ_QUOTE_TTL,
-                       "build": "r107",
+                       "build": "r108",
                        "editable": sorted(RFQ_EDITABLE)}
             RFQ_SNAP["data"] = payload
             RFQ_SNAP["ts"] = time.time()
@@ -6792,7 +6792,7 @@ PAGE = r"""<!doctype html>
 .blgrid td.rq-dp{text-align:right}
 .blgrid td.rq-dn{text-align:right}
 
-#rfq_tbl td.bed input[data-rf="trade_date"]{text-align:left;width:88px}
+#rfq_tbl td.bed input[data-rf="trade_date"]{text-align:left;width:64px}
 #rfq_hist{position:fixed;top:52px;right:0;width:360px;bottom:0;
   transform:translateX(105%);
   background:var(--bg);border-left:1px solid var(--border2);z-index:60;
@@ -6880,20 +6880,20 @@ PAGE = r"""<!doctype html>
   text-transform:uppercase}
 #rf_cap small{color:var(--faint);font-weight:400;letter-spacing:.2px;
   margin-left:10px;text-transform:none;font-size:10px}
-#rfq_tbl{font:11.5px var(--mono);border-collapse:separate;
+#rfq_tbl{font:10px var(--mono);font-variant-numeric:tabular-nums;line-height:1.15;border-collapse:separate;
   border-spacing:0;border:1px solid var(--border2);
   background:var(--bg)}
-#rfq_tbl.fs-s{font-size:10.5px}
-#rfq_tbl.fs-l{font-size:12.5px}
+#rfq_tbl.fs-s{font-size:9px}
+#rfq_tbl.fs-l{font-size:11px}
 #rfq_tbl select.rq-sel,#rfq_tbl td.bed input{
-  font:11.5px var(--mono)}
+  font:10px var(--mono);font-variant-numeric:tabular-nums}
 #rfq_tbl.fs-s select.rq-sel,#rfq_tbl.fs-s td.bed input{
-  font-size:10.5px}
+  font-size:9px}
 #rfq_tbl.fs-l select.rq-sel,#rfq_tbl.fs-l td.bed input{
-  font-size:12.5px}
+  font-size:11px}
 #rfq_tbl th{background:var(--panel);color:var(--muted);
-  font-weight:700;font-size:9.5px;letter-spacing:.4px;
-  text-transform:uppercase;padding:2px 5px;border:none;
+  font-weight:700;font-size:8.5px;letter-spacing:.4px;
+  text-transform:uppercase;padding:2px 4px;border:none;white-space:nowrap;
   border-bottom:1px solid var(--text)}
 #rfq_tbl th.rq-band{color:var(--faint);font-size:9px;
   letter-spacing:.7px;text-align:left;border-bottom:none;
@@ -6916,9 +6916,9 @@ PAGE = r"""<!doctype html>
 #rfq_tbl thead tr:last-child th.g-X{box-shadow:inset 0 -2px 0 #9d7ad8}
 #rfq_tbl td,#rfq_tbl td.bed input,#rfq_tbl td select,#rfq_tbl .rq-num{color:#000}
 #rfq_tbl td{border:none;border-bottom:1px solid var(--border);
-  padding:3px 7px}
-#rfq_tbl.den-c td{padding:2px 4px}
-#rfq_tbl.den-c th{padding:2px 4px}
+  padding:1px 4px;white-space:nowrap}
+#rfq_tbl.den-c td{padding:0 3px}
+#rfq_tbl.den-c th{padding:1px 3px}
 #rfq_tbl tbody tr:nth-child(even) td{background:var(--row)}
 #rfq_tbl tbody tr:hover td{background:var(--hover) !important}
 #rfq_tbl tr.bdone td{background:#b9e2c1 !important}
@@ -6936,7 +6936,7 @@ PAGE = r"""<!doctype html>
 #rfq_tbl tr.bcxl td{background:#d9dce2 !important}
 #rfq_tbl tr.bcxl:hover td{background:#ccd0d8 !important}
 #rfq_tbl td.bed{background:transparent;padding:0}
-#rfq_tbl td.bed input{padding:2px 4px;width:58px;
+#rfq_tbl td.bed input{padding:1px 3px;width:50px;
   background:transparent;border:1px solid transparent;
   color:var(--text);text-align:right}
 #rfq_tbl td.bed input::placeholder{color:var(--faint);
@@ -6944,8 +6944,8 @@ PAGE = r"""<!doctype html>
 #rfq_tbl tbody tr:hover td.bed input{border-color:var(--border2)}
 #rfq_tbl td.bed input:focus{border-color:var(--amber);
   background:var(--bg)}
-#rfq_tbl.den-c td.bed input{padding:2px 4px}
-#rfq_tbl td.bed input[data-rf="qty"]{width:66px}
+#rfq_tbl.den-c td.bed input{padding:0 3px}
+#rfq_tbl td.bed input[data-rf="qty"]{width:58px}
 #rfq_tbl td.bed input[data-rf="client"],
 #rfq_tbl td.bed input[data-rf="notes"],
 #rfq_tbl td.bed input[data-rf="trade_date"],
@@ -6953,11 +6953,14 @@ PAGE = r"""<!doctype html>
   text-align:left}
 #rfq_tbl td.bed input[data-rf="client"],
 #rfq_tbl td.bed input[data-rf="notes"],
-#rfq_tbl td.bed input[data-rf="isin"]{width:72px}
-#rfq_tbl td.bed input[data-rf="trade_date"]{width:70px}
+#rfq_tbl td.bed input[data-rf="isin"]{width:72px;text-overflow:ellipsis}
+#rfq_tbl td.bed input[data-rf="notes"]{width:110px}
+#rfq_tbl td.bed input[data-rf="trade_date"]{width:62px}
+#rfq_tbl td{max-width:220px;overflow:hidden;text-overflow:ellipsis}
+#rfq_tbl td.bed,#rfq_tbl td.rq-ctl,#rfq_tbl td.rq-qc{max-width:none;overflow:visible}
 #rfq_tbl select.rq-sel{border:1px solid transparent;
-  background:transparent;padding:2px 1px;
-  max-width:160px}
+  background:transparent;padding:1px 1px;
+  max-width:120px}
 #rfq_tbl select.rq-sel:hover{border-color:var(--border2);
   background:var(--bg)}
 #rfq_tbl select.rq-sel.rq-open{color:#7b5cc4}
@@ -7241,7 +7244,7 @@ body.amdock-b #rm_grip{left:0;right:0;top:0;bottom:auto;
 #rfq_tbl td.bed{padding:0;background:#fffdf2}
 #rfq_tbl td.bed input:focus{box-shadow:inset 0 0 0 1px #8a5b00}
 #rfq_tbl td.bed input[data-rf="client"],#rfq_tbl td.bed input[data-rf="notes"],
-#rfq_tbl td.bed input[data-rf="isin"]{text-align:left;width:104px}
+#rfq_tbl td.bed input[data-rf="isin"]{text-align:left;width:92px}
 .rf-f{border:1px solid #c9c9c9;background:#fff;padding:2px 10px;
   cursor:pointer;font-size:11px}
 .rf-f.on{background:#1c1c1c;color:#fff;border-color:#1c1c1c;font-weight:700}
@@ -7290,7 +7293,7 @@ body.amdock-b #rm_grip{left:0;right:0;top:0;bottom:auto;
  .btnrow{display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap}
  .btnrow .hint{color:#6e6a63;font-size:12px}
 </style></head><body>
-<header>LAGRANGE <small>CB Runs desk console &middot; build 2026-08-19.r107 &middot; one port (59988)</small>
+<header>LAGRANGE <small>CB Runs desk console &middot; build 2026-08-19.r108 &middot; one port (59988)</small>
   <small id="built"></small></header>
 <div id="tabs">
   <div class="tab active" id="tabbtn-recon" onclick="showTab('recon')">TRADE BOOKING RECONCILIATION</div>
@@ -7604,7 +7607,7 @@ coming later).</div>
     <div style="display:flex;flex-direction:column;gap:4px">
       <div><label>source</label> <input type="text" id="ib_src" value="IDB1" size="6"> <label>date</label> <input type="date" id="ib_date"> <button id="ib_ingest">Ingest run</button></div>
       <div><button id="ib_nuke" class="k" title="re-nuke every mapped bond at the broker's @REF (IDB tab only - Nuke Station untouched)">Re-nuke @ broker REF</button> <button data-fill="live">Live &rarr; ovd</button> <button data-fill="eod">EOD &rarr; ovd</button> <button data-fill="last">Last &rarr; ovd</button> <button id="ib_auto">AUTO last: OFF</button> <button data-fill="close">Close &rarr; ovd</button> <button data-fill="bref" title="ovdSpot = broker @REF (ref used, more recently quoted side); ovdCbFx / ovdUndFx = Nuke LIVE fx - IDB tab only, no re-nuke">Broker Ref &rarr; ovd</button> <button data-fill="clear">Clear overrides</button></div>
-      <div><button id="ib_accall" title="accept every suggested mapping (rows keep ASSUMED status until you confirm)">Accept all suggestions</button> <span class="sm">IDB tab r107</span></div>
+      <div><button id="ib_accall" title="accept every suggested mapping (rows keep ASSUMED status until you confirm)">Accept all suggestions</button> <span class="sm">IDB tab r108</span></div>
       <div><button id="ib_v_grid" class="on">Grid</button> <button id="ib_v_cmp">Compare</button> <button id="ib_v_board">Board</button> <button id="ib_v_alias">Aliases</button> <button id="ib_v_unp">Unparsed</button> <button id="ib_reload">&#8635;</button></div>
       <span class="status" id="ib_meta">IDB tab prices with its OWN override inputs (amber): any change to a row's inputs re-nukes that row automatically (Nuke's engine + model/X settings; Nuke Station untouched); override result, my bid/offer, gap and flags come only from those runs</span>
     </div>
@@ -10399,7 +10402,7 @@ if __name__ == "__main__":
     threading.Thread(target=_rfq_engine_loop,
                      daemon=True).start()
     print("=" * 62)
-    print("  LAGRANGE  BUILD r107  ·  %s" % os.path.abspath(__file__))
+    print("  LAGRANGE  BUILD r108  ·  %s" % os.path.abspath(__file__))
     print("  port %s  ·  if this banner is missing, you are" % PORT)
     print("  running an OLD file — kill that process first.")
     print("=" * 62)
