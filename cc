@@ -328,6 +328,10 @@ def ensure_schema() -> None:
                 f"ADD COLUMN IF NOT EXISTS vol_flag VARCHAR(32) NULL",
                 f"ALTER TABLE {APP_DB}.cb_state "
                 f"ADD COLUMN IF NOT EXISTS isin_manual VARCHAR(16) NULL",
+                f"CREATE TABLE IF NOT EXISTS {APP_DB}.cb_state_hist ("
+                "  id BIGINT AUTO_INCREMENT PRIMARY KEY, sec_id BIGINT NOT NULL, field VARCHAR(32) NOT NULL, "
+                "  old_val VARCHAR(64) NULL, new_val VARCHAR(64) NULL, changed_by VARCHAR(64) NULL, "
+                "  changed_at DATETIME NOT NULL, INDEX ix_sec_field (sec_id, field, id))",
 
             ):
                 try:
@@ -772,6 +776,28 @@ RFX_WAKE: Optional[asyncio.Event] = None
 REFDATA_WAKE: Optional[asyncio.Event] = None
 
 
+PROTECTED_FIELDS = ("short_name", "und_fx", "n_gamma", "isin_manual", "bond_type")
+
+
+def _rows_apply(it, row, user=""):
+    """Merge one rows-message item into a STATE row. Returns the touched fields.
+    A blank value for a protected field is ignored unless the client lists the
+    field in "_clear" (deliberate erase) - so a browser whose grid happened to be
+    empty can never wipe names, FX rics or types for everyone."""
+    clear = set(it.get("_clear") or [])
+    touched = []
+    for f in USER_FIELDS + OVD_FIELDS:
+        if f not in it:
+            continue
+        v = str(it.get(f) or "")
+        if f in PROTECTED_FIELDS and v == "" and (row.get(f) or "") != "" and f not in clear:
+            logger.info("rows: ignored blank %s for %s from %s (kept %r)", f, it.get("secId"), user, row.get(f))
+            continue
+        row[f] = v
+        touched.append(f)
+    return touched
+
+
 def _blank_row() -> Dict[str, Any]:
     return {"short_name": "", "und_fx": "", "n_gamma": "", "isin_manual": "",
             "or_bid_sprd": "", "or_ask_sprd": "",
@@ -966,6 +992,24 @@ def db_upsert_state_fields(sec_id: int, row: Dict[str, Any], user: str,
         conn = _db()
         try:
             with conn.cursor() as cur:
+                # append-only history of every change to a user field: the live table can be
+                # overwritten by a bad write, the history cannot - recovery reads it back
+                try:
+                    ufs = [f for f in fields if f in COLMAP and f in USER_FIELDS]
+                    if ufs:
+                        cur.execute(f"SELECT {', '.join(COLMAP[f] for f in ufs)} FROM {APP_DB}.cb_state WHERE sec_id=%s", (sec_id,))
+                        prev = cur.fetchone() or tuple(None for _ in ufs)
+                        hist = []
+                        for f, old in zip(ufs, prev):
+                            new = str(row.get(f) or "") or None
+                            old = (str(old) if old is not None else None) or None
+                            if new != old:
+                                hist.append((sec_id, f, old, new, user, datetime.now()))
+                        if hist:
+                            cur.executemany(f"INSERT INTO {APP_DB}.cb_state_hist (sec_id, field, old_val, new_val, changed_by, changed_at) "
+                                            "VALUES (%s,%s,%s,%s,%s,%s)", hist)
+                except Exception as exc:
+                    logger.warning("state history write failed: %s", exc)
                 collist = ", ".join(cols)
                 ph = ", ".join(["%s"] * len(cols))
                 upd = ", ".join(f"{c}=VALUES({c})" for c in cols)
@@ -1115,6 +1159,12 @@ def load_persisted_state() -> None:
             conn.close()
     except Exception as exc:
         logger.error("state restore from cb_state FAILED: %s", exc)
+    try:                                             # fill still-blank names / fx from cb_state + the autosave snapshots
+        _fx = recover_names(STATE["ids"])
+        if _fx:
+            logger.info("startup: filled blank names/fx for %d securities from cb_state/autosave", len(_fx))
+    except Exception as exc:
+        logger.warning("startup recover failed: %s", exc)
     for sid in STATE["ids"]:
         STATE["rows"].setdefault(sid, _blank_row())
     try:
@@ -3018,6 +3068,81 @@ def _bd_need(isin):
     return r.get("asof") != date.today().isoformat()        # a new day -> refresh once
 
 
+def recover_names(sids=None):
+    """Fill blank short_name / und_fx (and other user fields) from cb_state, then
+    blank short_name / und_fx from the latest autosave snapshot. Persists and
+    returns {sec_id: {field: value}} of what was recovered."""
+    sids = [int(s) for s in (sids or STATE["ids"])]
+    fixed = {}
+    db_rows = {}
+    try:
+        conn = _db()
+        try:
+            with conn.cursor() as cur:
+                load_state_rows(cur, db_rows)
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning("recover: cb_state read failed: %s", exc)
+    for sid in sids:
+        row = STATE["rows"].setdefault(sid, _blank_row())
+        src_row = db_rows.get(sid) or {}
+        for f in USER_FIELDS:
+            if (row.get(f) or "") == "" and (src_row.get(f) or "") != "":
+                row[f] = src_row[f]; fixed.setdefault(sid, {})[f] = src_row[f]
+    still = [sid for sid in sids if (STATE["rows"][sid].get("short_name") or "") == "" or (STATE["rows"][sid].get("und_fx") or "") == ""]
+    if still:
+        try:
+            prefs = fetch_saved_prefs(still)
+        except Exception as exc:
+            prefs = {}; logger.warning("recover: prefs read failed: %s", exc)
+        for sid in still:
+            p = prefs.get(sid) or {}
+            row = STATE["rows"][sid]
+            for f in ("short_name", "und_fx"):
+                if (row.get(f) or "") == "" and (p.get(f) or "") != "":
+                    row[f] = p[f]; fixed.setdefault(sid, {})[f] = p[f]
+    # last resort for ANY still-blank user field: the last non-blank value ever written, from the history
+    blanks = {sid: [f for f in USER_FIELDS if (STATE["rows"][sid].get(f) or "") == ""] for sid in sids}
+    need = {sid: fs for sid, fs in blanks.items() if fs}
+    if need:
+        try:
+            conn = _db()
+            try:
+                with conn.cursor() as cur:
+                    ph = ", ".join(["%s"] * len(need))
+                    cur.execute(f"SELECT sec_id, field, new_val FROM {APP_DB}.cb_state_hist "
+                                f"WHERE sec_id IN ({ph}) AND new_val IS NOT NULL AND new_val<>'' ORDER BY id DESC", list(need.keys()))
+                    seen = set()
+                    for sec_id, field, val in cur.fetchall():
+                        sec_id = int(sec_id)
+                        if (sec_id, field) in seen or field not in need.get(sec_id, []):
+                            continue
+                        seen.add((sec_id, field))
+                        STATE["rows"][sec_id][field] = str(val); fixed.setdefault(sec_id, {})[field] = str(val)
+            finally:
+                conn.close()
+        except Exception as exc:
+            logger.warning("recover: history read failed: %s", exc)
+    for sid, fs in fixed.items():
+        try:
+            db_upsert_state_fields(sid, STATE["rows"][sid], "recover", list(fs.keys()))
+        except Exception as exc:
+            logger.warning("recover: persist failed for %s: %s", sid, exc)
+    if fixed:
+        STATE["version"] += 1
+    return fixed
+
+
+@app.post("/api/state/recover")
+async def api_state_recover():
+    fixed = await run_in_threadpool(recover_names)
+    if fixed:
+        await broadcast({"type": "rows", "by": "recover", "v": STATE["version"],
+                         "list": [{"secId": sid, **STATE["rows"][sid]} for sid in fixed]})
+    return {"ok": True, "recovered": {str(k): v for k, v in fixed.items()}, "n": len(fixed)}
+
+
 @app.get("/api/bond_dates/probe")
 def api_bond_dates_probe(isin: str = ""):
     """Diagnostic for one ISIN: every candidate call/put/maturity field with the value the
@@ -3253,10 +3378,7 @@ async def ws_endpoint(ws: WebSocket):
                     except (TypeError, ValueError):
                         continue
                     row = STATE["rows"].setdefault(sid, _blank_row())
-                    touched = [f for f in USER_FIELDS + OVD_FIELDS
-                               if f in it]
-                    for f in touched:
-                        row[f] = str(it.get(f) or "")
+                    touched = _rows_apply(it, row, user)
                     if _van_mirror(row) and \
                             "ovdCbFx" not in touched:
                         touched.append("ovdCbFx")
@@ -3762,7 +3884,7 @@ h2{font-size:10.5px;font-weight:700;color:var(--muted);margin:0;
 <body>
 <header>
   <h1>CB nuke station</h1>
-  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b48</b></span>
+  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b50</b></span>
   <span id="conn" class="conn warn" title="Connection">&#9679;</span>
   <span id="online" class="sub"></span>
   <div class="tabs">
@@ -3920,6 +4042,10 @@ h2{font-size:10.5px;font-weight:700;color:var(--muted);margin:0;
         <label for="cfgStep">Bid/ask rounding step (live, eod, override, &Delta;)</label>
         <input type="number" id="cfgStep" min="0.0001" step="0.01">
       </div>
+      <h4 style="margin:14px 0 4px">Recovery</h4>
+      <div class="fieldrow"><label>Names / und_fx missing?</label>
+        <span><button type="button" onclick="recoverNames()">Recover from database, change history &amp; last autosave</button> <span id="recoverMsg" class="note"></span></span></div>
+      <p class="note">Every change to a name, FX ric, type, X / spread or borrow field is also appended to cb_state_hist; a value overwritten in the live table is restored from there.</p>
       <h4 style="margin:14px 0 4px">IDB quotes band</h4>
       <div class="fieldrow">
         <label for="cfgIdbLayout">Column layout</label>
@@ -4210,6 +4336,8 @@ async function snap8Now(){
   loadSnap8();
 }
 
+async function recoverNames(){ const base=location.pathname.replace(new RegExp("[/]+$"),""); const el=document.getElementById("recoverMsg"); if(el) el.textContent="recovering...";
+  try{ const j=await (await fetch(base+"/api/state/recover",{method:"POST"})).json(); if(el) el.textContent = j.ok ? ("recovered "+j.n+" securities"+(j.n?": "+Object.entries(j.recovered).map(([k,v])=>k+" "+Object.keys(v).join("/")).join(", "):"")) : (j.error||"failed"); }catch(e){ if(el) el.textContent="failed: "+e; } }
 function cfgIdbReset(){ delete CFG.idbColors; localStorage.setItem("nukestation.cfg", JSON.stringify(CFG)); idbApplyColors(); loadCfgForm(); }
 function loadCfgForm(){
   { const c=idbColors(); const set=(id,v)=>{ const el=document.getElementById(id); if(el) el.value=v; };
@@ -4586,7 +4714,7 @@ function wireGrid(){
     });
 
     inp.addEventListener("blur", ()=>inp.classList.remove("editing"));
-    inp.addEventListener("change", ()=>syncRows([r]));
+    inp.addEventListener("change", ()=>syncRows([r], inp.dataset.u || inp.dataset.f));   // the edited cell may be cleared on purpose
 
     inp.addEventListener("paste", (e)=>{
       const text = (e.clipboardData||window.clipboardData).getData("text");
@@ -5907,10 +6035,13 @@ function applyNuke(){
   render(data, null, true);  updParityAll(); updMovesFlags();
 }
 
-function rowPayload(ri){
+function rowPayload(ri, edited){
   const tr = trAt(ri); if(!tr) return null;
   const p = {secId: Number(tr.dataset.id)};
-  for(const f of ["short_name","und_fx","n_gamma"]) p[f] = uVal(tr, f);
+  // names / fx / gamma: only when present in the grid, or when this exact cell was edited (a deliberate clear is flagged)
+  const clear = [];
+  for(const f of ["short_name","und_fx","n_gamma"]){ const v = uVal(tr, f); if(v !== "") p[f] = v; else if(edited === f){ p[f] = ""; clear.push(f); } }
+  if(clear.length) p._clear = clear;
   for(const f of FIELDS){
     const i = tr.querySelector(`input[data-f="${f}"]`);
     p[f] = i ? i.value.trim() : "";
@@ -5918,13 +6049,13 @@ function rowPayload(ri){
   return p;
 }
 
-function syncRows(ris){
+function syncRows(ris, edited){
   [...new Set(ris)].forEach(ri=>{ const tr=trAt(ri); if(!tr) return;
     const sid=Number(tr.dataset.id); DC[sid]=DC[sid]||{};
     tr.querySelectorAll("input[data-dc]").forEach(i=>{
       DC[sid][i.dataset.dc]=i.value.trim(); });
     updDeltaCalc(tr); });
-  const list = [...new Set(ris)].map(rowPayload).filter(Boolean);
+  const list = [...new Set(ris)].map(ri=>rowPayload(ri, edited)).filter(Boolean);
   if(!list.length) return;
   for(const p of list) NS.rows[p.secId] = Object.assign({}, NS.rows[p.secId] || {}, p);   // merge, keep X / type / borrow fields
   NS.send({type:"rows", list});
@@ -6888,7 +7019,7 @@ if __name__ == "__main__":
     # NOTE: reload must stay OFF (single process) so the in-memory
     # WebSocket hub works, and so the browser only opens once.
     print("=" * 62)
-    print("  NUKE STATION  BUILD borrow.b48  \u00b7  %s"
+    print("  NUKE STATION  BUILD borrow.b50  \u00b7  %s"
           % os.path.abspath(__file__))
     print("  port %s \u00b7 if this banner is missing, an OLD file is\n  running \u2014 kill that process first." % PORT)
     print("=" * 62)
