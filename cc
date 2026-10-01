@@ -3428,7 +3428,7 @@ th{position:sticky}
 .hint{color:var(--faint);font-size:10px;margin:0}
 .filters{display:flex;align-items:center;gap:10px;font-size:11px;color:var(--text)}.filters .fl-lbl{color:var(--muted);font-weight:700;letter-spacing:.3px;text-transform:uppercase;font-size:9.5px}
 .filters label{display:inline-flex;align-items:center;gap:4px;cursor:pointer;padding:1px 6px;border:1px solid var(--border2);border-radius:3px;background:var(--panel)}.filters label:has(input:checked){background:#0b6e66;color:#fff;border-color:#0b6e66}
-.filters .fl-cnt{color:var(--muted);font-variant-numeric:tabular-nums}
+.filters .fl-cnt{color:var(--muted);font-variant-numeric:tabular-nums}.filters .fl-sep{width:1px;height:14px;background:var(--border2)}.filters .fl-grp{color:var(--muted);font-size:9.5px;font-weight:700;text-transform:uppercase}
 #tbl tr.flt-hide{display:none}
 kbd{background:var(--panel2);border:1px solid var(--border2);border-radius:0;
   padding:0 4px;font:10px var(--mono);color:var(--muted)}
@@ -3450,7 +3450,7 @@ h2{font-size:10.5px;font-weight:700;color:var(--muted);margin:0;
 <body>
 <header>
   <h1>CB nuke station</h1>
-  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b39</b></span>
+  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b40</b></span>
   <span id="conn" class="conn warn" title="Connection">&#9679;</span>
   <span id="online" class="sub"></span>
   <div class="tabs">
@@ -3476,6 +3476,14 @@ h2{font-size:10.5px;font-weight:700;color:var(--muted);margin:0;
       <div class="filters" id="filters" title="Filters show only the rows that match; hidden rows are still priced and refreshed. (Tip: und_fx takes an Eikon FX RIC - TWD=, KRW=, TWDKRW=R, or 1 for USD.)">
         <span class="fl-lbl">Filter</span>
         <label><input type="checkbox" id="fltMove" onchange="filtersChanged()"> MOVE flag</label>
+        <span class="fl-sep"></span><span class="fl-grp">VOL</span>
+        <label><input type="checkbox" data-flt="vol" value="Rich" onchange="filtersChanged()"> Rich</label>
+        <label><input type="checkbox" data-flt="vol" value="Cheap" onchange="filtersChanged()"> Cheap</label>
+        <label><input type="checkbox" data-flt="vol" value="" onchange="filtersChanged()"> Neutral</label>
+        <span class="fl-sep"></span><span class="fl-grp">IDB gap</span>
+        <label title="bid gap pill (G.B)"><input type="checkbox" data-flt="idb" value="gb" onchange="filtersChanged()"> G.B</label>
+        <label title="offer gap pill (G.O)"><input type="checkbox" data-flt="idb" value="go" onchange="filtersChanged()"> G.O</label>
+        <label title="mid gap pill (G)"><input type="checkbox" data-flt="idb" value="g" onchange="filtersChanged()"> G</label>
         <span id="fltCount" class="fl-cnt"></span>
       </div>
       <span class="namebox" id="namebox">&mdash;</span>
@@ -4785,16 +4793,28 @@ function mvClass(td, v, kind){
   let lv = 0; for(let i=0;i<th.length;i++) if(a >= th[i]) lv = i+1;
   td.classList.add((v>0?"mv-p":"mv-n")+lv);
 }
-const FILTERS = Object.assign({move:false}, JSON.parse(localStorage.getItem("nukestation.filters")||"{}"));
+const FILTERS = Object.assign({move:false, vol:[], idb:[]}, JSON.parse(localStorage.getItem("nukestation.filters")||"{}"));
+function rowVol(tr){ const s=tr.querySelector('select[data-u="vol_flag"]'); return s ? String(s.value||"") : ""; }   // "Rich" | "Cheap" | "" (neutral)
+function rowIdbGaps(tr){ const out=new Set(); tr.querySelectorAll('td[data-c="idb_flag"] span.ip').forEach(p=>{ const t=p.textContent; if(t.startsWith("G.B")) out.add("gb"); else if(t.startsWith("G.O")) out.add("go"); else if(/^G [+-]/.test(t)) out.add("g"); }); return out; }
 function rowMoveFlag(tr){ const mv=tr.querySelector('td[data-fl="f_move"]'); if(!mv) return false; const c=mv.classList;
   return [...c].some(x=>/^mv-[pn][34]$/.test(x)) || c.contains("fl-red") || c.contains("fl-amb"); }   // beyond BE (strong/solid), fixed-threshold hit, or FX part
 function applyFilters(){
   const rows=[...document.querySelectorAll("#tbl tr[data-id]")]; let shown=0;
-  rows.forEach(tr=>{ const ok = !FILTERS.move || rowMoveFlag(tr); tr.classList.toggle("flt-hide", !ok); if(ok) shown++; });
-  const c=document.getElementById("fltCount"); if(c) c.textContent = (FILTERS.move ? (shown+" of "+rows.length+" rows") : "");
+  const vol=FILTERS.vol||[], idb=FILTERS.idb||[]; const active = FILTERS.move || vol.length || idb.length;
+  rows.forEach(tr=>{
+    let ok = !FILTERS.move || rowMoveFlag(tr);                       // AND across filters ...
+    if(ok && vol.length) ok = vol.includes(rowVol(tr));               // ... OR within a filter
+    if(ok && idb.length){ const g=rowIdbGaps(tr); ok = idb.some(k=>g.has(k)); }
+    tr.classList.toggle("flt-hide", !ok); if(ok) shown++; });
+  const c=document.getElementById("fltCount"); if(c) c.textContent = (active ? (shown+" of "+rows.length+" rows") : "");
 }
-function filtersChanged(){ const el=document.getElementById("fltMove"); FILTERS.move=!!(el&&el.checked); localStorage.setItem("nukestation.filters", JSON.stringify(FILTERS)); applyFilters(); }
-(function(){ const el=document.getElementById("fltMove"); if(el) el.checked=!!FILTERS.move; })();
+function filtersChanged(){ const el=document.getElementById("fltMove"); FILTERS.move=!!(el&&el.checked);
+  FILTERS.vol=[...document.querySelectorAll('#filters input[data-flt="vol"]:checked')].map(i=>i.value);
+  FILTERS.idb=[...document.querySelectorAll('#filters input[data-flt="idb"]:checked')].map(i=>i.value);
+  localStorage.setItem("nukestation.filters", JSON.stringify(FILTERS)); applyFilters(); }
+(function(){ const el=document.getElementById("fltMove"); if(el) el.checked=!!FILTERS.move;
+  document.querySelectorAll('#filters input[data-flt="vol"]').forEach(i=>{ i.checked=(FILTERS.vol||[]).includes(i.value); });
+  document.querySelectorAll('#filters input[data-flt="idb"]').forEach(i=>{ i.checked=(FILTERS.idb||[]).includes(i.value); }); })();
 function updMovesFlags(scope){
   const today = new Date();
   document.querySelectorAll("#tbl tr[data-id]").forEach(tr=>{
@@ -5036,6 +5056,7 @@ function updVolCls(sel){
 function volChanged(sel){
   updVolCls(sel);
   sprdChanged(sel);
+  if(typeof applyFilters==="function") applyFilters();
 }
 function updParity(tr){
   const td = tr.querySelector('td[data-c="parityPct"]');
@@ -5119,7 +5140,7 @@ function idbPill(txt){
   return `<span class="ip ip-grey" title="${esc(t)}">${esc(t)}</span>`;
 }
 function idbPills(flags){ return String(flags||"").split(" | ").map(idbPill).filter(Boolean).join(" "); }
-function idbPaintAll(){ document.querySelectorAll("#tbl tbody tr[data-id]").forEach(idbPaintRow); }
+function idbPaintAll(){ document.querySelectorAll("#tbl tbody tr[data-id]").forEach(idbPaintRow); if(typeof applyFilters==="function") applyFilters(); }
 async function idbMirrorRefresh(){
   try{
     const d=new Date(); const iso=d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0");
@@ -6473,7 +6494,7 @@ if __name__ == "__main__":
     # NOTE: reload must stay OFF (single process) so the in-memory
     # WebSocket hub works, and so the browser only opens once.
     print("=" * 62)
-    print("  NUKE STATION  BUILD borrow.b39  \u00b7  %s"
+    print("  NUKE STATION  BUILD borrow.b40  \u00b7  %s"
           % os.path.abspath(__file__))
     print("  port %s \u00b7 if this banner is missing, an OLD file is\n  running \u2014 kill that process first." % PORT)
     print("=" * 62)
