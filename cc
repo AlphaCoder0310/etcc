@@ -55,6 +55,8 @@ import json
 import logging
 import os
 import sys
+import time
+import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, date, timedelta
 from collections import deque
@@ -2793,6 +2795,187 @@ async def api_twap(req: TwapReq):
     return r
 
 
+# ---- Bond dates from Bloomberg (static reference data): NXT_CALL_DT / MATURITY / NXT_PUT_DT ----
+BOND_DATES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bond_dates_cache.json")
+_BD = {"data": {}, "pending": set(), "lock": threading.Lock(), "busy": False, "err": ""}
+BD_FIELDS = ["NXT_CALL_DT", "MATURITY", "NXT_PUT_DT", "CALLABLE", "PUTABLE"]
+BD_BATCH = 50
+
+
+def _bd_load():
+    try:
+        with open(BOND_DATES_FILE, "r", encoding="utf-8") as fh:
+            d = json.load(fh)
+        if isinstance(d, dict):
+            _BD["data"] = d
+    except Exception:
+        pass
+
+
+def _bd_save():
+    try:
+        tmp = BOND_DATES_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(_BD["data"], fh)
+        os.replace(tmp, BOND_DATES_FILE)
+    except Exception as exc:
+        logger.warning("bond dates cache save failed: %s", exc)
+
+
+def _bd_norm_date(v):
+    """Bloomberg date -> 'YYYY-MM-DD' or ''."""
+    if v is None:
+        return ""
+    try:
+        if hasattr(v, "strftime"):
+            return v.strftime("%Y-%m-%d")
+        s = str(v).strip()
+        if not s or s.lower() in ("nan", "nat", "none"):
+            return ""
+        return s[:10]
+    except Exception:
+        return ""
+
+
+def bbg_bond_dates(isins):
+    """ReferenceDataRequest for a batch of ISINs -> {isin: {call, expiry, put, callable, putable}}.
+    xbbg first, raw blpapi second."""
+    secs = ["/isin/" + i for i in isins]
+    out = {}
+    try:
+        from xbbg import blp
+        starts = {}
+        try:                                   # call period start = earliest row of the call schedule
+            sch = blp.bds(tickers=secs, flds="CALL_SCHEDULE")
+            if sch is not None and len(sch):
+                dcol = next((c for c in sch.columns if "date" in str(c).lower()), None)
+                if dcol is not None:
+                    for sec, grp in sch.groupby(level=0):
+                        ds = sorted(x for x in (_bd_norm_date(v) for v in grp[dcol]) if x)
+                        if ds:
+                            starts[str(sec).replace("/isin/", "").split()[0].upper()] = ds[0]
+        except Exception as exc:
+            logger.info("CALL_SCHEDULE not available: %s", exc)
+        df = blp.bdp(tickers=secs, flds=BD_FIELDS)
+        if df is not None and len(df):
+            cols = {str(c).lower(): c for c in df.columns}
+            for sec, row in df.iterrows():
+                isin = str(sec).replace("/isin/", "").split()[0].upper()
+                g = lambda f: row[cols[f.lower()]] if f.lower() in cols else None
+                out[isin] = {"call": _bd_norm_date(g("NXT_CALL_DT")), "expiry": _bd_norm_date(g("MATURITY")),
+                             "put": _bd_norm_date(g("NXT_PUT_DT")), "call_start": starts.get(isin, ""),
+                             "callable": str(g("CALLABLE") or "").upper()[:1], "putable": str(g("PUTABLE") or "").upper()[:1]}
+        return out
+    except ImportError:
+        pass
+    import blpapi
+    sess = blpapi.Session()
+    if not sess.start() or not sess.openService("//blp/refdata"):
+        raise RuntimeError("Bloomberg session could not start - is the Terminal running?")
+    try:
+        svc = sess.getService("//blp/refdata")
+        req = svc.createRequest("ReferenceDataRequest")
+        for s in secs:
+            req.getElement("securities").appendValue(s)
+        for f in BD_FIELDS + ["CALL_SCHEDULE"]:
+            req.getElement("fields").appendValue(f)
+        sess.sendRequest(req)
+        while True:
+            ev = sess.nextEvent(5000)
+            for msg in ev:
+                if not msg.hasElement("securityData"):
+                    continue
+                for sd in msg.getElement("securityData").values():
+                    isin = sd.getElementAsString("security").replace("/isin/", "").split()[0].upper()
+                    if sd.hasElement("securityError"):
+                        out[isin] = {"error": sd.getElement("securityError").getElementAsString("message")}
+                        continue
+                    fd = sd.getElement("fieldData")
+                    gv = lambda f: (fd.getElementAsString(f) if fd.hasElement(f) else None)
+                    cs = ""
+                    try:
+                        if fd.hasElement("CALL_SCHEDULE"):
+                            ds = []
+                            for row in fd.getElement("CALL_SCHEDULE").values():
+                                for k in range(row.numElements()):
+                                    el = row.getElement(k)
+                                    if "date" in str(el.name()).lower():
+                                        ds.append(_bd_norm_date(el.getValueAsString()))
+                            ds = sorted(x for x in ds if x)
+                            cs = ds[0] if ds else ""
+                    except Exception:
+                        cs = ""
+                    out[isin] = {"call": _bd_norm_date(gv("NXT_CALL_DT")), "expiry": _bd_norm_date(gv("MATURITY")),
+                                 "put": _bd_norm_date(gv("NXT_PUT_DT")), "call_start": cs,
+                                 "callable": str(gv("CALLABLE") or "").upper()[:1], "putable": str(gv("PUTABLE") or "").upper()[:1]}
+            if ev.eventType() == blpapi.Event.RESPONSE:
+                break
+        return out
+    finally:
+        sess.stop()
+
+
+def _bd_worker(isins):
+    """Background: fetch in batches, stamp with today's date, persist. Never on a request path."""
+    today = date.today().isoformat()
+    try:
+        for i in range(0, len(isins), BD_BATCH):
+            batch = isins[i:i + BD_BATCH]
+            try:
+                res = bbg_bond_dates(batch)
+                with _BD["lock"]:
+                    for isin in batch:
+                        r = res.get(isin) or {"error": "no data"}
+                        r = dict(r); r["asof"] = today
+                        _BD["data"][isin] = r
+                _BD["err"] = ""
+            except Exception as exc:
+                _BD["err"] = str(exc)[:200]
+                logger.warning("bond dates fetch failed (%d isins): %s", len(batch), exc)
+                with _BD["lock"]:
+                    for isin in batch:                          # remember the failure for an hour, do not hammer
+                        _BD["data"][isin] = {"error": str(exc)[:120], "asof": today, "retry_at": time.time() + 3600}
+        _bd_save()
+    finally:
+        with _BD["lock"]:
+            _BD["pending"].difference_update(isins)
+            _BD["busy"] = False
+
+
+def _bd_need(isin):
+    r = _BD["data"].get(isin)
+    if not r:
+        return True
+    if r.get("retry_at"):
+        return time.time() >= r["retry_at"]
+    return r.get("asof") != date.today().isoformat()        # a new day -> refresh once
+
+
+@app.get("/api/bond_dates")
+def api_bond_dates(isins: str = ""):
+    """Cached bond dates for the given ISINs; missing or stale ones are queued for one
+    background fetch (batched). The request itself never calls Bloomberg."""
+    if not _BD["data"] and os.path.exists(BOND_DATES_FILE):
+        _bd_load()
+    want = [i.strip().upper() for i in isins.split(",") if i.strip()]
+    out, need = {}, []
+    with _BD["lock"]:
+        for isin in want:
+            r = _BD["data"].get(isin)
+            if r and not _bd_need(isin):
+                out[isin] = r
+            elif r:
+                out[isin] = dict(r, stale=True)
+            if _bd_need(isin) and isin not in _BD["pending"]:
+                need.append(isin); _BD["pending"].add(isin)
+        if need and not _BD["busy"]:
+            _BD["busy"] = True
+            threading.Thread(target=_bd_worker, args=(need,), name="bond-dates", daemon=True).start()
+        elif need:
+            _BD["pending"].difference_update(need)   # let the next poll queue them once the worker is free
+    return {"ok": True, "dates": out, "pending": len(_BD["pending"]), "busy": _BD["busy"], "err": _BD["err"]}
+
+
 @app.post("/api/snap8/run")
 async def api_snap8_run():
     """Manual morning snapshot: Close -> ovd, re-nuke, store (replaces today)."""
@@ -3450,7 +3633,7 @@ h2{font-size:10.5px;font-weight:700;color:var(--muted);margin:0;
 <body>
 <header>
   <h1>CB nuke station</h1>
-  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b41</b></span>
+  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b43</b></span>
   <span id="conn" class="conn warn" title="Connection">&#9679;</span>
   <span id="online" class="sub"></span>
   <div class="tabs">
@@ -3487,6 +3670,11 @@ h2{font-size:10.5px;font-weight:700;color:var(--muted);margin:0;
         <span class="fl-sep"></span><span class="fl-grp">Opp</span>
         <label title="no position (qty_live 0 or blank) and the IDB bid is above my bid (gap bid > 0)"><input type="checkbox" data-flt="opp" value="flat_gb" onchange="filtersChanged()"> Flat &amp; G.B &gt; 0</label>
         <label title="long (qty_live > 0) and the IDB offer is below my offer (gap ofr < 0)"><input type="checkbox" data-flt="opp" value="long_go" onchange="filtersChanged()"> Long &amp; G.O &lt; 0</label>
+        <span class="fl-sep"></span><span class="fl-grp">Dates</span>
+        <label title="call period has started (Bloomberg call schedule start <= today) and the bond has not matured"><input type="checkbox" data-flt="dt" value="in_call" onchange="filtersChanged()"> In call period</label>
+        <label title="call period starts within the next 3 months"><input type="checkbox" data-flt="dt" value="call_3m" onchange="filtersChanged()"> Call starts &le; 3m</label>
+        <label title="maturity within the next 6 months"><input type="checkbox" data-flt="dt" value="exp_6m" onchange="filtersChanged()"> Expiry &le; 6m</label>
+        <label title="next put date within the next 6 months"><input type="checkbox" data-flt="dt" value="put_6m" onchange="filtersChanged()"> Put &le; 6m</label>
         <span id="fltCount" class="fl-cnt"></span>
       </div>
       <span class="namebox" id="namebox">&mdash;</span>
@@ -4623,7 +4811,7 @@ function buildTable(idsOpt){
   lastResponse = null;
   applyState();                                   // saved names / types / X / spreads: show at once
   loadRefData(uniq).catch(e=>setStatus(`<span class="warn">Reference lookup failed: ${e}</span>`))
-    .finally(()=>{ applyState(); applyNuke(); applyRfx(); if(typeof hnPaintAll==="function") hnPaintAll(); });   // and again after refdata (never skipped)
+    .finally(()=>{ applyState(); applyNuke(); applyRfx(); if(typeof hnPaintAll==="function") hnPaintAll(); if(typeof bdRefresh==="function") bdRefresh(true); });   // and again after refdata (never skipped)
 }
 
 const BAND_FIRST = new Set(["n_bid","bw_dvb","x_bid","f_call","v_iv","dc_notl","cn_start",idbOrder()[0],
@@ -4775,6 +4963,44 @@ function _numTxt(td){
   if(!td) return NaN;
   return parseFloat(String(td.textContent).split(",").join("").trim());
 }
+/* Bond dates from Bloomberg (cached daily on the server): CALL / EXP / PUT cells show the dates */
+const BD = {dates:{}, ts:0, inflight:false};
+function bdIsinOf(tr){ const sid=Number(tr.dataset.id); return String(((refCache[sid]||{}).isin)||"").trim().toUpperCase(); }
+async function bdRefresh(force){
+  if(BD.inflight) return; const now=Date.now(); if(!force && now-BD.ts < 60000) return;
+  const isins=[...new Set([...document.querySelectorAll("#tbl tr[data-id]")].map(bdIsinOf).filter(Boolean))];
+  if(!isins.length) return;
+  BD.inflight=true;
+  try{ const base=location.pathname.replace(new RegExp("[/]+$"),"");
+    const j=await (await fetch(base+"/api/bond_dates?isins="+encodeURIComponent(isins.join(",")))).json();
+    if(j&&j.ok){ Object.assign(BD.dates, j.dates||{}); BD.ts=now; BD.err=j.err||""; bdPaintAll(); if(j.pending||j.busy) setTimeout(()=>bdRefresh(true), 4000); }
+  }catch(e){ BD.err=String(e); } finally{ BD.inflight=false; }
+}
+function _dateChip(td, iso, yearsFallback, kind, flag){
+  if(!td) return;
+  td.classList.remove("fl-red","fl-amb","fl-dim");
+  if(!iso){ if(flag==="N"){ td.textContent="\u2014"; td.title=kind+": none (Bloomberg)"; td.classList.add("fl-dim"); return; }
+    if(isFinite(yearsFallback)){ td.textContent=yearsFallback.toFixed(1)+"y"; td.title=kind+": Bloomberg date not available - model years shown"; td.classList.add(yearsFallback<FLAG_TH.yearsRed?"fl-red":yearsFallback<FLAG_TH.yearsAmb?"fl-amb":"fl-dim"); return; }
+    td.textContent=""; td.title=kind+": no date"; return; }
+  const d=new Date(iso+"T00:00:00"); const days=Math.round((d-new Date(new Date().toDateString()))/86400000);
+  td.textContent = d.toLocaleDateString("en-GB",{day:"2-digit",month:"short",year:"2-digit"});
+  if(days<0) td.classList.add("fl-dim"); else if(days<=30) td.classList.add("fl-red"); else if(days<=90) td.classList.add("fl-amb");
+  td.title = kind+" "+iso+(days<0?" (passed "+(-days)+"d ago)":" (in "+days+"d)")+(isFinite(yearsFallback)?" \u00b7 model: "+yearsFallback.toFixed(2)+"y":"");
+}
+function bdPaintRow(tr){
+  const sid=Number(tr.dataset.id); const ref=refCache[sid]||{}; const isin=bdIsinOf(tr); const r=isin?BD.dates[isin]:null;
+  const g=k=>tr.querySelector('td[data-fl="'+k+'"]');
+  let ye=NaN; if(ref.expiry_date){ const d=new Date(ref.expiry_date); if(!isNaN(d)) ye=(d-new Date())/(365.25*24*3600*1000); }
+  if(!r || r.error){ _yearsChip(g("f_call"), parseFloat(ref.years_to_call), (r&&r.error)?"Bloomberg: "+r.error:"call: waiting for Bloomberg dates");
+    _yearsChip(g("f_exp"), ye, "no expiry_date"); _yearsChip(g("f_put"), parseFloat(ref.years_to_put), "put: waiting for Bloomberg dates");
+    const why=(r&&r.error)?"Bloomberg: "+r.error+" - model years shown":"waiting for Bloomberg dates - model years shown"; ["f_call","f_exp","f_put"].forEach(k=>{ const c=g(k); if(c && c.textContent) c.title=why; }); return; }
+  _dateChip(g("f_call"), r.call, parseFloat(ref.years_to_call), "next issuer call", r.callable);
+  if(r.call_start){ const c=g("f_call"); if(c) c.title += " \u00b7 call period from "+r.call_start; }
+  _dateChip(g("f_exp"), r.expiry, ye, "maturity", "");
+  _dateChip(g("f_put"), r.put, parseFloat(ref.years_to_put), "next put", r.putable);
+}
+function bdPaintAll(){ document.querySelectorAll("#tbl tr[data-id]").forEach(bdPaintRow); if(typeof applyFilters==="function") applyFilters(); }
+setInterval(()=>bdRefresh(false), 60000);
 function _yearsChip(td, v, missingTitle){
   if(!isFinite(v)){ td.textContent="";
     td.classList.remove("fl-red","fl-amb","fl-dim");
@@ -4796,7 +5022,16 @@ function mvClass(td, v, kind){
   let lv = 0; for(let i=0;i<th.length;i++) if(a >= th[i]) lv = i+1;
   td.classList.add((v>0?"mv-p":"mv-n")+lv);
 }
-const FILTERS = Object.assign({move:false, vol:[], idb:[], opp:[]}, JSON.parse(localStorage.getItem("nukestation.filters")||"{}"));
+const FILTERS = Object.assign({move:false, vol:[], idb:[], opp:[], dt:[]}, JSON.parse(localStorage.getItem("nukestation.filters")||"{}"));
+function _addMonths(d,n){ const x=new Date(d.getTime()); const day=x.getDate(); x.setMonth(x.getMonth()+n); if(x.getDate()!==day) x.setDate(0); return x; }   // calendar months, clamped (31 Jan + 1m = 28/29 Feb)
+function rowDates(tr){ const s=new Set(); const isin=(typeof bdIsinOf==="function")?bdIsinOf(tr):""; const r=isin?(BD.dates||{})[isin]:null; if(!r||r.error) return s;
+  const today=new Date(new Date().toDateString()); const P=v=>{ if(!v) return null; const d=new Date(String(v).slice(0,10)+"T00:00:00"); return isNaN(d)?null:d; };
+  const cs=P(r.call_start)||((r.callable==="Y")?P(r.call):null), ex=P(r.expiry), pt=P(r.put);
+  if(cs && cs<=today && (!ex || ex>=today)) s.add("in_call");
+  if(cs && cs>today && cs<=_addMonths(today,3)) s.add("call_3m");
+  if(ex && ex>=today && ex<=_addMonths(today,6)) s.add("exp_6m");
+  if(pt && pt>=today && pt<=_addMonths(today,6)) s.add("put_6m");
+  return s; }
 function rowQtyLive(tr){ const sid=Number(tr.dataset.id); const q=parseFloat(String(((refCache[sid]||{}).quantity_live)??"").replace(/,/g,"")); return isFinite(q)?q:0; }   // blank -> 0 (flat)
 function rowGap(tr,k){ const td=tr.querySelector('td[data-c="'+k+'"]'); const v=parseFloat(String(td?td.textContent:"").replace(/[+,]/g,"")); return isFinite(v)?v:NaN; }   // blank / not compared -> NaN
 function rowOpp(tr){ const q=rowQtyLive(tr), gb=rowGap(tr,"idb_gap_b"), go=rowGap(tr,"idb_gap_a"); const s=new Set();
@@ -4809,12 +5044,13 @@ function rowMoveFlag(tr){ const mv=tr.querySelector('td[data-fl="f_move"]'); if(
   return [...c].some(x=>/^mv-[pn][34]$/.test(x)) || c.contains("fl-red") || c.contains("fl-amb"); }   // beyond BE (strong/solid), fixed-threshold hit, or FX part
 function applyFilters(){
   const rows=[...document.querySelectorAll("#tbl tr[data-id]")]; let shown=0;
-  const vol=FILTERS.vol||[], idb=FILTERS.idb||[], opp=FILTERS.opp||[]; const active = FILTERS.move || vol.length || idb.length || opp.length;
+  const vol=FILTERS.vol||[], idb=FILTERS.idb||[], opp=FILTERS.opp||[], dts=FILTERS.dt||[]; const active = FILTERS.move || vol.length || idb.length || opp.length || dts.length;
   rows.forEach(tr=>{
     let ok = !FILTERS.move || rowMoveFlag(tr);                       // AND across filters ...
     if(ok && vol.length) ok = vol.includes(rowVol(tr));               // ... OR within a filter
     if(ok && idb.length){ const g=rowIdbGaps(tr); ok = idb.some(k=>g.has(k)); }
     if(ok && opp.length){ const o=rowOpp(tr); ok = opp.some(k=>o.has(k)); }
+    if(ok && dts.length){ const dd=rowDates(tr); ok = dts.some(k=>dd.has(k)); }
     tr.classList.toggle("flt-hide", !ok); if(ok) shown++; });
   const c=document.getElementById("fltCount"); if(c) c.textContent = (active ? (shown+" of "+rows.length+" rows") : "");
 }
@@ -4822,11 +5058,13 @@ function filtersChanged(){ const el=document.getElementById("fltMove"); FILTERS.
   FILTERS.vol=[...document.querySelectorAll('#filters input[data-flt="vol"]:checked')].map(i=>i.value);
   FILTERS.idb=[...document.querySelectorAll('#filters input[data-flt="idb"]:checked')].map(i=>i.value);
   FILTERS.opp=[...document.querySelectorAll('#filters input[data-flt="opp"]:checked')].map(i=>i.value);
+  FILTERS.dt=[...document.querySelectorAll('#filters input[data-flt="dt"]:checked')].map(i=>i.value);
   localStorage.setItem("nukestation.filters", JSON.stringify(FILTERS)); applyFilters(); }
 (function(){ const el=document.getElementById("fltMove"); if(el) el.checked=!!FILTERS.move;
   document.querySelectorAll('#filters input[data-flt="vol"]').forEach(i=>{ i.checked=(FILTERS.vol||[]).includes(i.value); });
   document.querySelectorAll('#filters input[data-flt="idb"]').forEach(i=>{ i.checked=(FILTERS.idb||[]).includes(i.value); });
-  document.querySelectorAll('#filters input[data-flt="opp"]').forEach(i=>{ i.checked=(FILTERS.opp||[]).includes(i.value); }); })();
+  document.querySelectorAll('#filters input[data-flt="opp"]').forEach(i=>{ i.checked=(FILTERS.opp||[]).includes(i.value); });
+  document.querySelectorAll('#filters input[data-flt="dt"]').forEach(i=>{ i.checked=(FILTERS.dt||[]).includes(i.value); }); })();
 function updMovesFlags(scope){
   const today = new Date();
   document.querySelectorAll("#tbl tr[data-id]").forEach(tr=>{
@@ -4847,16 +5085,7 @@ function updMovesFlags(scope){
     if(fmTd){ fmTd.textContent=isFinite(fm)?((fm>0?"+":"")+fm.toFixed(0)):"";
       mvClass(fmTd, fm, "fx"); }
     // flags
-    _yearsChip(g("f_call"), parseFloat(ref.years_to_call),
-      "no years_to_call in lp_model_output");
-    let ye = NaN;
-    if(ref.expiry_date){
-      const d = new Date(ref.expiry_date);
-      if(!isNaN(d)) ye = (d - today) / (365.25*24*3600*1000);
-    }
-    _yearsChip(g("f_exp"), ye, "no expiry_date");
-    _yearsChip(g("f_put"), parseFloat(ref.years_to_put),
-      "no years_to_put in lp_model_output");
+    bdPaintRow(tr);                                   // CALL / EXP / PUT: Bloomberg dates (cached daily), years chips until they arrive
     const dv = g("f_div");
     if(dv){
       dv.classList.remove("fl-red","fl-amb","fl-dim");
@@ -6506,7 +6735,7 @@ if __name__ == "__main__":
     # NOTE: reload must stay OFF (single process) so the in-memory
     # WebSocket hub works, and so the browser only opens once.
     print("=" * 62)
-    print("  NUKE STATION  BUILD borrow.b41  \u00b7  %s"
+    print("  NUKE STATION  BUILD borrow.b43  \u00b7  %s"
           % os.path.abspath(__file__))
     print("  port %s \u00b7 if this banner is missing, an OLD file is\n  running \u2014 kill that process first." % PORT)
     print("=" * 62)
