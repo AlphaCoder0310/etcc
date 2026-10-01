@@ -2275,15 +2275,174 @@ def bbg_bars(ticker, day):
         sess.stop()
 
 
-def _hms(t):
-    """'9:05' / '09:05' / '09:05:30' -> 'HH:MM:SS' for the VWAP overrides."""
-    p = [x for x in str(t or "").strip().split(":") if x != ""]
-    if len(p) < 2:
+def parse_time_smart(t):
+    """Forgiving time entry -> (h, m, s). Accepts 9, 09, 930, 0930, 9:3,
+    9.30, 9h30, 9am, 930a, 2pm, 14, 14:30:15, now."""
+    import re as _re
+    s = str(t or "").strip().lower().replace(" ", "")
+    if not s:
+        raise ValueError("time required")
+    if s == "now":
+        n = datetime.now(); return n.hour, n.minute, n.second
+    ap = None
+    m = _re.match(r"^(.*?)(am|pm|a|p)$", s)
+    if m and m.group(1):
+        s, ap = m.group(1), m.group(2)[0]
+    s = s.replace(".", ":").replace("h", ":")
+    if ":" in s:
+        p = [x for x in s.split(":") if x != ""]
+        if not p or not all(x.isdigit() for x in p):
+            raise ValueError("time must be HH:MM")
+        h = int(p[0]); mi = int(p[1]) if len(p) > 1 else 0; sec = int(p[2]) if len(p) > 2 else 0
+    elif s.isdigit():
+        if len(s) <= 2:
+            h, mi, sec = int(s), 0, 0
+        elif len(s) == 3:
+            h, mi, sec = int(s[0]), int(s[1:]), 0
+        elif len(s) == 4:
+            h, mi, sec = int(s[:2]), int(s[2:]), 0
+        elif len(s) == 6:
+            h, mi, sec = int(s[:2]), int(s[2:4]), int(s[4:])
+        else:
+            raise ValueError("time must be HH:MM")
+    else:
         raise ValueError("time must be HH:MM")
-    h, mi = int(p[0]), int(p[1]); s = int(p[2]) if len(p) > 2 else 0
-    if not (0 <= h < 24 and 0 <= mi < 60 and 0 <= s < 60):
+    if ap == "p" and h < 12:
+        h += 12
+    if ap == "a" and h == 12:
+        h = 0
+    if not (0 <= h < 24 and 0 <= mi < 60 and 0 <= sec < 60):
         raise ValueError("time out of range")
+    return h, mi, sec
+
+
+def _hms(t):
+    """Any accepted time entry -> 'HH:MM:SS' for the Bloomberg overrides."""
+    h, mi, s = parse_time_smart(t)
     return "%02d:%02d:%02d" % (h, mi, s)
+
+
+# Bloomberg TWAP: field + override names are configurable because the interval
+# override name should be confirmed on the desk (GET /api/twap/fields?q=TWAP).
+BBG_TWAP_FIELD = os.environ.get("BBG_TWAP_FIELD", "TWAP")
+BBG_TWAP_OV = {"start": os.environ.get("BBG_TWAP_OV_START", "TWAP_START_TIME"),
+               "end": os.environ.get("BBG_TWAP_OV_END", "TWAP_END_TIME"),
+               "date": os.environ.get("BBG_TWAP_OV_DATE", "TWAP_DT"),
+               "interval": os.environ.get("BBG_TWAP_OV_INTERVAL", "TWAP_INTERVAL")}
+BBG_TWAP_INTERVAL = os.environ.get("BBG_TWAP_INTERVAL", "1S")     # 1-second benchmark by default
+
+
+def bbg_twap_field(ticker, day, start, end):
+    """Bloomberg-computed TWAP (1-second benchmark by default) via a
+    ReferenceDataRequest with start/end/date/interval overrides."""
+    ov = {BBG_TWAP_OV["start"]: _hms(start), BBG_TWAP_OV["end"]: _hms(end),
+          BBG_TWAP_OV["date"]: day.replace("-", "")}
+    if BBG_TWAP_OV.get("interval") and BBG_TWAP_INTERVAL:
+        ov[BBG_TWAP_OV["interval"]] = BBG_TWAP_INTERVAL
+    r = _bbg_ref(ticker, [BBG_TWAP_FIELD], ov)
+    v = r.get("values", {}).get(BBG_TWAP_FIELD)
+    return {"twap": v, "status": ("ok" if v is not None else (r.get("status") or "no value returned")),
+            "field": BBG_TWAP_FIELD, "overrides": ov}
+
+
+def _bbg_ref(ticker, flds, ov):
+    """One ReferenceDataRequest with overrides -> {"values": {fld: float}, "status": msg}.
+    xbbg first, raw blpapi second; field/security errors come back verbatim."""
+    try:
+        from xbbg import blp
+        df = blp.bdp(tickers=ticker, flds=flds, **ov)
+        if df is None or len(df) == 0:
+            return {"values": {}, "status": "no value returned"}
+        row = df.iloc[0]
+        cols = {str(c).lower(): c for c in df.columns}
+        vals = {f: _fnum0(row[cols[f.lower()]]) for f in flds if f.lower() in cols}
+        return {"values": vals, "status": "ok" if vals else "no value returned"}
+    except ImportError:
+        pass
+    try:
+        import blpapi
+    except ImportError:
+        raise RuntimeError("Bloomberg API not available on this PC (install xbbg or blpapi)")
+    sess = blpapi.Session()
+    if not sess.start() or not sess.openService("//blp/refdata"):
+        raise RuntimeError("Bloomberg session could not start - is the Terminal running?")
+    try:
+        svc = sess.getService("//blp/refdata")
+        req = svc.createRequest("ReferenceDataRequest")
+        req.getElement("securities").appendValue(ticker)
+        for f in flds:
+            req.getElement("fields").appendValue(f)
+        ovs = req.getElement("overrides")
+        for k, val in ov.items():
+            o = ovs.appendElement(); o.setElement("fieldId", k); o.setElement("value", val)
+        sess.sendRequest(req)
+        out = {"values": {}, "status": "no value returned"}
+        while True:
+            ev = sess.nextEvent(5000)
+            for msg in ev:
+                if not msg.hasElement("securityData"):
+                    continue
+                for sd in msg.getElement("securityData").values():
+                    if sd.hasElement("securityError"):
+                        out["status"] = "security error: " + sd.getElement("securityError").getElementAsString("message")
+                        continue
+                    fd = sd.getElement("fieldData")
+                    for f in flds:
+                        if fd.hasElement(f):
+                            out["values"][f] = fd.getElementAsFloat(f); out["status"] = "ok"
+                    if sd.hasElement("fieldExceptions") and sd.getElement("fieldExceptions").numValues():
+                        fe = sd.getElement("fieldExceptions").getValueAsElement(0)
+                        out["status"] = "field error: " + fe.getElementAsString("fieldId") + " - " + fe.getElement("errorInfo").getElementAsString("message")
+            if ev.eventType() == blpapi.Event.RESPONSE:
+                break
+        return out
+    finally:
+        sess.stop()
+
+
+@app.get("/api/twap/fields")
+def api_twap_fields(q: str = "TWAP"):
+    """Discovery: Bloomberg FieldSearchRequest for q -> field ids, mnemonics,
+    descriptions and override field ids, so BBG_TWAP_* can be pinned."""
+    try:
+        import blpapi
+    except ImportError:
+        return {"ok": False, "error": "blpapi not installed on this PC"}
+    try:
+        sess = blpapi.Session()
+        if not sess.start() or not sess.openService("//blp/apiflds"):
+            return {"ok": False, "error": "Bloomberg session could not start"}
+        try:
+            svc = sess.getService("//blp/apiflds")
+            req = svc.createRequest("FieldSearchRequest")
+            req.set("searchSpec", q)
+            req.getElement("returnFieldDocumentation").setValue(True)
+            sess.sendRequest(req)
+            rows = []
+            while True:
+                ev = sess.nextEvent(5000)
+                for msg in ev:
+                    if not msg.hasElement("fieldData"):
+                        continue
+                    for fd in msg.getElement("fieldData").values():
+                        info = fd.getElement("fieldInfo") if fd.hasElement("fieldInfo") else None
+                        if info is None:
+                            continue
+                        ovs = []
+                        if info.hasElement("overrides"):
+                            ovs = [str(x) for x in info.getElement("overrides").values()]
+                        rows.append({"id": fd.getElementAsString("id"),
+                                     "mnemonic": info.getElementAsString("mnemonic"),
+                                     "description": info.getElementAsString("description"),
+                                     "overrides": ovs})
+                if ev.eventType() == blpapi.Event.RESPONSE:
+                    break
+            return {"ok": True, "query": q, "fields": rows[:60],
+                    "configured": {"field": BBG_TWAP_FIELD, "overrides": BBG_TWAP_OV, "interval": BBG_TWAP_INTERVAL}}
+        finally:
+            sess.stop()
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)[:300]}
 
 
 def bbg_vwap_field(ticker, day, start, end):
@@ -2389,22 +2548,22 @@ async def api_twap(req: TwapReq):
          "twap": None, "bars": 0}
     if not r["ok"]:
         r["error"] = vw.get("status") or "no value returned"
-    # 2) TWAP (no Bloomberg field with time overrides): from 1-min bars, optional, never blocks the VWAP
-    if os.environ.get("BBG_TWAP_BARS", "1") != "0":
-        bkey = "B|%s|%s" % (tk, day)
-        bent = _BBG_CACHE.get(bkey)
-        try:
-            if bent and now - bent["ts"] < 60:
-                bars = bent["bars"]
-            else:
-                bars = await asyncio.wait_for(run_in_threadpool(bbg_bars, tk, day), timeout=tmo)
-                _BBG_CACHE[bkey] = {"ts": now, "bars": bars}
-            t = twap_vwap(bars, req.start, req.end)
-            r["twap"], r["bars"] = t["twap"], t["bars"]
-            if r["volume"] is None:
-                r["volume"] = t.get("volume")
-        except Exception as exc:
-            r["twap_note"] = "twap n/a: " + str(exc)[:80]
+    # 2) TWAP: Bloomberg-computed (1-second benchmark by default), cached per window; never blocks the VWAP
+    tkey = "T|%s|%s|%s|%s" % (tk, day, s_, e_)
+    tent = _BBG_CACHE.get(tkey)
+    try:
+        if tent and now - tent["ts"] < 60:
+            tw = tent["v"]
+        else:
+            tw = await asyncio.wait_for(run_in_threadpool(bbg_twap_field, tk, day, req.start, req.end), timeout=tmo)
+            _BBG_CACHE[tkey] = {"ts": now, "v": tw}
+        r["twap"] = tw.get("twap"); r["twap_src"] = tw.get("field"); r["twap_interval"] = BBG_TWAP_INTERVAL
+        if r["twap"] is None:
+            r["twap_note"] = "twap: " + (tw.get("status") or "no value returned")
+    except asyncio.TimeoutError:
+        r["twap_note"] = "twap: Bloomberg timed out"
+    except Exception as exc:
+        r["twap_note"] = "twap n/a: " + str(exc)[:100]
     if len(_BBG_CACHE) > 400:
         for k in sorted(_BBG_CACHE, key=lambda k: _BBG_CACHE[k]["ts"])[:100]:
             _BBG_CACHE.pop(k, None)
@@ -2942,11 +3101,15 @@ input.bwv.bwred{background:#fde7e5 !important;border-color:#b3261e !important;co
 #tbl.hb-cbnuke .bfirst[data-band="cbnuke"]{font-size:0;padding:0;width:14px;min-width:14px;max-width:14px;background:#f3f2ef;border-left:1px solid #d8d4cc}
 #tbl.hb-cbnuke .bfirst[data-band="cbnuke"] input{display:none}
 .cn{background:#e3eef9;color:#1e3a6e}td[data-band="cbnuke"].cnc{background:#eef3fb;font-weight:600}td[data-band="cbnuke"].cnt{background:#f4f7fb;font-size:9.5px;color:#555;text-align:left}
-input.cnv{width:46px;text-align:center}td[data-c="cn_tk"].cn-err{color:#b91c1c}
+input.cnv{width:46px;text-align:center}td[data-c="cn_tk"].cn-err{color:#b91c1c}input.cnv.cn-bad{background:#fee2e2;color:#7f1d1d}
+input.hnv{width:60px;text-align:right}input.hnv.hn-live{color:#1e3a6e;font-style:italic}td[data-band="cbnuke"].hnc{background:#dcfce7;font-weight:700}
 #tbl.hb-idb th[data-band="idb"]:not(.bfirst),#tbl.hb-idb td[data-band="idb"]:not(.bfirst){display:none}
 #tbl.hb-idb .bfirst[data-band="idb"]{font-size:0;padding:0;width:14px;min-width:14px;max-width:14px;background:#f3f2ef;border-left:1px solid #d8d4cc}
 .ib{background:#dcd3f0;color:#3b2a6e}td[data-band="idb"].ibq{background:#f3effa}td[data-band="idb"].imy{background:#eef7f0;font-weight:600}td[data-band="idb"].ichk{background:#f6f6f6}
-td[data-c="idb_flag"]{text-align:left}td[data-c="idb_flag"] b{color:#c62828}td[data-c="idb_flag"] i{color:#b45309;font-style:normal}
+td[data-c="idb_flag"]{text-align:left;white-space:nowrap}
+.ip{display:inline-block;padding:0 5px;border-radius:9px;font-size:9px;font-weight:700;letter-spacing:.3px;line-height:14px;vertical-align:middle;font-family:'Segoe UI',system-ui,sans-serif}
+.ip-x{background:#b91c1c;color:#fff}.ip-g1{background:#fde68a;color:#78350f}.ip-g2{background:#f59e0b;color:#3b1f00}.ip-g3{background:#c2410c;color:#fff}
+.ip-grey{background:#e5e7eb;color:#374151}.ip-out{background:transparent;color:#6b7280;border:1px solid #cbd5e1;line-height:12px}.ip-blue{background:transparent;color:#1d4ed8;border:1px solid #93c5fd;line-height:12px}.ip-purple{background:#ede9fe;color:#5b21b6}
 #tbl.hb-dcalc th[data-band="dcalc"]:not(.bfirst),#tbl.hb-dcalc td[data-band="dcalc"]:not(.bfirst){display:none}
 #tbl.hb-dcalc .bfirst[data-band="dcalc"]{font-size:0;padding:0;width:14px;min-width:14px;max-width:14px;background:#f3f2ef;border-left:1px solid #d8d4cc}
 #tbl.hb-dcalc .bfirst[data-band="dcalc"] input{display:none}
@@ -2990,6 +3153,7 @@ td[data-fl^="f_"].fl-red{color:#c62828;font-weight:700}
 td[data-fl^="f_"].fl-amb{color:#b26a00;font-weight:600}
 td[data-fl^="f_"].fl-dim{color:#b6b1a8}
 td[data-fl="stk_move"],td[data-fl="fx_move"]{text-align:right}
+td.bemv{color:#334155;font-variant-numeric:tabular-nums}td[data-fl="f_move"]{white-space:nowrap;text-align:left}td[data-fl="f_move"].fl-dim{color:#8a8a8a}
 td.mv-p0{color:#15803d;font-weight:600}td.mv-n0{color:#b91c1c;font-weight:600}
 td.mv-p1{background:#dcfce7 !important;color:#14532d;font-weight:600}td.mv-n1{background:#fee2e2 !important;color:#7f1d1d;font-weight:600}
 td.mv-p2{background:#a7f3c4 !important;color:#14532d;font-weight:700}td.mv-n2{background:#fecaca !important;color:#7f1d1d;font-weight:700}
@@ -3047,7 +3211,7 @@ h2{font-size:10.5px;font-weight:700;color:var(--muted);margin:0;
 <body>
 <header>
   <h1>CB nuke station</h1>
-  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b28</b></span>
+  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b31</b></span>
   <span id="conn" class="conn warn" title="Connection">&#9679;</span>
   <span id="online" class="sub"></span>
   <div class="tabs">
@@ -3279,7 +3443,7 @@ const COL_DEFS = [
   ["x_ask","XAsk",""],["x_both","X",""],
   ["quote_bid","QuoteBid",""],["quote_ask","QuoteAsk",""],
   ["ovdSpot","ovdSpot",""],["ovdCbFx","ovdCbFx",""],["ovdUndFx","ovdUndFx",""],
-  ["stk_move","Stk%",""],["fx_move","FXbps",""],
+  ["be_move","BE move%",""],["stk_move","Stk%",""],["fx_move","FXbps",""],
   ["d_vs","\u0394 vs live bid",""],["mid_drift","MID DRIFT",""],
   ["f_call","CALL","grp"],["f_exp","EXP",""],["f_put","PUT",""],
   ["f_div","DIV",""],["f_move","MOVE",""],["f_nuke","NUKE",""],
@@ -3290,6 +3454,7 @@ const COL_DEFS = [
   ["dc_notl","Notional","grp"],["dc_delta","Delta%",""],
   ["dc_shares","Eq Shares",""],["dc_usd","USD Delta",""],
   ["cn_start","Start","grp"],["cn_end","End",""],["cn_twap","TWAP",""],["cn_vwap","VWAP",""],["cn_vol","Volume",""],["cn_tk","BBG ticker",""],
+  ["hn_delta","Trade \u0394%",""],["hn_astk","A.Stock",""],["hn_afx","A.FX",""],["hn_abond","A.Bond",""],["hn_cstk","C.Stock",""],["hn_cfx","C.FX",""],["hn_dn","$-Neutral",""],
   ["idb_btime","time","grp"],
   ["idb_bref","@ref",""],
   ["idb_bid","IDB Bid",""],
@@ -3308,21 +3473,22 @@ const COL_DEFS = [
   ["eod_cbfx","cbFx",""],["eod_undfx","undFx",""],
   ["t_m","m%","grp"],["t_rolld","roll\u0394",""],["t_dpnl","\u0394pnl",""],
   ["t_gpnl","\u03b3pnl",""],["t_theo","theo",""],["t_vslive","vs live",""],
-  ["stk_last","last","grp rf"],["stk_time","time","rf"],["stk_date","date","rf"],
+  ["stk_last","last","grp rf"],["stk_time","time HKT","rf"],["stk_date","date","rf"],
   ["stk_close","close","rf"],["stk_closedt","close dt","rf"],
-  ["cf_last","cb fx last","grp cf"],["cf_time","cb fx time","cf"],
+  ["cf_last","cb fx last","grp cf"],["cf_time","cb fx time HKT","cf"],
   ["cf_date","cb fx date","cf"],["cf_close","cb fx close","cf"],
   ["cf_closedt","cb fx close dt","cf"],
-  ["fx_last","und fx last","grp fx"],["fx_time","und fx time","fx"],
+  ["fx_last","und fx last","grp fx"],["fx_time","und fx time HKT","fx"],
   ["fx_date","und fx date","fx"],["fx_close","und fx close","fx"],
   ["fx_closedt","und fx close dt","fx"],
 ];
 const COL_KEYS = COL_DEFS.map(d=>d[0]);
 const DEF_W = {secId:97, company:180, short_name:110, und_fx:92,
-               ovdSpot:96, ovdCbFx:96, ovdUndFx:96,
+               ovdSpot:96, ovdCbFx:96, ovdUndFx:96, be_move:72,
                cf_last:78, cf_time:70, cf_date:80, cf_close:78, cf_closedt:80,
                dc_notl:96, dc_delta:64, dc_shares:92, dc_usd:96,
                cn_start:54, cn_end:54, cn_twap:72, cn_vwap:72, cn_vol:84, cn_tk:120,
+               hn_delta:56, hn_astk:68, hn_afx:64, hn_abond:68, hn_cstk:68, hn_cfx:64, hn_dn:76,
                idb_bid:62, idb_bref:60, idb_btime:64, idb_ask:62, idb_aref:60, idb_atime:64,
                idb_ref:62, idb_my_bid:62, idb_my_ask:62, idb_gap_b:58, idb_gap_a:58, idb_gap:58, idb_flag:170};
 const SIDE_W_DEF = 172;   // left secid panel; LAYOUT._side overrides
@@ -4014,12 +4180,12 @@ function buildTable(idsOpt){
     `<td></td><td class="uin"></td><td colspan="2"></td>` +
     `<td colspan="9" class="gm grp bandhd" id="band-model" onclick="bandToggle('model')">model (last nuke) &#9662;</td>` +
     `<td colspan="12" class="bw grp bandhd" id="band-brw" onclick="bandToggle('brw')">borrow &#9662;</td>` +
-    `<td colspan="16" class="go grp bandhd" id="band-res" onclick="bandToggle('res')">override result &#9662;</td>` +
+    `<td colspan="17" class="go grp bandhd" id="band-res" onclick="bandToggle('res')">override result &#9662;</td>` +
     `<td colspan="7" class="fb grp bandhd" id="band-flags" onclick="bandToggle('flags')">flags &#9662;</td>` +
     `<td colspan="6" class="vb grp bandhd" id="band-vol" onclick="bandToggle('vol')">vol &#9662;</td>` +
     `<td colspan="4" class="dc grp bandhd" id="band-dcalc" onclick="bandToggle('dcalc')">delta calc &#9662;</td>` +
-    `<td colspan="6" class="cn grp bandhd" id="band-cbnuke" onclick="bandToggle('cbnuke')" title="VWAP = Bloomberg-computed (EQY_WEIGHTED_AVG_PX with VWAP_START/END_TIME overrides, exchange local, today); TWAP from 1-min bars; RIC -> BBG ticker (329180.KS -> 329180 KP Equity)">cb nuke &#9662;</td>` +
-    `<td colspan="13" class="ib grp bandhd" id="band-idb" onclick="bandToggle('idb')" title="read-only mirror of the Lagrange IDB QUOTES tab (mkt = broker as quoted, my = desk quote re-nuked at the broker ref); auto-refreshes every 5s">idb quotes &#9662;</td>` +
+    `<td colspan="13" class="cn grp bandhd" id="band-cbnuke" onclick="bandToggle('cbnuke')" title="VWAP/TWAP: Bloomberg-computed over [start,end) (exchange local, today); RIC -> BBG ticker (329180.KS -> 329180 KP Equity). Hedge: $-Neutral = A.Bond x [1 + Trade delta x ((C.Stock/C.FX) / (A.Stock/A.FX) - 1)] - the OVCV hedge-tab dollar-neutral price; C.Stock / C.FX follow the live cells until you type over them">cb nuke &#9662;</td>` +
+    `<td colspan="13" class="ib grp bandhd" id="band-idb" onclick="bandToggle('idb')" title="read-only mirror of the Lagrange IDB QUOTES tab (mkt = broker as quoted, my = desk quote re-nuked at the broker ref); auto-refreshes every 5s. Flags: ${IDB_PILL_LEGEND}">idb quotes &#9662;</td>` +
     `<td colspan="5" class="gl grp bandhd" id="band-live" onclick="bandToggle('live')">live &#9662;</td>` +
     `<td colspan="5" class="ge grp bandhd" id="band-eod" onclick="bandToggle('eod')">eod &#9662;</td>` +
     `<td colspan="6" class="grp bandhd" id="band-theo" onclick="bandToggle('theo')">theo &middot; &gamma;-adj &#9662;</td>` +
@@ -4103,6 +4269,7 @@ function buildTable(idsOpt){
         `<td class="gc inp" data-band="res">` +
         `<input class="gridcell" data-f="${f}" data-row="${ri}" data-col="${ci+3}"
           inputmode="decimal" autocomplete="off" placeholder="&#8212;"></td>`).join("") +
+      `<td data-c="be_move" data-band="res" class="rowclick bemv" title="break-even daily stock move for gamma trading = ImpVol / sqrt(252) (1-sigma daily move)"></td>` +
       `<td data-fl="stk_move" data-band="res" class="rowclick"
          title="stock last / close - 1"></td>` +
       `<td data-fl="fx_move" data-band="res" class="rowclick"
@@ -4129,6 +4296,9 @@ function buildTable(idsOpt){
       `<td data-c="cn_vwap" data-band="cbnuke" class="rowclick cnc" title="Bloomberg-computed VWAP: EQY_WEIGHTED_AVG_PX with VWAP_START_TIME / VWAP_END_TIME / VWAP_DT overrides"></td>` +
       `<td data-c="cn_vol" data-band="cbnuke" class="rowclick cnc" title="traded volume in the window"></td>` +
       `<td data-c="cn_tk" data-band="cbnuke" class="rowclick cnt" title="Bloomberg ticker derived from the RIC"></td>` +
+      [["delta","trade delta % (e.g. 60)"],["astk","anchor stock price"],["afx","anchor fx (stock ccy per USD; 1 if same ccy)"],["abond","anchor bond price"],["cstk","current stock - follows live last until you type"],["cfx","current fx - follows live last until you type"]].map(([k,t])=>
+        `<td class="gc uinp" data-band="cbnuke"><input class="gridcell hnv" data-hn="${k}" data-id="${id}" autocomplete="off" inputmode="decimal" placeholder="&#8212;" title="${t}" onchange="hnChanged(this)"></td>`).join("") +
+      `<td data-c="hn_dn" data-band="cbnuke" class="rowclick hnc" title="dollar-neutral bond price = A.Bond x [1 + delta x ((C.Stock/C.FX)/(A.Stock/A.FX) - 1)]"></td>` +
       ["idb_btime","idb_bref","idb_bid","idb_atime","idb_aref","idb_ask","idb_my_bid","idb_my_ask","idb_ref","idb_gap_b","idb_gap_a","idb_gap","idb_flag"].map((k,i)=>`<td data-c="${k}" data-band="idb" class="rowclick${i===0?" grp bfirst":""}${["idb_bid","idb_bref","idb_btime","idb_ask","idb_aref","idb_atime"].includes(k)?" ibq":(["idb_ref","idb_my_bid","idb_my_ask"].includes(k)?" imy":" ichk")}"></td>`).join("") +
       RES_COLS.slice(5,10).map((c,i)=>
         `<td data-c="${c}" data-band="live" class="rowclick gL${i===0?" grp bfirst":""}"></td>`).join("") +
@@ -4173,11 +4343,11 @@ const BAND_FIRST = new Set(["n_bid","bw_dvb","x_bid","f_call","v_iv","dc_notl","
 const BANDS = {
   model:{label:"model (last nuke)",span:9},
   brw:{label:"borrow",span:12},
-  res:{label:"override result",span:16},
+  res:{label:"override result",span:17},
   flags:{label:"flags",span:7},
   vol:{label:"vol",span:6,vr:true},
   dcalc:{label:"delta calc",span:4},
-  cbnuke:{label:"cb nuke",span:6},
+  cbnuke:{label:"cb nuke",span:13},
   idb:{label:"idb quotes",span:13},
   live:{label:"live",span:5}, eod:{label:"eod",span:5},
   theo:{label:"theo \u00b7 \u03b3-adj",span:6},
@@ -4185,7 +4355,7 @@ const BANDS = {
 function bandOf(k){
   if(k.startsWith("bw_")) return "brw";
   if(k.startsWith("dc_")) return "dcalc";
-  if(k.startsWith("cn_")) return "cbnuke";
+  if(k.startsWith("cn_")||k.startsWith("hn_")) return "cbnuke";
   if(k.startsWith("idb_")) return "idb";
   if(k==="parityPct"||k==="cs_used"||k==="m_delta"||k.startsWith("n_")) return "model";
   if(k==="stk_move"||k==="fx_move"||k==="x_bid"||k==="x_ask"||
@@ -4382,19 +4552,36 @@ function updMovesFlags(scope){
         } else { dv.textContent=""; dv.title=""; }
       } else { dv.textContent=""; dv.title="no dividend data"; }
     }
+    // break-even daily move from ImpVol (annualised): sigma / sqrt(252)
+    const ivTxt = (tr.querySelector('td[data-v="iv"]')||{}).textContent || "";
+    const ivPct = parseFloat(String(ivTxt).replace("%",""));
+    const be = (isFinite(ivPct) && ivPct > 0) ? ivPct / Math.sqrt(252) : NaN;
+    const beTd = tr.querySelector('td[data-c="be_move"]');
+    if(beTd){ beTd.textContent = isFinite(be) ? ("\u00b1" + be.toFixed(2) + "%") : ""; }
     const mv = g("f_move");
     if(mv){
-      const parts=[];
-      if(isFinite(sm)&&Math.abs(sm)>=FLAG_TH.stkPct)
-        parts.push("S"+sm.toFixed(1)+"%");
-      if(isFinite(fm)&&Math.abs(fm)>=FLAG_TH.fxBps)
-        parts.push("F"+fm.toFixed(0));
-      mv.classList.remove("fl-red","fl-amb","fl-dim");
-      mv.textContent = parts.join(" ");
-      if(parts.length) mv.classList.add("fl-red");
-      mv.title = parts.length
-        ? `move vs close beyond ${FLAG_TH.stkPct}% / ${FLAG_TH.fxBps}bp`
-        : "";
+      mv.classList.remove("fl-red","fl-amb","fl-dim",...MV_CLS);
+      let txt = "", title = "";
+      if(isFinite(sm) && isFinite(be)){
+        const r = Math.abs(sm) / be;
+        const arrow = sm > 0 ? "\u25b2 " : (sm < 0 ? "\u25bc " : "");
+        if(r >= 1){
+          txt = arrow + (sm>0?"+":"") + sm.toFixed(2) + "% > " + be.toFixed(2) + "% BE";
+          mv.classList.add((sm>0?"mv-p":"mv-n") + (r >= 1.5 ? 4 : 3));
+          title = "stock moved " + r.toFixed(2) + "x the break-even daily move (ImpVol/sqrt252) - gamma in the money";
+        } else {
+          txt = (sm>0?"+":"") + sm.toFixed(2) + "% / " + be.toFixed(2) + "%";
+          mv.classList.add("fl-dim");
+          title = "stock move is " + r.toFixed(2) + "x the break-even daily move";
+        }
+      } else if(isFinite(sm) && Math.abs(sm) >= FLAG_TH.stkPct){
+        txt = "S" + sm.toFixed(1) + "%"; mv.classList.add("fl-red"); title = "no ImpVol - fixed threshold " + FLAG_TH.stkPct + "%";
+      }
+      if(isFinite(fm) && Math.abs(fm) >= FLAG_TH.fxBps){
+        txt = (txt ? txt + "  " : "") + "F" + fm.toFixed(0) + "bp";
+        if(!mv.classList.contains("mv-p4") && !mv.classList.contains("mv-n4") && !mv.classList.contains("mv-p3") && !mv.classList.contains("mv-n3")) mv.classList.add("fl-amb");
+      }
+      mv.textContent = txt; mv.title = title;
     }
     const ovb=_numTxt(tr.querySelector('td[data-c="ovdMktBid"]'));
     const ova=_numTxt(tr.querySelector('td[data-c="ovdMktAsk"]'));
@@ -4615,9 +4802,33 @@ function idbPaintRow(tr){
   set("idb_ref",F2(r.idb_ref)); set("idb_my_bid",F2(r.idb_rb)); set("idb_my_ask",F2(r.idb_ra));
   const G=v=>(v==null||v===""||isNaN(v))?"":((v>0?"+":"")+Number(v).toFixed(3));
   set("idb_gap_b",G(r.idb_gap_b)); set("idb_gap_a",G(r.idb_gap_a)); set("idb_gap",G(r.idb_gap));
-  const esc = s => String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
-  set("idb_flag",(r.idb_flag||"").split(" | ").filter(Boolean).map(x=>x.startsWith("MKT")?"<b>"+esc(x)+"</b>":(x.startsWith("GAP")?"<i>"+esc(x)+"</i>":esc(x))).join(" | "),true);
+  set("idb_flag", idbPills(r.idb_flag), true);
 }
+const IDB_PILL_LEGEND = "X BID = broker bid above my offer; X OFR = broker offer below my bid; G.B / G.O / G = gap on bid / offer / mid (orange deepens with size); RE-NUKE = inputs changed, not repriced; NOT PRICED = no IDB run yet; NO MARK = unmapped; T\u2260 = bid/offer quoted at different times (ref from the later side); B n/c, O n/c = that side quoted at another ref, not compared; REF\u2260 = my ref differs from the broker ref; STALE = > 90 min old; HIST = previous day";
+function idbPill(txt){
+  const esc = s => String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+  const t = String(txt||"").trim(); if(!t) return "";
+  const num = (m)=>{ const v=parseFloat(m); return isFinite(v)?v:0; };
+  const shade = v => Math.abs(v) >= 2 ? "ip-g3" : (Math.abs(v) >= 1 ? "ip-g2" : "ip-g1");
+  let m;
+  if(t === "MKT BID > MY OFFER") return `<span class="ip ip-x" title="${esc(t)}">X BID</span>`;
+  if(t === "MKT OFFER < MY BID") return `<span class="ip ip-x" title="${esc(t)}">X OFR</span>`;
+  if((m = t.match(/^BID GAP ([+-]?[\\d.]+)/))) return `<span class="ip ${shade(num(m[1]))}" title="${esc(t)}">G.B ${num(m[1])>0?"+":""}${num(m[1]).toFixed(2)}</span>`;
+  if((m = t.match(/^OFR GAP ([+-]?[\\d.]+)/))) return `<span class="ip ${shade(num(m[1]))}" title="${esc(t)}">G.O ${num(m[1])>0?"+":""}${num(m[1]).toFixed(2)}</span>`;
+  if((m = t.match(/^GAP ([+-]?[\\d.]+)/))) return `<span class="ip ${shade(num(m[1]))}" title="${esc(t)}">G ${num(m[1])>0?"+":""}${num(m[1]).toFixed(2)}</span>`;
+  if(t.startsWith("NOT REPRICED")) return `<span class="ip ip-grey" title="${esc(t)}">RE-NUKE</span>`;
+  if(t.startsWith("NOT PRICED")) return `<span class="ip ip-grey" title="${esc(t)}">NOT PRICED</span>`;
+  if(t === "NO MARK") return `<span class="ip ip-out" title="${esc(t)}">NO MARK</span>`;
+  if(t.startsWith("SIDES @ DIFF TIME")){ const s=(t.match(/ref from (\\w+)/)||[])[1]||""; return `<span class="ip ip-blue" title="${esc(t)}">T\u2260${s?" ("+s+")":""}</span>`; }
+  if(t.startsWith("BID @") && /not compared/.test(t)) return `<span class="ip ip-out" title="${esc(t)}">B n/c</span>`;
+  if(t.startsWith("OFR @") && /not compared/.test(t)) return `<span class="ip ip-out" title="${esc(t)}">O n/c</span>`;
+  if(t.startsWith("REF ")) return `<span class="ip ip-blue" title="${esc(t)}">REF\u2260</span>`;
+  if(t === "STALE") return `<span class="ip ip-purple" title="${esc(t)}">STALE</span>`;
+  if(t.startsWith("HIST")) return `<span class="ip ip-out" title="${esc(t)}">${esc(t)}</span>`;
+  if(t === "NO QUOTE") return `<span class="ip ip-out" title="${esc(t)}">NO QUOTE</span>`;
+  return `<span class="ip ip-grey" title="${esc(t)}">${esc(t)}</span>`;
+}
+function idbPills(flags){ return String(flags||"").split(" | ").map(idbPill).filter(Boolean).join(" "); }
 function idbPaintAll(){ document.querySelectorAll("#tbl tbody tr[data-id]").forEach(idbPaintRow); }
 async function idbMirrorRefresh(){
   try{
@@ -4635,10 +4846,26 @@ setTimeout(idbMirrorRefresh, 2000);
 const CN = {};
 const RIC_BBG_JS = {KS:"KP",KQ:"KQ",HK:"HK",T:"JT",TW:"TT",TWO:"TT",SS:"CG",SZ:"CS",N:"UN",O:"UW",OQ:"UW",L:"LN",SI:"SP",AX:"AT",KL:"MK",BK:"TB",JK:"IJ",NS:"IS",BO:"IB",PA:"FP",DE:"GY",MI:"IM",AS:"NA",SW:"SW",ST:"SS",TO:"CN",MC:"SM"};
 function cnTicker(ric){ const s=String(ric||"").trim().toUpperCase(); const i=s.lastIndexOf("."); if(i<0) return ""; const sym0=s.slice(0,i), suf=s.slice(i+1); const code=RIC_BBG_JS[suf]; if(!code||!sym0) return ""; const sym=(code==="HK")?sym0.replace(/^0+/,""):sym0; return sym+" "+code+" Equity"; }
+function parseTimeSmart(raw){
+  let s=String(raw||"").trim().toLowerCase().replace(/\\s+/g,""); if(!s) return null;
+  if(s==="now"){ const n=new Date(); return [n.getHours(),n.getMinutes(),0]; }
+  let ap=null; const m=s.match(/^(.*?)(am|pm|a|p)$/); if(m&&m[1]){ s=m[1]; ap=m[2][0]; }
+  s=s.replace(/\\./g,":").replace(/h/g,":"); let h,mi,se=0;
+  if(s.includes(":")){ const p=s.split(":").filter(x=>x!==""); if(!p.length||!p.every(x=>/^\\d+$/.test(x))) return null; h=+p[0]; mi=p.length>1?+p[1]:0; se=p.length>2?+p[2]:0; }
+  else if(/^\\d+$/.test(s)){ if(s.length<=2){h=+s;mi=0;} else if(s.length===3){h=+s[0];mi=+s.slice(1);} else if(s.length===4){h=+s.slice(0,2);mi=+s.slice(2);} else if(s.length===6){h=+s.slice(0,2);mi=+s.slice(2,4);se=+s.slice(4);} else return null; }
+  else return null;
+  if(ap==="p"&&h<12) h+=12; if(ap==="a"&&h===12) h=0;
+  if(!(h>=0&&h<24&&mi>=0&&mi<60&&se>=0&&se<60)) return null;
+  return [h,mi,se];
+}
+function fmtHM(t){ return t?String(t[0]).padStart(2,"0")+":"+String(t[1]).padStart(2,"0")+(t[2]?":"+String(t[2]).padStart(2,"0"):""):""; }
 function cnPaintTicker(tr){ const td=tr.querySelector('td[data-c="cn_tk"]'); if(!td) return; const ric=(tr.querySelector("td[data-r='ric']")||{}).textContent||""; const tk=cnTicker(ric.trim()); td.textContent = tk || (ric.trim()?("no bbg code for ."+ric.trim().split(".").pop()):""); td.classList.toggle("cn-err", !tk && !!ric.trim()); }
 async function cnChanged(el){
   const tr=el.closest("tr"); const sid=Number(tr.dataset.id); CN[sid]=CN[sid]||{};
-  CN[sid][el.dataset.cn]=el.value.trim();
+  const raw=el.value.trim(); const t=parseTimeSmart(raw);
+  if(raw && !t){ el.classList.add("cn-bad"); el.title="not a time: "+raw; CN[sid][el.dataset.cn]=""; const c=k=>{const x=tr.querySelector('td[data-c="'+k+'"]'); if(x) x.textContent="";}; c("cn_twap"); c("cn_vwap"); c("cn_vol"); return; }
+  el.classList.remove("cn-bad"); el.title=""; el.value=fmtHM(t); el.defaultValue=el.value;
+  CN[sid][el.dataset.cn]=el.value;
   const st=CN[sid].start||"", en=CN[sid].end||"";
   const set=(k,v)=>{ const c=tr.querySelector('td[data-c="'+k+'"]'); if(c) c.textContent=v; };
   if(!st||!en){ set("cn_twap",""); set("cn_vwap",""); set("cn_vol",""); return; }
@@ -4650,9 +4877,61 @@ async function cnChanged(el){
   if(!j.ok){ set("cn_twap",""); set("cn_vwap",""); set("cn_vol",""); if(tk){ tk.textContent=(j.ticker?j.ticker+" \u00b7 ":"")+(j.error||j.status||"error"); tk.classList.add("cn-err"); } return; }
   set("cn_twap", j.twap==null?"":Number(j.twap).toFixed(4)); set("cn_vwap", j.vwap==null?"":Number(j.vwap).toFixed(4));
   set("cn_vol", j.volume==null?"":Number(j.volume).toLocaleString("en-US",{maximumFractionDigits:0}));
-  if(tk){ tk.textContent=j.ticker+" \u00b7 VWAP: BBG"+(j.bars?" \u00b7 TWAP: "+j.bars+" bars":(j.twap_note?" \u00b7 "+j.twap_note:""))+(j.status&&j.status!=="ok"?" \u00b7 "+j.status:""); }
+  if(tk){ tk.textContent=j.ticker+" \u00b7 VWAP: BBG"+(j.twap!=null?" \u00b7 TWAP: BBG "+(j.twap_interval||""):(j.twap_note?" \u00b7 "+j.twap_note:""))+(j.status&&j.status!=="ok"?" \u00b7 "+j.status:""); }
 }
-function cnPaintAll(){ document.querySelectorAll("#tbl tbody tr[data-id]").forEach(tr=>{ cnPaintTicker(tr); const sid=Number(tr.dataset.id); const v=CN[sid]||{}; tr.querySelectorAll("input[data-cn]").forEach(i=>{ if(document.activeElement!==i) i.value=v[i.dataset.cn]||""; }); }); }
+(function(){ const tbl=document.getElementById("tbl"); if(!tbl) return;
+  const inputsOf=tr=>tr.querySelectorAll("input[data-cn]");
+  const rowOf=(tr,d)=>{ let x=tr; while(x){ x=d>0?x.nextElementSibling:x.previousElementSibling; if(x&&x.dataset&&x.dataset.id!==undefined) return x; } return null; };
+  const HN_ORDER=["delta","astk","afx","abond","cstk","cfx"];
+  tbl.addEventListener("keydown", e=>{ const el=e.target; if(!(el&&el.dataset&&(el.dataset.cn||el.dataset.hn))) return; const tr=el.closest("tr");
+    if(el.dataset.hn){ const k=el.dataset.hn; const idx=HN_ORDER.indexOf(k);
+      if(e.key==="Enter"||e.key==="ArrowDown"||e.key==="ArrowUp"){ e.preventDefault(); if(e.key!=="ArrowUp") el.dispatchEvent(new Event("change")); const nr=rowOf(tr,e.key==="ArrowUp"?-1:1); const nx=nr&&nr.querySelector('input[data-hn="'+k+'"]'); if(nx){ nx.focus(); nx.select(); } return; }
+      if(e.key==="Tab"){ e.preventDefault(); el.dispatchEvent(new Event("change")); let nx=null; if(!e.shiftKey){ nx=idx<HN_ORDER.length-1?tr.querySelector('input[data-hn="'+HN_ORDER[idx+1]+'"]'):(rowOf(tr,1)&&rowOf(tr,1).querySelector('input[data-hn="delta"]')); } else { nx=idx>0?tr.querySelector('input[data-hn="'+HN_ORDER[idx-1]+'"]'):(rowOf(tr,-1)&&rowOf(tr,-1).querySelector('input[data-hn="cfx"]')); } if(nx){ nx.focus(); nx.select(); } return; }
+      if(e.key==="Escape"){ el.value=el.defaultValue||""; el.classList.remove("cn-bad"); el.blur(); return; }
+      return; }
+    const which=el.dataset.cn;
+    if(e.key==="Enter"||e.key==="ArrowDown"||e.key==="ArrowUp"){ e.preventDefault(); if(e.key!=="ArrowUp") el.dispatchEvent(new Event("change")); const nr=rowOf(tr,e.key==="ArrowUp"?-1:1); const nx=nr&&nr.querySelector('input[data-cn="'+which+'"]'); if(nx){ nx.focus(); nx.select(); } return; }
+    if(e.key==="Tab"){ e.preventDefault(); el.dispatchEvent(new Event("change")); let nx; if(!e.shiftKey){ nx=which==="start"?tr.querySelector('input[data-cn="end"]'):(rowOf(tr,1)||{}).querySelector&&rowOf(tr,1).querySelector('input[data-cn="start"]'); } else { nx=which==="end"?tr.querySelector('input[data-cn="start"]'):(rowOf(tr,-1)&&rowOf(tr,-1).querySelector('input[data-cn="end"]')); } if(nx){ nx.focus(); nx.select(); } return; }
+    if(e.key==="Escape"){ el.value=el.defaultValue||""; el.classList.remove("cn-bad"); el.blur(); return; }
+  }, true);
+  tbl.addEventListener("focusin", e=>{ const el=e.target; if(el&&el.dataset&&(el.dataset.cn||el.dataset.hn)) setTimeout(()=>el.select(),0); }, true);   // typing replaces
+  tbl.addEventListener("paste", e=>{ const el=e.target; if(!(el&&el.dataset&&el.dataset.cn)) return; const txt=(e.clipboardData||window.clipboardData).getData("text")||""; const parts=txt.split(/[\t,;]| - |-/).map(x=>x.trim()).filter(Boolean); if(parts.length<2) return; e.preventDefault();
+    const tr=el.closest("tr"); const a=tr.querySelector('input[data-cn="start"]'), b=tr.querySelector('input[data-cn="end"]'); if(a&&b){ a.value=parts[0]; b.value=parts[1]; a.dispatchEvent(new Event("change")); b.dispatchEvent(new Event("change")); } }, true);
+})();
+/* OVCV-style hedge: $-neutral = A.Bond x [1 + delta x ((C.Stock/C.FX)/(A.Stock/A.FX) - 1)] */
+const HN = {};   // secId -> {delta, astk, afx, abond, cstk, cfx}; cstk/cfx undefined = follow live
+function hnNum(v){ const n=parseFloat(String(v==null?"":v).replace(/,/g,"")); return isFinite(n)?n:NaN; }
+function hnLive(tr, which){
+  if(which==="cstk"){ const t=tr.querySelector('td[data-rf="last"]'); return hnNum(t?t.textContent:""); }
+  const fx=uVal(tr,"und_fx"); const c=hnNum(fx); if(isFinite(c)) return c;      // numeric constant und fx
+  const t=tr.querySelector('td[data-fx="last"]'); return hnNum(t?t.textContent:"");
+}
+function hnDollarNeutral(delta, astk, afx, abond, cstk, cfx){
+  const d=delta/100;
+  if(![delta,astk,afx,abond,cstk,cfx].every(x=>isFinite(x))) return NaN;
+  if(astk<=0||afx<=0||cfx<=0||abond<=0||cstk<=0) return NaN;
+  const ratio=(cstk/cfx)/(astk/afx);
+  return abond*(1+d*(ratio-1));
+}
+function hnPaintRow(tr){
+  const sid=Number(tr.dataset.id); const v=HN[sid]||{};
+  const get=k=>{ const i=tr.querySelector('input[data-hn="'+k+'"]'); if(!i) return NaN;
+    if((k==="cstk"||k==="cfx") && (v[k]===undefined||v[k]==="")){ const lv=hnLive(tr,k); if(document.activeElement!==i){ i.value=isFinite(lv)?(k==="cfx"?lv.toFixed(4):String(lv)):""; i.classList.add("hn-live"); } return lv; }
+    if(document.activeElement!==i) i.value=(v[k]===undefined?"":v[k]); i.classList.remove("hn-live"); return hnNum(v[k]); };
+  const out=hnDollarNeutral(get("delta"),get("astk"),get("afx"),get("abond"),get("cstk"),get("cfx"));
+  const td=tr.querySelector('td[data-c="hn_dn"]'); if(td) td.textContent=isFinite(out)?out.toFixed(3):"";
+}
+function hnChanged(el){
+  const tr=el.closest("tr"); const sid=Number(tr.dataset.id); HN[sid]=HN[sid]||{};
+  const raw=el.value.trim(); const n=hnNum(raw);
+  if(raw && !isFinite(n)){ el.classList.add("cn-bad"); el.title="not a number: "+raw; return; }
+  el.classList.remove("cn-bad");
+  if(raw===""){ delete HN[sid][el.dataset.hn]; } else { HN[sid][el.dataset.hn]=String(n); el.value=String(n); }
+  el.defaultValue=el.value;
+  hnPaintRow(tr);
+}
+function hnPaintAll(){ document.querySelectorAll("#tbl tbody tr[data-id]").forEach(hnPaintRow); }
+function cnPaintAll(){ document.querySelectorAll("#tbl tbody tr[data-id]").forEach(tr=>{ cnPaintTicker(tr); const sid=Number(tr.dataset.id); const v=CN[sid]||{}; tr.querySelectorAll("input[data-cn]").forEach(i=>{ if(document.activeElement!==i) i.value=v[i.dataset.cn]||""; }); }); hnPaintAll(); }
 const DC = {};   // session-only inputs per secId (blank at launch)
 function dcChg(el){
   const sid = Number(el.dataset.id);
@@ -4773,6 +5052,15 @@ function cbFxRicOf(tr){
   const ccy = String(((refCache[sid]||{}).sec_fx)||"").trim().toUpperCase();
   return (!ccy || ccy==="USD") ? "" : ccy + "=";
 }
+const HKT_OFFSET_MIN = 8*60;
+function toHKT(timeStr, dateStr){   // GMT 'HH:MM[:SS]' (+ 'YYYY-MM-DD') -> HKT, rolling the date past midnight
+  const m=String(timeStr||"").match(/^(\\d{1,2}):(\\d{2})(?::(\\d{2}))?/); if(!m) return {t:String(timeStr||""), d:String(dateStr||"")};
+  let mins=(+m[1])*60+(+m[2])+HKT_OFFSET_MIN; let roll=0; if(mins>=1440){ mins-=1440; roll=1; }
+  const hh=String(Math.floor(mins/60)).padStart(2,"0"), mm=String(mins%60).padStart(2,"0"), ss=m[3]?":"+m[3]:"";
+  let d=String(dateStr||""); if(roll&&/^\\d{4}-\\d{2}-\\d{2}/.test(d)){ const dt=new Date(d.slice(0,10)+"T00:00:00Z"); dt.setUTCDate(dt.getUTCDate()+1); d=dt.toISOString().slice(0,10); }
+  return {t:hh+":"+mm+ss, d};
+}
+function rfxCell(k, rec){ if(k==="last_time") return toHKT(rec.last_time, rec.last_date).t; if(k==="last_date") return toHKT(rec.last_time, rec.last_date).d; return rec[k] ?? ""; }
 function applyRfx(){
   const byRic = NS.rfx;
   const ts = document.getElementById("rfxts");
@@ -4784,7 +5072,7 @@ function applyRfx(){
     tr.querySelectorAll("td[data-rf]").forEach(td=>{
       if(!stk){ td.textContent = ""; return; }
       const k = td.dataset.rf, v = stk[k];
-      td.textContent = (k==="last"||k==="close") ? fmt2(v) : (v ?? "");
+      td.textContent = (k==="last"||k==="close") ? fmt2(v) : rfxCell(k, stk);   // times HKT
     });
     const cfRic = cbFxRicOf(tr);
     const cf = cfRic ? byRic[cfRic] : null;
@@ -4792,7 +5080,7 @@ function applyRfx(){
       const k = td.dataset.cf;
       if(!cfRic){ td.textContent = (k==="last"||k==="close") ? "1.0000" : ""; return; }   // USD bond
       if(!cf){ td.textContent = ""; return; }
-      td.textContent = (k==="last"||k==="close") ? fmt4(cbFxVal(tr, cf[k])) : (cf[k] ?? "");   // USD/CCY always
+      td.textContent = (k==="last"||k==="close") ? fmt4(cbFxVal(tr, cf[k])) : rfxCell(k, cf);   // USD/CCY always; times HKT
     });
     const fxRic = uVal(tr, "und_fx");
     const isConst = fxRic !== "" && !isNaN(Number(fxRic));
@@ -4801,11 +5089,12 @@ function applyRfx(){
       const k = td.dataset.fx;
       if(isConst){ td.textContent = k==="last"||k==="close" ? fmt4(fxRic) : ""; return; }
       if(!fx){ td.textContent = ""; return; }
-      td.textContent = (k==="last"||k==="close") ? fmt4(fx[k]) : (fx[k] ?? "");
+      td.textContent = (k==="last"||k==="close") ? fmt4(fx[k]) : rfxCell(k, fx);
     });
   });
   if(ts){
     ts.textContent = NS.rfxErrMsg ? "ERR" : (NS.rfxTs || "");
+  if(typeof hnPaintAll==="function") hnPaintAll();
     ts.title = NS.rfxErrMsg || "";
   }
   computeTheoAll();
@@ -5522,7 +5811,7 @@ function render(data, _unused, quiet){
   document.querySelectorAll("#tbl tr[data-id]").forEach(tr=>{
     if(scope.size && !scope.has(Number(tr.dataset.id))) return;
     tr.querySelectorAll("td[data-c]").forEach(td=>{
-      if(td.dataset.c === "parityPct" || (td.dataset.c||"").startsWith("dc_") || (td.dataset.c||"").startsWith("idb_") || (td.dataset.c||"").startsWith("cn_")) return;   // client-computed / mirrored, not ours
+      if(td.dataset.c === "parityPct" || td.dataset.c === "be_move" || (td.dataset.c||"").startsWith("dc_") || (td.dataset.c||"").startsWith("idb_") || (td.dataset.c||"").startsWith("cn_") || (td.dataset.c||"").startsWith("hn_")) return;   // client-computed / mirrored, not ours
       td.textContent = ""; td.classList.remove("ovd-on","pos","neg");
     });
   });
@@ -5544,7 +5833,7 @@ function render(data, _unused, quiet){
     };
     tr.querySelectorAll("td[data-c]").forEach(td=>{
       const c = td.dataset.c;
-      if(c === "parityPct" || c.startsWith("dc_") || c.startsWith("idb_") || c.startsWith("cn_")) return;              // client-computed / mirrored, not ours
+      if(c === "parityPct" || c === "be_move" || c.startsWith("dc_") || c.startsWith("idb_") || c.startsWith("cn_") || c.startsWith("hn_")) return;              // client-computed / mirrored, not ours
       td.textContent = vals[c];
       if(applied && (c==="ovdMktBid"||c==="ovdMktAsk"||c==="dVsLive"))
         td.classList.add("ovd-on");
@@ -5879,7 +6168,7 @@ if __name__ == "__main__":
     # NOTE: reload must stay OFF (single process) so the in-memory
     # WebSocket hub works, and so the browser only opens once.
     print("=" * 62)
-    print("  NUKE STATION  BUILD borrow.b28  \u00b7  %s"
+    print("  NUKE STATION  BUILD borrow.b31  \u00b7  %s"
           % os.path.abspath(__file__))
     print("  port %s \u00b7 if this banner is missing, an OLD file is\n  running \u2014 kill that process first." % PORT)
     print("=" * 62)
