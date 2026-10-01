@@ -328,6 +328,7 @@ def ensure_schema() -> None:
                 f"ADD COLUMN IF NOT EXISTS vol_flag VARCHAR(32) NULL",
                 f"ALTER TABLE {APP_DB}.cb_state "
                 f"ADD COLUMN IF NOT EXISTS isin_manual VARCHAR(16) NULL",
+                f"CREATE INDEX IF NOT EXISTS ix_cbnuke_sec_id ON {APP_DB}.{APP_TABLE} (sec_id, id)",
                 f"CREATE TABLE IF NOT EXISTS {APP_DB}.cb_state_hist ("
                 "  id BIGINT AUTO_INCREMENT PRIMARY KEY, sec_id BIGINT NOT NULL, field VARCHAR(32) NOT NULL, "
                 "  old_val VARCHAR(64) NULL, new_val VARCHAR(64) NULL, changed_by VARCHAR(64) NULL, "
@@ -393,29 +394,27 @@ def fetch_saved_prefs(sec_ids: List[int]) -> Dict[int, Dict[str, str]]:
     if not sec_ids:
         return {}
     ph = ", ".join(["%s"] * len(sec_ids))
-    query = f"""
-        SELECT sec_id, short_name, und_fx
-        FROM {APP_DB}.{APP_TABLE}
-        WHERE sec_id IN ({ph})
-        ORDER BY saved_at DESC, id DESC
-    """
+    out: Dict[int, Dict[str, str]] = {int(s): {"short_name": "", "und_fx": ""} for s in sec_ids}
     try:
         conn = _db()
     except Exception:
-        return {}
+        return out
     try:
         with conn.cursor() as cur:
-            cur.execute(query, sec_ids)
-            rows = cur.fetchall()
-    except Exception:
-        return {}
+            for col in ("short_name", "und_fx"):
+                # the latest NON-blank value per security - a snapshot taken while the state
+                # was blank must never hide an older good value
+                cur.execute(
+                    f"SELECT t.sec_id, t.{col} FROM {APP_DB}.{APP_TABLE} t "
+                    f"JOIN (SELECT sec_id, MAX(id) AS mid FROM {APP_DB}.{APP_TABLE} "
+                    f"      WHERE sec_id IN ({ph}) AND {col} IS NOT NULL AND {col} <> '' GROUP BY sec_id) m "
+                    f"ON m.mid = t.id", list(sec_ids))
+                for sec_id, val in cur.fetchall():
+                    out.setdefault(int(sec_id), {"short_name": "", "und_fx": ""})[col] = str(val or "")
+    except Exception as exc:
+        logger.warning("saved prefs read failed: %s", exc)
     finally:
         conn.close()
-    out: Dict[int, Dict[str, str]] = {}
-    for sec_id, short_name, und_fx in rows:
-        sid = int(sec_id)
-        if sid not in out:
-            out[sid] = {"short_name": short_name or "", "und_fx": und_fx or ""}
     return out
 
 
@@ -3124,6 +3123,10 @@ def recover_names(sids=None):
                 conn.close()
         except Exception as exc:
             logger.warning("recover: history read failed: %s", exc)
+    missing = [sid for sid in sids if (STATE["rows"][sid].get("short_name") or "") == "" or (STATE["rows"][sid].get("und_fx") or "") == ""]
+    if missing:
+        logger.warning("recover: still no short_name/und_fx anywhere (cb_state, history, autosave) for %s", missing)
+    STATE["recoverMissing"] = missing
     for sid, fs in fixed.items():
         try:
             db_upsert_state_fields(sid, STATE["rows"][sid], "recover", list(fs.keys()))
@@ -3140,7 +3143,8 @@ async def api_state_recover():
     if fixed:
         await broadcast({"type": "rows", "by": "recover", "v": STATE["version"],
                          "list": [{"secId": sid, **STATE["rows"][sid]} for sid in fixed]})
-    return {"ok": True, "recovered": {str(k): v for k, v in fixed.items()}, "n": len(fixed)}
+    return {"ok": True, "recovered": {str(k): v for k, v in fixed.items()}, "n": len(fixed),
+            "missing": STATE.get("recoverMissing", [])}
 
 
 @app.get("/api/bond_dates/probe")
@@ -3884,7 +3888,7 @@ h2{font-size:10.5px;font-weight:700;color:var(--muted);margin:0;
 <body>
 <header>
   <h1>CB nuke station</h1>
-  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b50</b></span>
+  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b51</b></span>
   <span id="conn" class="conn warn" title="Connection">&#9679;</span>
   <span id="online" class="sub"></span>
   <div class="tabs">
@@ -4337,7 +4341,7 @@ async function snap8Now(){
 }
 
 async function recoverNames(){ const base=location.pathname.replace(new RegExp("[/]+$"),""); const el=document.getElementById("recoverMsg"); if(el) el.textContent="recovering...";
-  try{ const j=await (await fetch(base+"/api/state/recover",{method:"POST"})).json(); if(el) el.textContent = j.ok ? ("recovered "+j.n+" securities"+(j.n?": "+Object.entries(j.recovered).map(([k,v])=>k+" "+Object.keys(v).join("/")).join(", "):"")) : (j.error||"failed"); }catch(e){ if(el) el.textContent="failed: "+e; } }
+  try{ const j=await (await fetch(base+"/api/state/recover",{method:"POST"})).json(); if(el) el.textContent = j.ok ? ("recovered "+j.n+" securities"+(j.n?": "+Object.entries(j.recovered).map(([k,v])=>k+" "+Object.keys(v).join("/")).join(", "):"")+((j.missing||[]).length?" \u00b7 still no name/fx anywhere for "+j.missing.join(", ")+" - type them once":"")) : (j.error||"failed"); }catch(e){ if(el) el.textContent="failed: "+e; } }
 function cfgIdbReset(){ delete CFG.idbColors; localStorage.setItem("nukestation.cfg", JSON.stringify(CFG)); idbApplyColors(); loadCfgForm(); }
 function loadCfgForm(){
   { const c=idbColors(); const set=(id,v)=>{ const el=document.getElementById(id); if(el) el.value=v; };
@@ -7019,7 +7023,7 @@ if __name__ == "__main__":
     # NOTE: reload must stay OFF (single process) so the in-memory
     # WebSocket hub works, and so the browser only opens once.
     print("=" * 62)
-    print("  NUKE STATION  BUILD borrow.b50  \u00b7  %s"
+    print("  NUKE STATION  BUILD borrow.b51  \u00b7  %s"
           % os.path.abspath(__file__))
     print("  port %s \u00b7 if this banner is missing, an OLD file is\n  running \u2014 kill that process first." % PORT)
     print("=" * 62)
