@@ -739,7 +739,7 @@ STATE: Dict[str, Any] = {
     "version": 0,
     "ids": [],                     # ordered sec_ids
     "rows": {},                    # sec_id -> {short_name, und_fx, ovdSpot,...}
-    "stockRics": {}, "cbFxRics": {},               # sec_id -> ric (server-side, for the poller)
+    "stockRics": {}, "cbFxRics": {}, "cbFxCcy": {},               # sec_id -> ric (server-side, for the poller)
     "nuke": {},                    # sec_id -> last upstream row
     "nukeMeta": {},                # host / elapsed / by / ts / missing
     "rfx": {},                     # ric -> refinitiv rec
@@ -799,6 +799,7 @@ def snapshot() -> Dict[str, Any]:
             "nukeMeta": STATE["nukeMeta"], "rfx": STATE["rfx"],
             "rfxBanner": STATE.get("rfxBanner", ""),
             "cbFxRics": STATE.get("cbFxRics", {}),
+            "cbFxCcy": STATE.get("cbFxCcy", {}),
             "rfxTs": STATE["rfxTs"], "rfxErr": STATE["rfxErr"],
             "refreshSec": STATE["refreshSec"],
             "autosaveSec": STATE["autosaveSec"],
@@ -1170,6 +1171,7 @@ def refresh_stock_rics() -> None:
         m = fetch_ric_map(STATE["ids"])
         STATE["stockRics"] = {sid: d.get("ric", "") for sid, d in m.items()}
         STATE["cbFxRics"] = {sid: cb_fx_ric(d.get("ccy", "")) for sid, d in m.items()}
+        STATE["cbFxCcy"] = {sid: str(d.get("ccy", "") or "").strip().upper() for sid, d in m.items()}
     except Exception as exc:
         logger.warning("stock ric refresh failed: %s", exc)
 
@@ -2373,7 +2375,7 @@ PAGE = """<!doctype html>
 td[data-c="m_delta"],td[data-c="x_bid"]{min-width:52px}
 :root{
   --bg:#ffffff; --panel:#f2f3f5; --panel2:#f7f8f9; --row:#f7f8fa; --hover:#eef0f3;
-  --rowsel:#e8eef7; --border:#e3e6ea; --border2:#c9ced4;
+  --rowsel:#dbe7f7; --border:#e3e6ea; --border2:#c9ced4;
   --text:#16181d; --muted:#5a6068; --faint:#8b919a;
   --amber:#8a5b00; --amber-dim:#f7f1e2; --green:#106b3f; --red:#a8231b;
   --blue:#274f8f; --teal:#0b6e66; --teal-dim:rgba(11,110,102,.08);
@@ -2452,6 +2454,7 @@ tr td.gE{background:#f0f1f4} tr:nth-child(even) td.gE{background:#eaecf0}
 tr.rowsel td{background:var(--rowsel);
   border-top:1px solid #0b6e66 !important;
   border-bottom:1px solid #0b6e66 !important}
+tr.rowsel.rowfocus td{background-image:linear-gradient(rgba(11,110,102,.16),rgba(11,110,102,.16))}
 tr.rowsel td:first-child{border-left:4px solid #0b6e66 !important}
 tr.rowsel td.stick1{font-weight:700;color:#0b6e66}
 tbody tr:hover td{background:var(--hover)}
@@ -2580,6 +2583,14 @@ td[data-fl^="f_"].fl-red{color:#c62828;font-weight:700}
 td[data-fl^="f_"].fl-amb{color:#b26a00;font-weight:600}
 td[data-fl^="f_"].fl-dim{color:#b6b1a8}
 td[data-fl="stk_move"],td[data-fl="fx_move"]{text-align:right}
+td.mv-p0{color:#15803d;font-weight:600}td.mv-n0{color:#b91c1c;font-weight:600}
+td.mv-p1{background:#dcfce7 !important;color:#14532d;font-weight:600}td.mv-n1{background:#fee2e2 !important;color:#7f1d1d;font-weight:600}
+td.mv-p2{background:#a7f3c4 !important;color:#14532d;font-weight:700}td.mv-n2{background:#fecaca !important;color:#7f1d1d;font-weight:700}
+td.mv-p3{background:#4ade80 !important;color:#052e16;font-weight:700}td.mv-n3{background:#f87171 !important;color:#450a0a;font-weight:700}
+td.mv-p4{background:#15803d !important;color:#fff;font-weight:700}td.mv-n4{background:#b91c1c !important;color:#fff;font-weight:700}
+tr.rowfocus td{background-image:linear-gradient(rgba(11,110,102,.10),rgba(11,110,102,.10))}
+tr.rowfocus td:first-child{border-left:4px solid #0b6e66 !important}
+tr.rowfocus td.stick1{font-weight:700;color:#0b6e66}
 td.bgpos{background:#d7f2dd !important;color:#14532d;font-weight:600}
 td.bgneg{background:#fbdcda !important;color:#7f1d1d;font-weight:600}
 td.qcell{color:#0b3d91;font-weight:600;text-align:right}
@@ -2629,7 +2640,7 @@ h2{font-size:10.5px;font-weight:700;color:var(--muted);margin:0;
 <body>
 <header>
   <h1>CB nuke station</h1>
-  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b23</b></span>
+  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b25</b></span>
   <span id="conn" class="conn warn" title="Connection">&#9679;</span>
   <span id="online" class="sub"></span>
   <div class="tabs">
@@ -3305,6 +3316,16 @@ function bulkEikon(metric){
 }
 
 /* ---------------- grid wiring ---------------- */
+function setRowFocus(tr){
+  if(!tr || !tr.dataset || tr.dataset.id===undefined) return;
+  if(tr.classList.contains("rowfocus")) return;
+  document.querySelectorAll("#tbl tr.rowfocus").forEach(x=>x.classList.remove("rowfocus"));
+  tr.classList.add("rowfocus");
+}
+(function(){ const tbl=document.getElementById("tbl"); if(!tbl) return;
+  tbl.addEventListener("mousedown", e=>{ const tr=e.target.closest&&e.target.closest("tr[data-id]"); if(tr) setRowFocus(tr); }, true);
+  tbl.addEventListener("focusin",  e=>{ const tr=e.target.closest&&e.target.closest("tr[data-id]"); if(tr) setRowFocus(tr); }, true);
+})();
 function wireGrid(){
   document.querySelectorAll("#tbl input.gridcell").forEach(inp=>{
     const r = +inp.dataset.row, c = +inp.dataset.col;
@@ -3593,7 +3614,7 @@ function buildTable(idsOpt){
     `<td colspan="5" class="ge grp bandhd" id="band-eod" onclick="bandToggle('eod')">eod &#9662;</td>` +
     `<td colspan="6" class="grp bandhd" id="band-theo" onclick="bandToggle('theo')">theo &middot; &gamma;-adj &#9662;</td>` +
     `<td colspan="5" class="grp rfx bandhd" id="band-stk" onclick="bandToggle('stk')">stock <span id="rfxts" onclick="event.stopPropagation(); rfxNow&&rfxNow()">&mdash;</span> &#9662;</td>` +
-    `<td colspan="5" class="grp cfx bandhd" id="band-cbfx" onclick="bandToggle('cbfx')" title="bond-currency fx from sec_fx: USD = 1, CNH -> CNH=, EUR -> EUR= ...">cb fx &#9662;</td>` +
+    `<td colspan="5" class="grp cfx bandhd" id="band-cbfx" onclick="bandToggle('cbfx')" title="bond-currency fx as USD/CCY: USD = 1; CNH, JPY, HKD... from CCY=; EUR, GBP, AUD, NZD from CCY= inverted (Refinitiv quotes those as CCY/USD)">cb fx &#9662;</td>` +
     `<td colspan="5" class="grp fxx bandhd" id="band-fx" onclick="bandToggle('fx')">und fx &#9662;</td></tr>`;
   h += `<tr><th class="stick0"><input type="checkbox" id="cbAll" title="Select all"></th>` +
     COL_DEFS.map(([k,label,cls])=>
@@ -3888,6 +3909,17 @@ function _yearsChip(td, v, missingTitle){
                  : v < FLAG_TH.yearsAmb ? "fl-amb" : "fl-dim");
   td.title = "";
 }
+/* signed magnitude scale: level 0 = coloured text only, 1..4 = light -> solid fill */
+const MV_TH = {stk:[0.5,1,2,4], fx:[10,25,50,100], pts:[0.10,0.25,0.50,1.00]};
+const MV_CLS = ["mv-p0","mv-p1","mv-p2","mv-p3","mv-p4","mv-n0","mv-n1","mv-n2","mv-n3","mv-n4","bgpos","bgneg","pos","neg"];
+function mvClass(td, v, kind){
+  if(!td) return;
+  td.classList.remove(...MV_CLS);
+  if(!isFinite(v) || v===0) return;
+  const th = MV_TH[kind] || MV_TH.pts, a = Math.abs(v);
+  let lv = 0; for(let i=0;i<th.length;i++) if(a >= th[i]) lv = i+1;
+  td.classList.add((v>0?"mv-p":"mv-n")+lv);
+}
 function updMovesFlags(scope){
   const today = new Date();
   document.querySelectorAll("#tbl tr[data-id]").forEach(tr=>{
@@ -3903,12 +3935,10 @@ function updMovesFlags(scope){
     const sm = (isFinite(sl)&&isFinite(sc)&&sc!==0)?(sl/sc-1)*100:NaN;
     const fm = (isFinite(fl)&&isFinite(fc)&&fc!==0)?(fl/fc-1)*10000:NaN;
     const smTd=g("stk_move"), fmTd=g("fx_move");
-    if(smTd){ smTd.textContent=isFinite(sm)?sm.toFixed(2):"";
-      smTd.classList.remove("bgpos","bgneg");
-      if(isFinite(sm)&&sm!==0) smTd.classList.add(sm>0?"bgpos":"bgneg"); }
-    if(fmTd){ fmTd.textContent=isFinite(fm)?fm.toFixed(0):"";
-      fmTd.classList.remove("pos","neg");
-      if(isFinite(fm)&&fm!==0) fmTd.classList.add(fm>0?"pos":"neg"); }
+    if(smTd){ smTd.textContent=isFinite(sm)?((sm>0?"+":"")+sm.toFixed(2)+"%"):"";
+      mvClass(smTd, sm, "stk"); }
+    if(fmTd){ fmTd.textContent=isFinite(fm)?((fm>0?"+":"")+fm.toFixed(0)):"";
+      mvClass(fmTd, fm, "fx"); }
     // flags
     _yearsChip(g("f_call"), parseFloat(ref.years_to_call),
       "no years_to_call in lp_model_output");
@@ -3967,7 +3997,7 @@ function updMovesFlags(scope){
         const st = (CFG.roundStep>0?CFG.roundStep:0.05);
         const dd = Math.round(((qb+qa)/2 - smid)/st)*st;
         drTd.textContent = (dd>0?"+":"")+dd.toFixed(2);
-        if(dd!==0) drTd.classList.add(dd>0?"bgpos":"bgneg");
+        mvClass(drTd, dd, "pts");
         drTd.title = "mid " + ((qb+qa)/2).toFixed(2) + " vs 8am " +
                      smid.toFixed(2);
       } else { drTd.textContent="";
@@ -4288,6 +4318,14 @@ async function loadRefData(ids){
 }
 
 /* ---------------- Refinitiv (server-pushed) ---------------- */
+const CBFX_INVERT = new Set(["EUR","GBP","AUD","NZD"]);   // Refinitiv quotes these as CCY/USD; the band shows USD/CCY
+function cbFxCcyOf(tr){
+  const sid = Number(tr.dataset.id);
+  const fromState = (NS.cbFxCcy||{})[sid];
+  if(fromState !== undefined) return String(fromState||"").toUpperCase();
+  return String(((refCache[sid]||{}).sec_fx)||"").trim().toUpperCase();
+}
+function cbFxVal(tr, x){ const v = Number(x); if(!isFinite(v) || v===0) return ""; return CBFX_INVERT.has(cbFxCcyOf(tr)) ? 1/v : v; }
 function cbFxRicOf(tr){
   const sid = Number(tr.dataset.id);
   const fromState = (NS.cbFxRics||{})[sid];
@@ -4314,7 +4352,7 @@ function applyRfx(){
       const k = td.dataset.cf;
       if(!cfRic){ td.textContent = (k==="last"||k==="close") ? "1.0000" : ""; return; }   // USD bond
       if(!cf){ td.textContent = ""; return; }
-      td.textContent = (k==="last"||k==="close") ? fmt4(cf[k]) : (cf[k] ?? "");
+      td.textContent = (k==="last"||k==="close") ? fmt4(cbFxVal(tr, cf[k])) : (cf[k] ?? "");   // USD/CCY always
     });
     const fxRic = uVal(tr, "und_fx");
     const isConst = fxRic !== "" && !isNaN(Number(fxRic));
@@ -4489,7 +4527,7 @@ const NS = {
       this.rows = st.rows || {}; this.nuke = st.nuke || {};
       this.nukeMeta = st.nukeMeta || {}; this.rfx = st.rfx || {};
       this.rfxTs = st.rfxTs; this.rfxErrMsg = st.rfxErr || null;
-      this.cbFxRics = st.cbFxRics || {};
+      this.cbFxRics = st.cbFxRics || {}; this.cbFxCcy = st.cbFxCcy || {};
       this.refreshSec = st.refreshSec || 5;
       this.refdataSec = st.refdataSec || 300;
       this.autosaveSec = st.autosaveSec ?? 300;
@@ -5071,8 +5109,7 @@ function render(data, _unused, quiet){
       if(applied && (c==="ovdMktBid"||c==="ovdMktAsk"||c==="dVsLive"))
         td.classList.add("ovd-on");
       if(c==="dVsLive"){
-        td.classList.remove("pos","neg","bgpos","bgneg");
-        if(dv!==null && dv!==0) td.classList.add(dv>0?"bgpos":"bgneg");
+        mvClass(td, (dv===null?NaN:dv), "pts");
       }
     });
   }
@@ -5402,7 +5439,7 @@ if __name__ == "__main__":
     # NOTE: reload must stay OFF (single process) so the in-memory
     # WebSocket hub works, and so the browser only opens once.
     print("=" * 62)
-    print("  NUKE STATION  BUILD borrow.b23  \u00b7  %s"
+    print("  NUKE STATION  BUILD borrow.b25  \u00b7  %s"
           % os.path.abspath(__file__))
     print("  port %s \u00b7 if this banner is missing, an OLD file is\n  running \u2014 kill that process first." % PORT)
     print("=" * 62)
