@@ -2799,11 +2799,42 @@ async def api_twap(req: TwapReq):
 
 # ---- Bond dates from Bloomberg (static reference data): NXT_CALL_DT / MATURITY / NXT_PUT_DT ----
 BOND_DATES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bond_dates_cache.json")
-_BD = {"data": {}, "pending": set(), "lock": threading.Lock(), "busy": False, "err": ""}
+_BD = {"data": {}, "pending": set(), "lock": threading.Lock(), "busy": False, "err": "", "sched_err": ""}
 BD_CALL_FIELDS = [f.strip() for f in os.environ.get("BBG_CALL_FIELDS", "NXT_CALL_DT,CV_NXT_CALL_DT,FIRST_CALL_DT").split(",") if f.strip()]
 BD_PUT_FIELDS = [f.strip() for f in os.environ.get("BBG_PUT_FIELDS", "NXT_PUT_DT,CV_NXT_PUT_DT").split(",") if f.strip()]
 BD_SOFT_FIELDS = [f.strip() for f in os.environ.get("BBG_SOFTCALL_FIELDS", "CV_SOFT_CALL_START_DT,CV_PROV_CALL_START_DT,PROVISIONAL_CALL_DT").split(",") if f.strip()]
-BD_FIELDS = BD_CALL_FIELDS + ["MATURITY"] + BD_PUT_FIELDS + BD_SOFT_FIELDS + ["CALLABLE", "PUTABLE", "SOFT_CALL_TRIGGER_PCT"]
+BD_TRIG_FIELDS = [f.strip() for f in os.environ.get("BBG_TRIGGER_FIELDS", "SOFT_CALL_TRIGGER_PCT,CV_SOFT_CALL_TRIGGER,PROV_CALL_TRIGGER_PCT,CV_PROV_CALL_TRIGGER").split(",") if f.strip()]
+BD_FIELDS = BD_CALL_FIELDS + ["MATURITY"] + BD_PUT_FIELDS + BD_SOFT_FIELDS + ["CALLABLE", "PUTABLE"] + BD_TRIG_FIELDS
+
+
+def _bd_first_num(row_get, fields):
+    for f in fields:
+        v = _fnum0(row_get(f))
+        if v is not None and v == v:
+            return v
+    return None
+
+
+def _bd_sched_from_df(df):
+    """xbbg bds frame -> {isin: [dates]} tolerant of flat / multi index and column naming."""
+    out = {}
+    if df is None or len(df) == 0:
+        return out
+    dcol = next((c for c in df.columns if "date" in str(c).lower()), None)
+    if dcol is None:
+        for c in df.columns:
+            if str(df[c].dtype).startswith("datetime"):
+                dcol = c; break
+    if dcol is None:
+        return out
+    idx = df.index
+    secs = [str(i[0] if isinstance(i, tuple) else i) for i in idx]
+    for sec, v in zip(secs, df[dcol].tolist()):
+        isin = sec.replace("/isin/", "").split()[0].upper()
+        d = _bd_norm_date(v)
+        if d:
+            out.setdefault(isin, []).append(d)
+    return out
 
 
 def _bd_first(row_get, fields):
@@ -2867,17 +2898,21 @@ def bbg_bond_dates(isins):
     try:
         from xbbg import blp
         starts = {}
-        try:                                   # call period start = earliest row of the call schedule
-            sch = blp.bds(tickers=secs, flds="CALL_SCHEDULE")
-            if sch is not None and len(sch):
-                dcol = next((c for c in sch.columns if "date" in str(c).lower()), None)
-                if dcol is not None:
-                    for sec, grp in sch.groupby(level=0):
-                        ds = sorted(x for x in (_bd_norm_date(v) for v in grp[dcol]) if x)
-                        if ds:
-                            starts[str(sec).replace("/isin/", "").split()[0].upper()] = _bd_sched_next(ds)
+        sched = {}
+        try:                                   # call schedule: one batched bulk request ...
+            sched = _bd_sched_from_df(blp.bds(secs, "CALL_SCHEDULE"))
         except Exception as exc:
-            logger.info("CALL_SCHEDULE not available: %s", exc)
+            _BD["sched_err"] = "batch: " + str(exc)[:160]
+            logger.warning("CALL_SCHEDULE batch failed (%s) - trying per security", exc)
+            for s_ in secs:                    # ... else one by one, so a single bad security cannot blank the rest
+                try:
+                    sched.update(_bd_sched_from_df(blp.bds(s_, "CALL_SCHEDULE")))
+                except Exception as exc2:
+                    _BD["sched_err"] = str(exc2)[:160]
+        if sched:
+            _BD["sched_err"] = ""
+        for isin, ds in sched.items():
+            starts[isin] = _bd_sched_next(ds)
         df = blp.bdp(tickers=secs, flds=BD_FIELDS)
         if df is not None and len(df):
             cols = {str(c).lower(): c for c in df.columns}
@@ -2887,7 +2922,7 @@ def bbg_bond_dates(isins):
                 cs, cn = starts.get(isin, ("", ""))
                 call = _bd_first(g, BD_CALL_FIELDS) or cn            # no hard-call field -> next date in the (soft) call schedule
                 soft = _bd_first(g, BD_SOFT_FIELDS) or cs            # soft-call start: scalar field if the Terminal has one, else the schedule start
-                trig = _fnum0(g("SOFT_CALL_TRIGGER_PCT"))
+                trig = _bd_first_num(g, BD_TRIG_FIELDS)
                 out[isin] = {"call": call, "expiry": _bd_norm_date(g("MATURITY")),
                              "put": _bd_first(g, BD_PUT_FIELDS), "call_start": soft or cs, "soft_call": soft,
                              "trigger": trig, "hard_call": _bd_first(g, BD_CALL_FIELDS),
@@ -2934,7 +2969,7 @@ def bbg_bond_dates(isins):
                         cs, cn = "", ""
                     call = _bd_first(gv, BD_CALL_FIELDS) or cn
                     soft = _bd_first(gv, BD_SOFT_FIELDS) or cs
-                    trig = _fnum0(gv("SOFT_CALL_TRIGGER_PCT"))
+                    trig = _bd_first_num(gv, BD_TRIG_FIELDS)
                     out[isin] = {"call": call, "expiry": _bd_norm_date(gv("MATURITY")),
                                  "put": _bd_first(gv, BD_PUT_FIELDS), "call_start": soft or cs, "soft_call": soft,
                                  "trigger": trig, "hard_call": _bd_first(gv, BD_CALL_FIELDS),
@@ -2996,7 +3031,7 @@ def api_bond_dates_probe(isin: str = ""):
         return {"ok": False, "error": "blpapi not installed on this PC"}
     flds = ["NXT_CALL_DT", "NXT_CALL_PX", "CALLABLE", "CALL_SCHEDULE", "CV_NXT_CALL_DT", "FIRST_CALL_DT",
             "NXT_PUT_DT", "NXT_PUT_PX", "PUTABLE", "PUT_SCHEDULE", "CV_NXT_PUT_DT", "MATURITY", "FINAL_MATURITY",
-            "CV_CNVS_START_DT", "CV_CNVS_END_DT", "SOFT_CALL_TRIGGER_PCT"]
+            "CV_CNVS_START_DT", "CV_CNVS_END_DT"] + BD_SOFT_FIELDS + BD_TRIG_FIELDS
     out = {"ok": True, "isin": isin, "values": {}, "errors": {}, "schedules": {}}
     try:
         sess = blpapi.Session()
@@ -3065,7 +3100,7 @@ def api_bond_dates(isins: str = ""):
             threading.Thread(target=_bd_worker, args=(need,), name="bond-dates", daemon=True).start()
         elif need:
             _BD["pending"].difference_update(need)   # let the next poll queue them once the worker is free
-    return {"ok": True, "dates": out, "pending": len(_BD["pending"]), "busy": _BD["busy"], "err": _BD["err"]}
+    return {"ok": True, "dates": out, "pending": len(_BD["pending"]), "busy": _BD["busy"], "err": _BD["err"], "sched_err": _BD.get("sched_err", "")}
 
 
 @app.post("/api/snap8/run")
@@ -3726,7 +3761,7 @@ h2{font-size:10.5px;font-weight:700;color:var(--muted);margin:0;
 <body>
 <header>
   <h1>CB nuke station</h1>
-  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b46</b></span>
+  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b47</b></span>
   <span id="conn" class="conn warn" title="Connection">&#9679;</span>
   <span id="online" class="sub"></span>
   <div class="tabs">
@@ -4781,7 +4816,7 @@ function buildTable(idsOpt){
       `<td class="ref rowclick" data-r="ric"></td>` +
       `<td class="ref isincell" data-r="isin"><span class="isin-db"></span>` +
       `<input class="sprd isinv" data-u="isin_manual" data-id="${id}" placeholder="ISIN" maxlength="12" autocomplete="off" ` +
-      `onchange="isinChanged(this)" style="display:none" title="no ISIN in the database - type it here; saved for everyone and used for the Bloomberg dates until the database provides one"></td>` +
+      `onchange="isinChanged(this)" title="no ISIN in the database - type it here; saved for everyone and used for the Bloomberg dates until the database provides one"></td>` +
       `<td class="ref rowclick" data-r="sec_fx"></td>` +
       `<td class="gc uinp"><input class="gridcell" data-u="und_fx"
          data-row="${ri}" data-col="1" autocomplete="off"
@@ -5077,7 +5112,7 @@ async function bdRefresh(force){
   BD.inflight=true;
   try{ const base=location.pathname.replace(new RegExp("[/]+$"),"");
     const j=await (await fetch(base+"/api/bond_dates?isins="+encodeURIComponent(isins.join(",")))).json();
-    if(j&&j.ok){ Object.assign(BD.dates, j.dates||{}); BD.ts=now; BD.err=j.err||""; bdPaintAll(); if(j.pending||j.busy) setTimeout(()=>bdRefresh(true), 4000); }
+    if(j&&j.ok){ Object.assign(BD.dates, j.dates||{}); BD.ts=now; BD.err=j.err||""; BD.schedErr=j.sched_err||""; bdPaintAll(); if(j.pending||j.busy) setTimeout(()=>bdRefresh(true), 4000); }
   }catch(e){ BD.err=String(e); } finally{ BD.inflight=false; }
 }
 function _dateChip(td, iso, yearsFallback, kind, flag){
@@ -5101,6 +5136,8 @@ function bdPaintRow(tr){
     const why=(r&&r.error)?"Bloomberg: "+r.error+" - model years shown":"waiting for Bloomberg dates - model years shown"; ["f_call","f_exp","f_put"].forEach(k=>{ const c=g(k); if(c && c.textContent) c.title=why; }); return; }
   if(r.hard_call){ _dateChip(g("f_call"), r.hard_call, parseFloat(ref.years_to_call), "next issuer (hard) call", r.callable);
     { const c=g("f_call"); if(c && r.soft_call) c.title += " \u00b7 soft call from "+r.soft_call+(r.trigger!=null?" (trigger "+r.trigger+"%)":""); } }
+  else if(!(r.soft_call || r.call) && r.callable==="Y"){ const c=g("f_call"); if(c){ c.textContent="no sched"; c.classList.remove("fl-red","fl-amb"); c.classList.add("fl-dim");
+      c.title="callable, but Bloomberg returned no call schedule for "+(bdIsinOf(tr)||"this ISIN")+(BD.schedErr?" - "+BD.schedErr:"")+" - run /nuke/api/bond_dates/probe?isin="+(bdIsinOf(tr)||"")+" to see what the Terminal returns"; } }
   else { _dateChip(g("f_call"), r.soft_call || r.call, parseFloat(ref.years_to_call), "soft call", r.callable);
     { const c=g("f_call"); if(c && (r.soft_call||r.call)){ const d0=new Date((r.soft_call||r.call)+"T00:00:00"), tnow=new Date(new Date().toDateString());
       c.title = (d0<=tnow ? "soft call period running since " : "soft call period starts ")+(r.soft_call||r.call)+(r.trigger!=null?" \u00b7 trigger "+r.trigger+"%":"")+(r.call&&r.call!==r.soft_call?" \u00b7 next schedule date "+r.call:"")+(isFinite(parseFloat(ref.years_to_call))?" \u00b7 model: "+parseFloat(ref.years_to_call).toFixed(2)+"y":""); c.textContent = "S "+c.textContent; } } }
@@ -6850,7 +6887,7 @@ if __name__ == "__main__":
     # NOTE: reload must stay OFF (single process) so the in-memory
     # WebSocket hub works, and so the browser only opens once.
     print("=" * 62)
-    print("  NUKE STATION  BUILD borrow.b46  \u00b7  %s"
+    print("  NUKE STATION  BUILD borrow.b47  \u00b7  %s"
           % os.path.abspath(__file__))
     print("  port %s \u00b7 if this banner is missing, an OLD file is\n  running \u2014 kill that process first." % PORT)
     print("=" * 62)
