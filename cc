@@ -2376,6 +2376,74 @@ def _snap_edges(ticks, start_hms, end_hms):
     return f(inside[0]), f(inside[-1])
 
 
+def bbg_ticks(ticker, day, start_hms, end_hms):
+    """TRADE ticks in [start, end] as [(exchange-local 'HH:MM:SS', price), ...], sorted.
+    xbbg bdtick first, raw blpapi IntradayTickRequest second."""
+    code = _bbg_code(ticker)
+    out = []
+    try:
+        from xbbg import blp
+        df = blp.bdtick(ticker, dt=day, time_range=(start_hms, end_hms), types=["TRADE"])
+        if df is not None and len(df):
+            cols = {str(c[-1] if isinstance(c, tuple) else c).lower(): c for c in df.columns}
+            pc = cols.get("value") or cols.get("price") or cols.get("px") or list(df.columns)[0]
+            for ts, row in df.iterrows():
+                v = _fnum0(row[pc])
+                if v is not None and v == v:
+                    out.append((ts.strftime("%H:%M:%S"), v))
+        return sorted(out)
+    except ImportError:
+        pass
+    import blpapi
+    sess = blpapi.Session()
+    if not sess.start() or not sess.openService("//blp/refdata"):
+        raise RuntimeError("Bloomberg session could not start")
+    try:
+        svc = sess.getService("//blp/refdata")
+        d = datetime.strptime(day, "%Y-%m-%d")
+        off = timedelta(hours=BBG_TZ_OFFSET.get(code, 0))
+        a = datetime.combine(d.date(), datetime.strptime(start_hms, "%H:%M:%S").time()) - off
+        b = datetime.combine(d.date(), datetime.strptime(end_hms, "%H:%M:%S").time()) - off
+        req = svc.createRequest("IntradayTickRequest")
+        req.set("security", ticker); req.getElement("eventTypes").appendValue("TRADE")
+        req.set("startDateTime", blpapi.datetime.Datetime(a.year, a.month, a.day, a.hour, a.minute, a.second))
+        req.set("endDateTime", blpapi.datetime.Datetime(b.year, b.month, b.day, b.hour, b.minute, b.second))
+        sess.sendRequest(req)
+        while True:
+            ev = sess.nextEvent(5000)
+            for msg in ev:
+                if msg.hasElement("tickData"):
+                    for tk in msg.getElement("tickData").getElement("tickData").values():
+                        t = tk.getElementAsDatetime("time")
+                        lt = _utc_to_local(datetime(t.year, t.month, t.day, t.hour, t.minute, t.second), code)
+                        out.append((lt.strftime("%H:%M:%S"), tk.getElementAsFloat("value")))
+            if ev.eventType() == blpapi.Event.RESPONSE:
+                break
+        return sorted(out)
+    finally:
+        sess.stop()
+
+
+def twap_1s(ticks, start_hms, end_hms):
+    """Bloomberg's 1-second benchmark TWAP: sample the last trade price at
+    every second of [start, end] (from the first trade onward) and average."""
+    def sec(t):
+        h, m, s = [int(x) for x in str(t).split(":")[:3]]
+        return h * 3600 + m * 60 + s
+    s0, e0 = sec(start_hms), sec(end_hms)
+    pts = sorted((sec(t), p) for t, p in (ticks or []) if p is not None and p == p and s0 <= sec(t) <= e0)
+    if not pts:
+        return None, 0
+    total, n, i, last = 0.0, 0, 0, None
+    for t in range(s0, e0 + 1):
+        while i < len(pts) and pts[i][0] <= t:
+            last = pts[i][1]; i += 1
+        if last is None:
+            continue
+        total += last; n += 1
+    return (round(total / n, 4) if n else None), n
+
+
 def bbg_window_edges(ticker, day, start_hms, end_hms):
     """What the Bloomberg VWAP/TWAP screen does with a typed window: move the
     start to the first trade at/after it and the end to the last trade at/before
@@ -2663,21 +2731,24 @@ async def api_twap(req: TwapReq):
     snap_note = ""
     ekey = "E|%s|%s|%s|%s" % (tk, day, s_, e_)
     eent = _BBG_CACHE.get(ekey)
+    ticks = None
     try:
         if eent and now - eent["ts"] < 60:
-            fe, le = eent["v"]
+            ticks = eent["v"]
         else:
-            fe, le = await asyncio.wait_for(run_in_threadpool(bbg_window_edges, tk, day, s_, e_), timeout=tmo)
-            _BBG_CACHE[ekey] = {"ts": now, "v": (fe, le)}
+            ticks = await asyncio.wait_for(run_in_threadpool(bbg_ticks, tk, day, s_, e_), timeout=tmo)
+            _BBG_CACHE[ekey] = {"ts": now, "v": ticks}
+        fe, le = _snap_edges([t for t, _p in ticks], s_, e_)
         if fe is None:
-            return {"ok": False, "ticker": tk, "error": "no trades between %s and %s" % (s_[:5], e_[:5])}
-        if (fe, le) != (s_, e_):
-            snap_note = "window snapped to trades %s-%s" % (fe, le)
-        s_, e_ = fe, le
+            snap_note = "no ticks found in the window - using typed times"
+        else:
+            if (fe, le) != (s_, e_):
+                snap_note = "window snapped to trades %s-%s" % (fe, le)
+            s_, e_ = fe, le
     except asyncio.TimeoutError:
-        snap_note = "edge snap timed out - using typed times"
+        snap_note = "tick request timed out - using typed times"
     except Exception as exc:
-        snap_note = "edge snap n/a (%s) - using typed times" % str(exc)[:60]
+        snap_note = "ticks n/a (%s) - using typed times" % str(exc)[:60]
     # 1) Bloomberg-computed VWAP (the number of record)
     key = "V|%s|%s|%s|%s" % (tk, day, s_, e_)
     ent = _BBG_CACHE.get(key)
@@ -2706,6 +2777,10 @@ async def api_twap(req: TwapReq):
             tw = await asyncio.wait_for(run_in_threadpool(bbg_twap_field, tk, day, s_, e_), timeout=tmo)
             _BBG_CACHE[tkey] = {"ts": now, "v": tw}
         r["twap"] = tw.get("twap"); r["twap_src"] = tw.get("field"); r["twap_interval"] = (tw.get("overrides") or {}).get(BBG_TWAP_OV.get("interval", ""), "") or BBG_TWAP_INTERVAL
+        if r["twap"] is None and ticks:
+            tv, n = twap_1s(ticks, s_, e_)                       # no Bloomberg TWAP field: 1-second benchmark from ticks
+            if tv is not None:
+                r["twap"], r["twap_src"], r["twap_interval"] = tv, "ticks", "1s (%d samples)" % n
         if r["twap"] is None:
             r["twap_note"] = "twap: " + (tw.get("status") or "no value returned")
     except asyncio.TimeoutError:
@@ -3359,7 +3434,7 @@ h2{font-size:10.5px;font-weight:700;color:var(--muted);margin:0;
 <body>
 <header>
   <h1>CB nuke station</h1>
-  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b33</b></span>
+  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b34</b></span>
   <span id="conn" class="conn warn" title="Connection">&#9679;</span>
   <span id="online" class="sub"></span>
   <div class="tabs">
@@ -4332,7 +4407,7 @@ function buildTable(idsOpt){
     `<td colspan="7" class="fb grp bandhd" id="band-flags" onclick="bandToggle('flags')">flags &#9662;</td>` +
     `<td colspan="6" class="vb grp bandhd" id="band-vol" onclick="bandToggle('vol')">vol &#9662;</td>` +
     `<td colspan="4" class="dc grp bandhd" id="band-dcalc" onclick="bandToggle('dcalc')">delta calc &#9662;</td>` +
-    `<td colspan="13" class="cn grp bandhd" id="band-cbnuke" onclick="bandToggle('cbnuke')" title="VWAP/TWAP: Bloomberg-computed over [start,end) (exchange local, today); RIC -> BBG ticker (329180.KS -> 329180 KP Equity). Hedge: $-Neutral = A.Bond x [1 + Trade delta x ((C.Stock/C.FX) / (A.Stock/A.FX) - 1)] - the OVCV hedge-tab dollar-neutral price; C.Stock / C.FX follow the live cells until you type over them">cb nuke &#9662;</td>` +
+    `<td colspan="13" class="cn grp bandhd" id="band-cbnuke" onclick="bandToggle('cbnuke')" title="VWAP/TWAP: Bloomberg-computed over [start,end) (exchange local, today); RIC -> BBG ticker (329180.KS -> 329180 KP Equity). Hedge: $-Neutral = A.Bond + Trade delta x (parity_c - parity_a), parity = CR x Stock/FX with CR = 100 x fixed FX / CP (refdata) - matches the OVCV hedge-tab dollar-neutral price; C.Stock / C.FX follow the live cells until you type over them">cb nuke &#9662;</td>` +
     `<td colspan="13" class="ib grp bandhd" id="band-idb" onclick="bandToggle('idb')" title="read-only mirror of the Lagrange IDB QUOTES tab (mkt = broker as quoted, my = desk quote re-nuked at the broker ref); auto-refreshes every 5s. Flags: ${IDB_PILL_LEGEND}">idb quotes &#9662;</td>` +
     `<td colspan="5" class="gl grp bandhd" id="band-live" onclick="bandToggle('live')">live &#9662;</td>` +
     `<td colspan="5" class="ge grp bandhd" id="band-eod" onclick="bandToggle('eod')">eod &#9662;</td>` +
@@ -4446,7 +4521,7 @@ function buildTable(idsOpt){
       `<td data-c="cn_tk" data-band="cbnuke" class="rowclick cnt" title="Bloomberg ticker derived from the RIC"></td>` +
       [["delta","trade delta % (e.g. 60)"],["astk","anchor stock price"],["afx","anchor fx (stock ccy per USD; 1 if same ccy)"],["abond","anchor bond price"],["cstk","current stock - follows live last until you type"],["cfx","current fx - follows live last until you type"]].map(([k,t])=>
         `<td class="gc uinp" data-band="cbnuke"><input class="sprd hnv" data-hn="${k}" data-id="${id}" autocomplete="off" inputmode="decimal" placeholder="&#8212;" title="${t}" onchange="hnChanged(this)"></td>`).join("") +
-      `<td data-c="hn_dn" data-band="cbnuke" class="rowclick hnc" title="dollar-neutral bond price = A.Bond x [1 + delta x ((C.Stock/C.FX)/(A.Stock/A.FX) - 1)]"></td>` +
+      `<td data-c="hn_dn" data-band="cbnuke" class="rowclick hnc" title="dollar-neutral bond price = A.Bond + delta x (parity_c - parity_a), parity = CR x stock/fx (CR = 100 x fixed FX / CP from refdata)"></td>` +
       ["idb_btime","idb_bref","idb_bid","idb_atime","idb_aref","idb_ask","idb_my_bid","idb_my_ask","idb_ref","idb_gap_b","idb_gap_a","idb_gap","idb_flag"].map((k,i)=>`<td data-c="${k}" data-band="idb" class="rowclick${i===0?" grp bfirst":""}${["idb_bid","idb_bref","idb_btime","idb_ask","idb_aref","idb_atime"].includes(k)?" ibq":(["idb_ref","idb_my_bid","idb_my_ask"].includes(k)?" imy":" ichk")}"></td>`).join("") +
       RES_COLS.slice(5,10).map((c,i)=>
         `<td data-c="${c}" data-band="live" class="rowclick gL${i===0?" grp bfirst":""}"></td>`).join("") +
@@ -4483,7 +4558,7 @@ function buildTable(idsOpt){
   lastResponse = null;
   applyState();                                   // saved names / types / X / spreads: show at once
   loadRefData(uniq).catch(e=>setStatus(`<span class="warn">Reference lookup failed: ${e}</span>`))
-    .finally(()=>{ applyState(); applyNuke(); applyRfx(); });   // and again after refdata (never skipped)
+    .finally(()=>{ applyState(); applyNuke(); applyRfx(); if(typeof hnPaintAll==="function") hnPaintAll(); });   // and again after refdata (never skipped)
 }
 
 const BAND_FIRST = new Set(["n_bid","bw_dvb","x_bid","f_call","v_iv","dc_notl","cn_start","idb_btime",
@@ -5057,20 +5132,31 @@ function hnLive(tr, which){
   const fx=uVal(tr,"und_fx"); const c=hnNum(fx); if(isFinite(c)) return c;      // numeric constant und fx
   const t=tr.querySelector('td[data-fx="last"]'); return hnNum(t?t.textContent:"");
 }
-function hnDollarNeutral(delta, astk, afx, abond, cstk, cfx){
+function hnDollarNeutral(delta, astk, afx, abond, cstk, cfx, cr){
+  // OVCV dollar-neutral: bond moves by delta x change in parity, parity = CR x stock in bond ccy (per 100 face)
   const d=delta/100;
-  if(![delta,astk,afx,abond,cstk,cfx].every(x=>isFinite(x))) return NaN;
-  if(astk<=0||afx<=0||cfx<=0||abond<=0||cstk<=0) return NaN;
-  const ratio=(cstk/cfx)/(astk/afx);
-  return abond*(1+d*(ratio-1));
+  if(![delta,astk,afx,abond,cstk,cfx,cr].every(x=>isFinite(x))) return NaN;
+  if(astk<=0||afx<=0||cfx<=0||abond<=0||cstk<=0||cr<=0) return NaN;
+  const parA=cr*astk/afx, parC=cr*cstk/cfx;
+  return abond + d*(parC-parA);
+}
+function hnConvRatio(tr){   // shares per 100 face in bond ccy: 100 x fixedFX / CP (vanilla: 100 / CP)
+  const sid=Number(tr.dataset.id); const ref=refCache[sid]||{};
+  const cp=parseFloat(ref.lp_conversion_price)||parseFloat(ref.conversion_price); if(!isFinite(cp)||cp<=0) return NaN;
+  const bt=((tr.querySelector('input[data-u="bond_type"]')||{value:""}).value||"").trim().toLowerCase();
+  const ff=bt.startsWith("vanil")?1:(parseFloat(ref.conversion_fixed_fx)||1);
+  return 100*ff/cp;
 }
 function hnPaintRow(tr){
   const sid=Number(tr.dataset.id); const v=HN[sid]||{};
   const get=k=>{ const i=tr.querySelector('input[data-hn="'+k+'"]'); if(!i) return NaN;
     if((k==="cstk"||k==="cfx") && (v[k]===undefined||v[k]==="")){ const lv=hnLive(tr,k); if(document.activeElement!==i && !i.classList.contains("cn-bad")){ i.value=isFinite(lv)?(k==="cfx"?lv.toFixed(4):String(lv)):""; i.defaultValue=i.value; i.classList.add("hn-live"); i.title=(k==="cstk"?"current stock":"current fx")+" - following live (type to override; clear or Delete to follow live again)"; } return lv; }
     if(document.activeElement!==i) i.value=(v[k]===undefined?"":v[k]); i.classList.remove("hn-live"); if(k==="cstk"||k==="cfx") i.title=(k==="cstk"?"current stock":"current fx")+" - typed override (clear or Delete to follow live again)"; return hnNum(v[k]); };
-  const out=hnDollarNeutral(get("delta"),get("astk"),get("afx"),get("abond"),get("cstk"),get("cfx"));
-  const td=tr.querySelector('td[data-c="hn_dn"]'); if(td) td.textContent=isFinite(out)?out.toFixed(3):"";
+  const cr=hnConvRatio(tr);
+  const out=hnDollarNeutral(get("delta"),get("astk"),get("afx"),get("abond"),get("cstk"),get("cfx"),cr);
+  const td=tr.querySelector('td[data-c="hn_dn"]'); if(td){ td.textContent=isFinite(out)?out.toFixed(3):"";
+    const a=get("astk"),af=get("afx"),c=get("cstk"),cf=get("cfx");
+    td.title=isFinite(cr)?("$-neutral = A.Bond + delta x (parity_c - parity_a); CR "+cr.toFixed(4)+" per 100"+(isFinite(a*af*c*cf)?" ; parity_a "+(cr*a/af).toFixed(3)+" -> parity_c "+(cr*c/cf).toFixed(3):"")):"needs conversion price (refdata) to compute parity"; }
 }
 function hnChanged(el){
   const tr=el.closest("tr"); const sid=Number(tr.dataset.id); HN[sid]=HN[sid]||{};
@@ -6320,7 +6406,7 @@ if __name__ == "__main__":
     # NOTE: reload must stay OFF (single process) so the in-memory
     # WebSocket hub works, and so the browser only opens once.
     print("=" * 62)
-    print("  NUKE STATION  BUILD borrow.b33  \u00b7  %s"
+    print("  NUKE STATION  BUILD borrow.b34  \u00b7  %s"
           % os.path.abspath(__file__))
     print("  port %s \u00b7 if this banner is missing, an OLD file is\n  running \u2014 kill that process first." % PORT)
     print("=" * 62)
