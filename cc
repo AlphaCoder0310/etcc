@@ -3330,17 +3330,20 @@ input.hnv{width:60px;text-align:right}input.hnv.hn-live{color:#1e3a6e;font-style
 #tbl.hb-idb .bfirst[data-band="idb"]{font-size:0;padding:0;width:14px;min-width:14px;max-width:14px;background:#f3f2ef;border-left:1px solid #d8d4cc}
 .ib{background:#dcd3f0;color:#3b2a6e}td[data-band="idb"].ichk{background:#f6f6f6}
 /* IDB quotes: colour by SIDE (blue = bid, orange = offer; colour-blind safe), broker light / mine strong */
-:root{--idb-ibBid-bg:#dbeafe;--idb-ibBid-fg:#111827;--idb-myBid-bg:#93c5fd;--idb-myBid-fg:#111827;--idb-ibOfr-bg:#ffedd5;--idb-ibOfr-fg:#111827;--idb-myOfr-bg:#fdba74;--idb-myOfr-fg:#111827}
+:root{--idb-ibBid-bg:#dbeafe;--idb-ibBid-fg:#111827;--idb-myBid-bg:#93c5fd;--idb-myBid-fg:#111827;--idb-ibOfr-bg:#ffedd5;--idb-ibOfr-fg:#111827;--idb-myOfr-bg:#fdba74;--idb-myOfr-fg:#111827;
+      --idb-ibBidq-bg:#eaf2ff;--idb-ibBidq-fg:#1e3a8a;--idb-ibOfrq-bg:#fff4e8;--idb-ibOfrq-fg:#7c2d12}
 td[data-band="idb"].ib-bid{background:var(--idb-ibBid-bg);color:var(--idb-ibBid-fg)}
 td[data-band="idb"].my-bid{background:var(--idb-myBid-bg);color:var(--idb-myBid-fg);font-weight:700}
 td[data-band="idb"].ib-ofr{background:var(--idb-ibOfr-bg);color:var(--idb-ibOfr-fg)}
 td[data-band="idb"].my-ofr{background:var(--idb-myOfr-bg);color:var(--idb-myOfr-fg);font-weight:700}
-td[data-band="idb"].ib-bidq{background:rgb(239,246,255);color:rgb(107,114,128);font-size:9.5px}
-td[data-band="idb"].ib-ofrq{background:rgb(255,247,237);color:rgb(107,114,128);font-size:9.5px}
+td[data-band="idb"].ib-bidq{background:var(--idb-ibBidq-bg);color:var(--idb-ibBidq-fg);font-weight:700}
+td[data-band="idb"].ib-ofrq{background:var(--idb-ibOfrq-bg);color:var(--idb-ibOfrq-fg);font-weight:700}
 td[data-band="idb"].ib-refu{background:rgb(229,231,235);color:rgb(55,65,81);font-weight:700;border-left:2px solid rgb(156,163,175)}
 td[data-c="idb_flag"]{text-align:left;white-space:nowrap}
 .ip{display:inline-block;padding:0 5px;border-radius:9px;font-size:9px;font-weight:700;letter-spacing:.3px;line-height:14px;vertical-align:middle;font-family:'Segoe UI',system-ui,sans-serif}
 .ip-x{background:#b91c1c;color:#fff}.ip-g1{background:#fde68a;color:#78350f}.ip-g2{background:#f59e0b;color:#3b1f00}.ip-g3{background:#c2410c;color:#fff}
+.ip-b1{background:#dbeafe;color:#1e3a8a}.ip-b2{background:#60a5fa;color:#0b1b4d}.ip-b3{background:#1d4ed8;color:#fff}
+.ip-o1{background:#ffedd5;color:#7c2d12}.ip-o2{background:#fb923c;color:#3b1104}.ip-o3{background:#c2410c;color:#fff}
 .ip-grey{background:#e5e7eb;color:#374151}.ip-out{background:transparent;color:#6b7280;border:1px solid #cbd5e1;line-height:12px}.ip-blue{background:transparent;color:#1d4ed8;border:1px solid #93c5fd;line-height:12px}.ip-purple{background:#ede9fe;color:#5b21b6}
 #tbl.hb-dcalc th[data-band="dcalc"]:not(.bfirst),#tbl.hb-dcalc td[data-band="dcalc"]:not(.bfirst){display:none}
 #tbl.hb-dcalc .bfirst[data-band="dcalc"]{font-size:0;padding:0;width:14px;min-width:14px;max-width:14px;background:#f3f2ef;border-left:1px solid #d8d4cc}
@@ -3423,6 +3426,10 @@ th{position:sticky}
 .ovd-on{background:var(--amber-dim)!important}
 .pos{color:var(--green)} .neg{color:var(--red)}
 .hint{color:var(--faint);font-size:10px;margin:0}
+.filters{display:flex;align-items:center;gap:10px;font-size:11px;color:var(--text)}.filters .fl-lbl{color:var(--muted);font-weight:700;letter-spacing:.3px;text-transform:uppercase;font-size:9.5px}
+.filters label{display:inline-flex;align-items:center;gap:4px;cursor:pointer;padding:1px 6px;border:1px solid var(--border2);border-radius:3px;background:var(--panel)}.filters label:has(input:checked){background:#0b6e66;color:#fff;border-color:#0b6e66}
+.filters .fl-cnt{color:var(--muted);font-variant-numeric:tabular-nums}
+#tbl tr.flt-hide{display:none}
 kbd{background:var(--panel2);border:1px solid var(--border2);border-radius:0;
   padding:0 4px;font:10px var(--mono);color:var(--muted)}
 h2{font-size:10.5px;font-weight:700;color:var(--muted);margin:0;
@@ -3443,7 +3450,7 @@ h2{font-size:10.5px;font-weight:700;color:var(--muted);margin:0;
 <body>
 <header>
   <h1>CB nuke station</h1>
-  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b37</b></span>
+  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b39</b></span>
   <span id="conn" class="conn warn" title="Connection">&#9679;</span>
   <span id="online" class="sub"></span>
   <div class="tabs">
@@ -3466,15 +3473,11 @@ h2{font-size:10.5px;font-weight:700;color:var(--muted);margin:0;
   <main>
     <div class="toprow">
       <h2>Securities</h2>
-      <p class="hint">
-        short_name, und_fx, nGamma (teal, manual) and overrides (amber) all behave like a spreadsheet:
-        drag select, <kbd>Ctrl</kbd>+<kbd>C</kbd>/<kbd>X</kbd>/<kbd>V</kbd>, corner drag-fill,
-        <kbd>Ctrl</kbd>+<kbd>D</kbd>, <kbd>Esc</kbd> &middot;
-        und_fx takes an Eikon FX RIC (<kbd>TWD=</kbd> <kbd>KRW=</kbd> <kbd>TWDKRW=R</kbd>, <kbd>1</kbd> = USD)
-        and drives fx last/time/date/close &middot;
-        toolbar buttons fill overrides (Live/EOD = all-or-selected, Last/Close = selected only) &middot;
-        click eikon last/close cells to copy one value &middot; bands refresh on click
-      </p>
+      <div class="filters" id="filters" title="Filters show only the rows that match; hidden rows are still priced and refreshed. (Tip: und_fx takes an Eikon FX RIC - TWD=, KRW=, TWDKRW=R, or 1 for USD.)">
+        <span class="fl-lbl">Filter</span>
+        <label><input type="checkbox" id="fltMove" onchange="filtersChanged()"> MOVE flag</label>
+        <span id="fltCount" class="fl-cnt"></span>
+      </div>
       <span class="namebox" id="namebox">&mdash;</span>
     </div>
     <div class="tablewrap" id="wrap"><table id="tbl"></table><div id="fh"></div></div>
@@ -3688,6 +3691,11 @@ function idbApplyColors(){
   for(const [k,v] of Object.entries({ibBid:c.ibBid, myBid:c.myBid, ibOfr:c.ibOfr, myOfr:c.myOfr})){
     st.setProperty("--idb-"+k+"-bg", v); st.setProperty("--idb-"+k+"-fg", idbTextFor(v));
   }
+  // @ref / time cells: a lighter mix of the side colour, with a deep, readable text of the same hue
+  const mix=(hex,wt)=>{ const m=String(hex).match(/^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i); if(!m) return "#f3f4f6"; return "#"+[1,2,3].map(i=>Math.round(parseInt(m[i],16)*(1-wt)+255*wt).toString(16).padStart(2,"0")).join(""); };
+  const deep=(hex,wt)=>{ const m=String(hex).match(/^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i); if(!m) return "#111827"; return "#"+[1,2,3].map(i=>Math.round(parseInt(m[i],16)*(1-wt)).toString(16).padStart(2,"0")).join(""); };
+  st.setProperty("--idb-ibBidq-bg", mix(c.ibBid,0.45)); st.setProperty("--idb-ibBidq-fg", deep(c.myBid,0.62));   // tint = IDB price colour + 45% white: always lighter than the price cell
+  st.setProperty("--idb-ibOfrq-bg", mix(c.ibOfr,0.45)); st.setProperty("--idb-ibOfrq-fg", deep(c.myOfr,0.62));
 }
 idbApplyColors();
 const COL_DEFS = [
@@ -4777,6 +4785,16 @@ function mvClass(td, v, kind){
   let lv = 0; for(let i=0;i<th.length;i++) if(a >= th[i]) lv = i+1;
   td.classList.add((v>0?"mv-p":"mv-n")+lv);
 }
+const FILTERS = Object.assign({move:false}, JSON.parse(localStorage.getItem("nukestation.filters")||"{}"));
+function rowMoveFlag(tr){ const mv=tr.querySelector('td[data-fl="f_move"]'); if(!mv) return false; const c=mv.classList;
+  return [...c].some(x=>/^mv-[pn][34]$/.test(x)) || c.contains("fl-red") || c.contains("fl-amb"); }   // beyond BE (strong/solid), fixed-threshold hit, or FX part
+function applyFilters(){
+  const rows=[...document.querySelectorAll("#tbl tr[data-id]")]; let shown=0;
+  rows.forEach(tr=>{ const ok = !FILTERS.move || rowMoveFlag(tr); tr.classList.toggle("flt-hide", !ok); if(ok) shown++; });
+  const c=document.getElementById("fltCount"); if(c) c.textContent = (FILTERS.move ? (shown+" of "+rows.length+" rows") : "");
+}
+function filtersChanged(){ const el=document.getElementById("fltMove"); FILTERS.move=!!(el&&el.checked); localStorage.setItem("nukestation.filters", JSON.stringify(FILTERS)); applyFilters(); }
+(function(){ const el=document.getElementById("fltMove"); if(el) el.checked=!!FILTERS.move; })();
 function updMovesFlags(scope){
   const today = new Date();
   document.querySelectorAll("#tbl tr[data-id]").forEach(tr=>{
@@ -4921,6 +4939,7 @@ function updMovesFlags(scope){
       }
     }
   });
+  if(typeof applyFilters==="function") applyFilters();
 }
 
 let AUTO_LAST = localStorage.getItem("nukestation.autolast")==="1";
@@ -5079,11 +5098,13 @@ function idbPill(txt){
   const t = String(txt||"").trim(); if(!t) return "";
   const num = (m)=>{ const v=parseFloat(m); return isFinite(v)?v:0; };
   const shade = v => Math.abs(v) >= 2 ? "ip-g3" : (Math.abs(v) >= 1 ? "ip-g2" : "ip-g1");
+  const shadeB = v => Math.abs(v) >= 2 ? "ip-b3" : (Math.abs(v) >= 1 ? "ip-b2" : "ip-b1");   // bid gap: blue family
+  const shadeO = v => Math.abs(v) >= 2 ? "ip-o3" : (Math.abs(v) >= 1 ? "ip-o2" : "ip-o1");   // offer gap: orange family
   let m;
   if(t === "MKT BID > MY OFFER") return `<span class="ip ip-x" title="${esc(t)}">X BID</span>`;
   if(t === "MKT OFFER < MY BID") return `<span class="ip ip-x" title="${esc(t)}">X OFR</span>`;
-  if((m = t.match(/^BID GAP ([+-]?[\\d.]+)/))) return `<span class="ip ${shade(num(m[1]))}" title="${esc(t)}">G.B ${num(m[1])>0?"+":""}${num(m[1]).toFixed(2)}</span>`;
-  if((m = t.match(/^OFR GAP ([+-]?[\\d.]+)/))) return `<span class="ip ${shade(num(m[1]))}" title="${esc(t)}">G.O ${num(m[1])>0?"+":""}${num(m[1]).toFixed(2)}</span>`;
+  if((m = t.match(/^BID GAP ([+-]?[\\d.]+)/))) return `<span class="ip ${shadeB(num(m[1]))}" title="${esc(t)}">G.B ${num(m[1])>0?"+":""}${num(m[1]).toFixed(2)}</span>`;
+  if((m = t.match(/^OFR GAP ([+-]?[\\d.]+)/))) return `<span class="ip ${shadeO(num(m[1]))}" title="${esc(t)}">G.O ${num(m[1])>0?"+":""}${num(m[1]).toFixed(2)}</span>`;
   if((m = t.match(/^GAP ([+-]?[\\d.]+)/))) return `<span class="ip ${shade(num(m[1]))}" title="${esc(t)}">G ${num(m[1])>0?"+":""}${num(m[1]).toFixed(2)}</span>`;
   if(t.startsWith("NOT REPRICED")) return `<span class="ip ip-grey" title="${esc(t)}">RE-NUKE</span>`;
   if(t.startsWith("NOT PRICED")) return `<span class="ip ip-grey" title="${esc(t)}">NOT PRICED</span>`;
@@ -6452,7 +6473,7 @@ if __name__ == "__main__":
     # NOTE: reload must stay OFF (single process) so the in-memory
     # WebSocket hub works, and so the browser only opens once.
     print("=" * 62)
-    print("  NUKE STATION  BUILD borrow.b37  \u00b7  %s"
+    print("  NUKE STATION  BUILD borrow.b39  \u00b7  %s"
           % os.path.abspath(__file__))
     print("  port %s \u00b7 if this banner is missing, an OLD file is\n  running \u2014 kill that process first." % PORT)
     print("=" * 62)
