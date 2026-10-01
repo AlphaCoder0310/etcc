@@ -3450,7 +3450,7 @@ h2{font-size:10.5px;font-weight:700;color:var(--muted);margin:0;
 <body>
 <header>
   <h1>CB nuke station</h1>
-  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b40</b></span>
+  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b41</b></span>
   <span id="conn" class="conn warn" title="Connection">&#9679;</span>
   <span id="online" class="sub"></span>
   <div class="tabs">
@@ -3484,6 +3484,9 @@ h2{font-size:10.5px;font-weight:700;color:var(--muted);margin:0;
         <label title="bid gap pill (G.B)"><input type="checkbox" data-flt="idb" value="gb" onchange="filtersChanged()"> G.B</label>
         <label title="offer gap pill (G.O)"><input type="checkbox" data-flt="idb" value="go" onchange="filtersChanged()"> G.O</label>
         <label title="mid gap pill (G)"><input type="checkbox" data-flt="idb" value="g" onchange="filtersChanged()"> G</label>
+        <span class="fl-sep"></span><span class="fl-grp">Opp</span>
+        <label title="no position (qty_live 0 or blank) and the IDB bid is above my bid (gap bid > 0)"><input type="checkbox" data-flt="opp" value="flat_gb" onchange="filtersChanged()"> Flat &amp; G.B &gt; 0</label>
+        <label title="long (qty_live > 0) and the IDB offer is below my offer (gap ofr < 0)"><input type="checkbox" data-flt="opp" value="long_go" onchange="filtersChanged()"> Long &amp; G.O &lt; 0</label>
         <span id="fltCount" class="fl-cnt"></span>
       </div>
       <span class="namebox" id="namebox">&mdash;</span>
@@ -4793,28 +4796,37 @@ function mvClass(td, v, kind){
   let lv = 0; for(let i=0;i<th.length;i++) if(a >= th[i]) lv = i+1;
   td.classList.add((v>0?"mv-p":"mv-n")+lv);
 }
-const FILTERS = Object.assign({move:false, vol:[], idb:[]}, JSON.parse(localStorage.getItem("nukestation.filters")||"{}"));
+const FILTERS = Object.assign({move:false, vol:[], idb:[], opp:[]}, JSON.parse(localStorage.getItem("nukestation.filters")||"{}"));
+function rowQtyLive(tr){ const sid=Number(tr.dataset.id); const q=parseFloat(String(((refCache[sid]||{}).quantity_live)??"").replace(/,/g,"")); return isFinite(q)?q:0; }   // blank -> 0 (flat)
+function rowGap(tr,k){ const td=tr.querySelector('td[data-c="'+k+'"]'); const v=parseFloat(String(td?td.textContent:"").replace(/[+,]/g,"")); return isFinite(v)?v:NaN; }   // blank / not compared -> NaN
+function rowOpp(tr){ const q=rowQtyLive(tr), gb=rowGap(tr,"idb_gap_b"), go=rowGap(tr,"idb_gap_a"); const s=new Set();
+  if(q===0 && isFinite(gb) && gb>0) s.add("flat_gb");
+  if(q>0 && isFinite(go) && go<0) s.add("long_go");
+  return s; }
 function rowVol(tr){ const s=tr.querySelector('select[data-u="vol_flag"]'); return s ? String(s.value||"") : ""; }   // "Rich" | "Cheap" | "" (neutral)
 function rowIdbGaps(tr){ const out=new Set(); tr.querySelectorAll('td[data-c="idb_flag"] span.ip').forEach(p=>{ const t=p.textContent; if(t.startsWith("G.B")) out.add("gb"); else if(t.startsWith("G.O")) out.add("go"); else if(/^G [+-]/.test(t)) out.add("g"); }); return out; }
 function rowMoveFlag(tr){ const mv=tr.querySelector('td[data-fl="f_move"]'); if(!mv) return false; const c=mv.classList;
   return [...c].some(x=>/^mv-[pn][34]$/.test(x)) || c.contains("fl-red") || c.contains("fl-amb"); }   // beyond BE (strong/solid), fixed-threshold hit, or FX part
 function applyFilters(){
   const rows=[...document.querySelectorAll("#tbl tr[data-id]")]; let shown=0;
-  const vol=FILTERS.vol||[], idb=FILTERS.idb||[]; const active = FILTERS.move || vol.length || idb.length;
+  const vol=FILTERS.vol||[], idb=FILTERS.idb||[], opp=FILTERS.opp||[]; const active = FILTERS.move || vol.length || idb.length || opp.length;
   rows.forEach(tr=>{
     let ok = !FILTERS.move || rowMoveFlag(tr);                       // AND across filters ...
     if(ok && vol.length) ok = vol.includes(rowVol(tr));               // ... OR within a filter
     if(ok && idb.length){ const g=rowIdbGaps(tr); ok = idb.some(k=>g.has(k)); }
+    if(ok && opp.length){ const o=rowOpp(tr); ok = opp.some(k=>o.has(k)); }
     tr.classList.toggle("flt-hide", !ok); if(ok) shown++; });
   const c=document.getElementById("fltCount"); if(c) c.textContent = (active ? (shown+" of "+rows.length+" rows") : "");
 }
 function filtersChanged(){ const el=document.getElementById("fltMove"); FILTERS.move=!!(el&&el.checked);
   FILTERS.vol=[...document.querySelectorAll('#filters input[data-flt="vol"]:checked')].map(i=>i.value);
   FILTERS.idb=[...document.querySelectorAll('#filters input[data-flt="idb"]:checked')].map(i=>i.value);
+  FILTERS.opp=[...document.querySelectorAll('#filters input[data-flt="opp"]:checked')].map(i=>i.value);
   localStorage.setItem("nukestation.filters", JSON.stringify(FILTERS)); applyFilters(); }
 (function(){ const el=document.getElementById("fltMove"); if(el) el.checked=!!FILTERS.move;
   document.querySelectorAll('#filters input[data-flt="vol"]').forEach(i=>{ i.checked=(FILTERS.vol||[]).includes(i.value); });
-  document.querySelectorAll('#filters input[data-flt="idb"]').forEach(i=>{ i.checked=(FILTERS.idb||[]).includes(i.value); }); })();
+  document.querySelectorAll('#filters input[data-flt="idb"]').forEach(i=>{ i.checked=(FILTERS.idb||[]).includes(i.value); });
+  document.querySelectorAll('#filters input[data-flt="opp"]').forEach(i=>{ i.checked=(FILTERS.opp||[]).includes(i.value); }); })();
 function updMovesFlags(scope){
   const today = new Date();
   document.querySelectorAll("#tbl tr[data-id]").forEach(tr=>{
@@ -6494,7 +6506,7 @@ if __name__ == "__main__":
     # NOTE: reload must stay OFF (single process) so the in-memory
     # WebSocket hub works, and so the browser only opens once.
     print("=" * 62)
-    print("  NUKE STATION  BUILD borrow.b40  \u00b7  %s"
+    print("  NUKE STATION  BUILD borrow.b41  \u00b7  %s"
           % os.path.abspath(__file__))
     print("  port %s \u00b7 if this banner is missing, an OLD file is\n  running \u2014 kill that process first." % PORT)
     print("=" * 62)
