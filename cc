@@ -3328,7 +3328,16 @@ input.cnv{width:62px;text-align:center}td[data-c="cn_tk"].cn-err{color:#b91c1c}i
 input.hnv{width:60px;text-align:right}input.hnv.hn-live{color:#1e3a6e;font-style:italic}input.hnv:not(.hn-live):not(:placeholder-shown){color:#111;font-style:normal}td[data-band="cbnuke"].hnc{background:#dcfce7;font-weight:700}
 #tbl.hb-idb th[data-band="idb"]:not(.bfirst),#tbl.hb-idb td[data-band="idb"]:not(.bfirst){display:none}
 #tbl.hb-idb .bfirst[data-band="idb"]{font-size:0;padding:0;width:14px;min-width:14px;max-width:14px;background:#f3f2ef;border-left:1px solid #d8d4cc}
-.ib{background:#dcd3f0;color:#3b2a6e}td[data-band="idb"].ibq{background:#f3effa}td[data-band="idb"].imy{background:#eef7f0;font-weight:600}td[data-band="idb"].ichk{background:#f6f6f6}
+.ib{background:#dcd3f0;color:#3b2a6e}td[data-band="idb"].ichk{background:#f6f6f6}
+/* IDB quotes: colour by SIDE (blue = bid, orange = offer; colour-blind safe), broker light / mine strong */
+:root{--idb-ibBid-bg:#dbeafe;--idb-ibBid-fg:#111827;--idb-myBid-bg:#93c5fd;--idb-myBid-fg:#111827;--idb-ibOfr-bg:#ffedd5;--idb-ibOfr-fg:#111827;--idb-myOfr-bg:#fdba74;--idb-myOfr-fg:#111827}
+td[data-band="idb"].ib-bid{background:var(--idb-ibBid-bg);color:var(--idb-ibBid-fg)}
+td[data-band="idb"].my-bid{background:var(--idb-myBid-bg);color:var(--idb-myBid-fg);font-weight:700}
+td[data-band="idb"].ib-ofr{background:var(--idb-ibOfr-bg);color:var(--idb-ibOfr-fg)}
+td[data-band="idb"].my-ofr{background:var(--idb-myOfr-bg);color:var(--idb-myOfr-fg);font-weight:700}
+td[data-band="idb"].ib-bidq{background:rgb(239,246,255);color:rgb(107,114,128);font-size:9.5px}
+td[data-band="idb"].ib-ofrq{background:rgb(255,247,237);color:rgb(107,114,128);font-size:9.5px}
+td[data-band="idb"].ib-refu{background:rgb(229,231,235);color:rgb(55,65,81);font-weight:700;border-left:2px solid rgb(156,163,175)}
 td[data-c="idb_flag"]{text-align:left;white-space:nowrap}
 .ip{display:inline-block;padding:0 5px;border-radius:9px;font-size:9px;font-weight:700;letter-spacing:.3px;line-height:14px;vertical-align:middle;font-family:'Segoe UI',system-ui,sans-serif}
 .ip-x{background:#b91c1c;color:#fff}.ip-g1{background:#fde68a;color:#78350f}.ip-g2{background:#f59e0b;color:#3b1f00}.ip-g3{background:#c2410c;color:#fff}
@@ -3434,7 +3443,7 @@ h2{font-size:10.5px;font-weight:700;color:var(--muted);margin:0;
 <body>
 <header>
   <h1>CB nuke station</h1>
-  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b34</b></span>
+  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b37</b></span>
   <span id="conn" class="conn warn" title="Connection">&#9679;</span>
   <span id="online" class="sub"></span>
   <div class="tabs">
@@ -3580,6 +3589,21 @@ h2{font-size:10.5px;font-weight:700;color:var(--muted);margin:0;
         <label for="cfgStep">Bid/ask rounding step (live, eod, override, &Delta;)</label>
         <input type="number" id="cfgStep" min="0.0001" step="0.01">
       </div>
+      <h4 style="margin:14px 0 4px">IDB quotes band</h4>
+      <div class="fieldrow">
+        <label for="cfgIdbLayout">Column layout</label>
+        <select id="cfgIdbLayout">
+          <option value="pairs">pairs (recommended): Ref used &middot; IDB Bid &middot; My Bid &middot; Gap bid &middot; IDB Ofr &middot; My Ofr &middot; Gap ofr &middot; Gap &middot; Flags &middot; @ref/time</option>
+          <option value="sides">sides: time &middot; @ref &middot; IDB Bid &middot; time &middot; @ref &middot; IDB Ofr &middot; Ref used &middot; My Bid &middot; My Ofr &middot; gaps &middot; Flags</option>
+        </select>
+      </div>
+      <div class="fieldrow">
+        <label>Colours (background; text colour picks itself for contrast)</label>
+        <span>IDB Bid <input type="color" id="cfgIdbBid"> My Bid <input type="color" id="cfgMyBid">
+        &nbsp; IDB Ofr <input type="color" id="cfgIdbOfr"> My Ofr <input type="color" id="cfgMyOfr">
+        <button type="button" onclick="cfgIdbReset()" style="margin-left:8px">Reset colours</button></span>
+      </div>
+      <p class="note">Blue = bid side, orange = offer side (colour-blind safe); the darker cell of each pair is yours. Layout and colours are saved in this browser.</p>
       <p class="note">Rounding and your name are saved in this browser; the
         refresh interval applies to the shared server poller for everyone.</p>
       <button class="primary" onclick="saveCfg()">Save &amp; apply</button>
@@ -3644,6 +3668,28 @@ const CFG = Object.assign(
   JSON.parse(localStorage.getItem("nukestation.cfg")||"{}"));
 
 /* every visible column after the checkbox, in exact display order */
+/* IDB QUOTES band: layout + colours are CONFIG settings (saved in this browser) */
+const IDB_LAYOUTS = {
+  pairs: ["idb_ref","idb_bid","idb_my_bid","idb_gap_b","idb_ask","idb_my_ask","idb_gap_a","idb_gap","idb_flag","idb_bref","idb_btime","idb_aref","idb_atime"],
+  sides: ["idb_btime","idb_bref","idb_bid","idb_atime","idb_aref","idb_ask","idb_ref","idb_my_bid","idb_my_ask","idb_gap_b","idb_gap_a","idb_gap","idb_flag"]
+};
+const IDB_LABELS = {idb_btime:"time",idb_bref:"@ref",idb_bid:"IDB Bid",idb_atime:"time",idb_aref:"@ref",idb_ask:"IDB Ofr",idb_ref:"Ref used",
+                    idb_my_bid:"My Bid",idb_my_ask:"My Ofr",idb_gap_b:"Gap bid",idb_gap_a:"Gap ofr",idb_gap:"Gap",idb_flag:"Flags"};
+const IDB_COLOR_DEF = {ibBid:"#dbeafe", myBid:"#93c5fd", ibOfr:"#ffedd5", myOfr:"#fdba74"};   // rgb(219,234,254) rgb(147,197,253) rgb(255,237,213) rgb(253,186,116)
+function idbOrder(){ return IDB_LAYOUTS[CFG.idbLayout] || IDB_LAYOUTS.pairs; }
+function idbColors(){ return Object.assign({}, IDB_COLOR_DEF, CFG.idbColors || {}); }
+function idbTextFor(bg){   // dark text on light fills, white on dark - WCAG-ish luminance
+  const m = String(bg||"").match(/^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i); if(!m) return "#111";
+  const [r,g,b] = [1,2,3].map(i=>parseInt(m[i],16)/255).map(v=>v<=0.03928?v/12.92:Math.pow((v+0.055)/1.055,2.4));
+  return (0.2126*r+0.7152*g+0.0722*b) > 0.45 ? "#111827" : "#ffffff";
+}
+function idbApplyColors(){
+  const c = idbColors(), st = document.documentElement.style;
+  for(const [k,v] of Object.entries({ibBid:c.ibBid, myBid:c.myBid, ibOfr:c.ibOfr, myOfr:c.myOfr})){
+    st.setProperty("--idb-"+k+"-bg", v); st.setProperty("--idb-"+k+"-fg", idbTextFor(v));
+  }
+}
+idbApplyColors();
 const COL_DEFS = [
   ["secId","secId","stick1"],["company","company","ref stick2"],
   ["short_name","short_name","ref stick3"],
@@ -3678,18 +3724,7 @@ const COL_DEFS = [
   ["dc_shares","Eq Shares",""],["dc_usd","USD Delta",""],
   ["cn_start","Start","grp"],["cn_end","End",""],["cn_twap","TWAP",""],["cn_vwap","VWAP",""],["cn_vol","Volume",""],["cn_tk","BBG ticker",""],
   ["hn_delta","Trade \u0394%",""],["hn_astk","A.Stock",""],["hn_afx","A.FX",""],["hn_abond","A.Bond",""],["hn_cstk","C.Stock",""],["hn_cfx","C.FX",""],["hn_dn","$-Neutral",""],
-  ["idb_btime","time","grp"],
-  ["idb_bref","@ref",""],
-  ["idb_bid","IDB Bid",""],
-  ["idb_atime","time",""],
-  ["idb_aref","@ref",""],
-  ["idb_ask","IDB Ofr",""],
-  ["idb_my_bid","My Bid",""],
-  ["idb_my_ask","My Ofr",""],
-  ["idb_ref","Ref used",""],
-  ["idb_gap_b","Gap bid",""],["idb_gap_a","Gap ofr",""],
-  ["idb_gap","Gap",""],
-  ["idb_flag","Flags",""],
+  ...idbOrder().map((k,i)=>[k, IDB_LABELS[k], i===0?"grp":""]),
   ["live_bid","bid","grp"],["live_ask","ask",""],["live_spot","spot",""],
   ["live_cbfx","cbFx",""],["live_undfx","undFx",""],
   ["eod_bid","bid","grp"],["eod_ask","ask",""],["eod_spot","spot",""],
@@ -3838,7 +3873,11 @@ async function snap8Now(){
   loadSnap8();
 }
 
+function cfgIdbReset(){ delete CFG.idbColors; localStorage.setItem("nukestation.cfg", JSON.stringify(CFG)); idbApplyColors(); loadCfgForm(); }
 function loadCfgForm(){
+  { const c=idbColors(); const set=(id,v)=>{ const el=document.getElementById(id); if(el) el.value=v; };
+    set("cfgIdbBid",c.ibBid); set("cfgMyBid",c.myBid); set("cfgIdbOfr",c.ibOfr); set("cfgMyOfr",c.myOfr);
+    const lay=document.getElementById("cfgIdbLayout"); if(lay) lay.value=(IDB_LAYOUTS[CFG.idbLayout]?CFG.idbLayout:"pairs"); }
   document.getElementById("cfgName").value = CFG.user;
   document.getElementById("cfgSec").value = NS.refreshSec;
   document.getElementById("cfgRef").value = NS.refdataSec;
@@ -3853,6 +3892,13 @@ function saveCfg(){
   const name = document.getElementById("cfgName").value.trim();
   if(name && name !== CFG.user){ CFG.user = name.slice(0,24); NS.hello(); }
   CFG.roundStep = parseFloat(document.getElementById("cfgStep").value)||0.05;
+  { const g=id=>(document.getElementById(id)||{}).value; const cols={ibBid:g("cfgIdbBid"),myBid:g("cfgMyBid"),ibOfr:g("cfgIdbOfr"),myOfr:g("cfgMyOfr")};
+    const def=IDB_COLOR_DEF; const changed={}; for(const k in cols) if(cols[k] && cols[k].toLowerCase()!==def[k]) changed[k]=cols[k].toLowerCase();
+    if(Object.keys(changed).length) CFG.idbColors=changed; else delete CFG.idbColors;
+    const lay=(document.getElementById("cfgIdbLayout")||{}).value; const prev=CFG.idbLayout||"pairs";
+    if(lay && IDB_LAYOUTS[lay]) CFG.idbLayout=lay;
+    localStorage.setItem("nukestation.cfg", JSON.stringify(CFG)); idbApplyColors();
+    if((CFG.idbLayout||"pairs")!==prev){ location.reload(); return; } }   // column order is baked at load: rebuild the page
   localStorage.setItem("nukestation.cfg", JSON.stringify(CFG));
   const sec = Math.max(2, parseInt(document.getElementById("cfgSec").value)||5);
   if(sec !== NS.refreshSec) NS.send({type:"refresh", sec});
@@ -4522,7 +4568,7 @@ function buildTable(idsOpt){
       [["delta","trade delta % (e.g. 60)"],["astk","anchor stock price"],["afx","anchor fx (stock ccy per USD; 1 if same ccy)"],["abond","anchor bond price"],["cstk","current stock - follows live last until you type"],["cfx","current fx - follows live last until you type"]].map(([k,t])=>
         `<td class="gc uinp" data-band="cbnuke"><input class="sprd hnv" data-hn="${k}" data-id="${id}" autocomplete="off" inputmode="decimal" placeholder="&#8212;" title="${t}" onchange="hnChanged(this)"></td>`).join("") +
       `<td data-c="hn_dn" data-band="cbnuke" class="rowclick hnc" title="dollar-neutral bond price = A.Bond + delta x (parity_c - parity_a), parity = CR x stock/fx (CR = 100 x fixed FX / CP from refdata)"></td>` +
-      ["idb_btime","idb_bref","idb_bid","idb_atime","idb_aref","idb_ask","idb_my_bid","idb_my_ask","idb_ref","idb_gap_b","idb_gap_a","idb_gap","idb_flag"].map((k,i)=>`<td data-c="${k}" data-band="idb" class="rowclick${i===0?" grp bfirst":""}${["idb_bid","idb_bref","idb_btime","idb_ask","idb_aref","idb_atime"].includes(k)?" ibq":(["idb_ref","idb_my_bid","idb_my_ask"].includes(k)?" imy":" ichk")}"></td>`).join("") +
+      idbOrder().map((k,i)=>`<td data-c="${k}" data-band="idb" class="rowclick${i===0?" grp bfirst":""}${({idb_bid:" ib-bid",idb_bref:" ib-bidq",idb_btime:" ib-bidq",idb_ask:" ib-ofr",idb_aref:" ib-ofrq",idb_atime:" ib-ofrq",idb_ref:" ib-refu",idb_my_bid:" my-bid",idb_my_ask:" my-ofr"})[k]||" ichk"}"></td>`).join("") +
       RES_COLS.slice(5,10).map((c,i)=>
         `<td data-c="${c}" data-band="live" class="rowclick gL${i===0?" grp bfirst":""}"></td>`).join("") +
       RES_COLS.slice(10,15).map((c,i)=>
@@ -4561,7 +4607,7 @@ function buildTable(idsOpt){
     .finally(()=>{ applyState(); applyNuke(); applyRfx(); if(typeof hnPaintAll==="function") hnPaintAll(); });   // and again after refdata (never skipped)
 }
 
-const BAND_FIRST = new Set(["n_bid","bw_dvb","x_bid","f_call","v_iv","dc_notl","cn_start","idb_btime",
+const BAND_FIRST = new Set(["n_bid","bw_dvb","x_bid","f_call","v_iv","dc_notl","cn_start",idbOrder()[0],
   "live_bid","eod_bid","t_m","stk_last","cf_last","fx_last"]);
 const BANDS = {
   model:{label:"model (last nuke)",span:9},
@@ -5014,7 +5060,7 @@ function updParity(tr){
 }
 /* IDB QUOTES mirror: values computed by the Lagrange IDB tab (same origin); no math here */
 const IDB_MIRROR = {};   // secId -> row from /api/idb/grid
-const IDB_KEYS = ["idb_btime","idb_bref","idb_bid","idb_atime","idb_aref","idb_ask","idb_my_bid","idb_my_ask","idb_ref","idb_gap_b","idb_gap_a","idb_gap","idb_flag"];
+const IDB_KEYS = idbOrder();
 function idbPaintRow(tr){
   const sid = Number(tr.dataset.id); const r = IDB_MIRROR[sid];
   const set = (k, v, html) => { const c = tr.querySelector('td[data-c="'+k+'"]'); if(!c) return; if(html) c.innerHTML = v; else c.textContent = v; };
@@ -5154,7 +5200,7 @@ function hnPaintRow(tr){
     if(document.activeElement!==i) i.value=(v[k]===undefined?"":v[k]); i.classList.remove("hn-live"); if(k==="cstk"||k==="cfx") i.title=(k==="cstk"?"current stock":"current fx")+" - typed override (clear or Delete to follow live again)"; return hnNum(v[k]); };
   const cr=hnConvRatio(tr);
   const out=hnDollarNeutral(get("delta"),get("astk"),get("afx"),get("abond"),get("cstk"),get("cfx"),cr);
-  const td=tr.querySelector('td[data-c="hn_dn"]'); if(td){ td.textContent=isFinite(out)?out.toFixed(3):"";
+  const td=tr.querySelector('td[data-c="hn_dn"]'); if(td){ td.textContent=isFinite(out)?out.toFixed(4):"";
     const a=get("astk"),af=get("afx"),c=get("cstk"),cf=get("cfx");
     td.title=isFinite(cr)?("$-neutral = A.Bond + delta x (parity_c - parity_a); CR "+cr.toFixed(4)+" per 100"+(isFinite(a*af*c*cf)?" ; parity_a "+(cr*a/af).toFixed(3)+" -> parity_c "+(cr*c/cf).toFixed(3):"")):"needs conversion price (refdata) to compute parity"; }
 }
@@ -6406,7 +6452,7 @@ if __name__ == "__main__":
     # NOTE: reload must stay OFF (single process) so the in-memory
     # WebSocket hub works, and so the browser only opens once.
     print("=" * 62)
-    print("  NUKE STATION  BUILD borrow.b34  \u00b7  %s"
+    print("  NUKE STATION  BUILD borrow.b37  \u00b7  %s"
           % os.path.abspath(__file__))
     print("  port %s \u00b7 if this banner is missing, an OLD file is\n  running \u2014 kill that process first." % PORT)
     print("=" * 62)
