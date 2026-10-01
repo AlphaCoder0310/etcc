@@ -2332,7 +2332,136 @@ BBG_TWAP_OV = {"start": os.environ.get("BBG_TWAP_OV_START", "TWAP_START_TIME"),
 BBG_TWAP_INTERVAL = os.environ.get("BBG_TWAP_INTERVAL", "1S")     # 1-second benchmark by default
 
 
+BBG_TZ_OFFSET = {  # exchange code -> UTC offset hours (fallback when zoneinfo/tzdata is unavailable)
+    "KP": 9, "KQ": 9, "JT": 9, "JO": 9, "HK": 8, "TT": 8, "CG": 8, "CS": 8, "SP": 8, "MK": 8, "PM": 8,
+    "TB": 7, "IJ": 7, "IS": 5.5, "IB": 5.5, "AT": 10, "NZ": 12, "UN": -4, "UW": -4, "UA": -4, "UP": -4,
+    "CN": -4, "CV": -4, "LN": 1, "FP": 2, "GY": 2, "IM": 2, "NA": 2, "SW": 2, "SS": 2, "SM": 2, "BB": 2}
+BBG_TZ_NAME = {"KP": "Asia/Seoul", "KQ": "Asia/Seoul", "JT": "Asia/Tokyo", "HK": "Asia/Hong_Kong", "TT": "Asia/Taipei",
+               "CG": "Asia/Shanghai", "CS": "Asia/Shanghai", "SP": "Asia/Singapore", "MK": "Asia/Kuala_Lumpur",
+               "TB": "Asia/Bangkok", "IJ": "Asia/Jakarta", "IS": "Asia/Kolkata", "IB": "Asia/Kolkata", "AT": "Australia/Sydney",
+               "NZ": "Pacific/Auckland", "UN": "America/New_York", "UW": "America/New_York", "UA": "America/New_York",
+               "CN": "America/Toronto", "LN": "Europe/London", "FP": "Europe/Paris", "GY": "Europe/Berlin", "IM": "Europe/Rome",
+               "NA": "Europe/Amsterdam", "SW": "Europe/Zurich", "SS": "Europe/Stockholm", "SM": "Europe/Madrid"}
+
+
+def _bbg_code(ticker):
+    p = str(ticker or "").split()
+    return p[1].upper() if len(p) >= 2 else ""
+
+
+def _utc_to_local(dt_utc, code):
+    """datetime (naive UTC) -> exchange-local datetime; zoneinfo when available, fixed offset otherwise."""
+    name = BBG_TZ_NAME.get(code)
+    if name:
+        try:
+            from zoneinfo import ZoneInfo
+            from datetime import timezone
+            return dt_utc.replace(tzinfo=timezone.utc).astimezone(ZoneInfo(name)).replace(tzinfo=None)
+        except Exception:
+            pass
+    return dt_utc + timedelta(hours=BBG_TZ_OFFSET.get(code, 0))
+
+
+def _snap_edges(ticks, start_hms, end_hms):
+    """ticks: iterable of exchange-local 'HH:MM:SS' trade times (any order).
+    Returns (first trade >= start, last trade <= end) or (None, None)."""
+    def sec(t):
+        h, m, s = [int(x) for x in str(t).split(":")[:3]]
+        return h * 3600 + m * 60 + s
+    s0, e0 = sec(start_hms), sec(end_hms)
+    inside = sorted(sec(t) for t in ticks if s0 <= sec(t) <= e0)
+    if not inside:
+        return None, None
+    f = lambda v: "%02d:%02d:%02d" % (v // 3600, (v % 3600) // 60, v % 60)
+    return f(inside[0]), f(inside[-1])
+
+
+def bbg_window_edges(ticker, day, start_hms, end_hms):
+    """What the Bloomberg VWAP/TWAP screen does with a typed window: move the
+    start to the first trade at/after it and the end to the last trade at/before
+    it. Uses TRADE ticks around each edge (xbbg bdtick, then raw blpapi)."""
+    code = _bbg_code(ticker)
+    d = datetime.strptime(day, "%Y-%m-%d")
+    s_dt = datetime.combine(d.date(), datetime.strptime(start_hms, "%H:%M:%S").time())
+    e_dt = datetime.combine(d.date(), datetime.strptime(end_hms, "%H:%M:%S").time())
+    pad = timedelta(minutes=10)
+    ticks = []
+    try:
+        from xbbg import blp
+        for a, b in ((s_dt, min(s_dt + pad, e_dt)), (max(e_dt - pad, s_dt), e_dt)):
+            df = blp.bdtick(ticker, dt=day, time_range=(a.strftime("%H:%M:%S"), b.strftime("%H:%M:%S")), types=["TRADE"])
+            if df is not None and len(df):
+                ticks += [ts.strftime("%H:%M:%S") for ts in df.index]
+        return _snap_edges(ticks, start_hms, end_hms)
+    except ImportError:
+        pass
+    import blpapi
+    sess = blpapi.Session()
+    if not sess.start() or not sess.openService("//blp/refdata"):
+        raise RuntimeError("Bloomberg session could not start")
+    try:
+        svc = sess.getService("//blp/refdata")
+        off = timedelta(hours=BBG_TZ_OFFSET.get(code, 0))
+        for a, b in ((s_dt, min(s_dt + pad, e_dt)), (max(e_dt - pad, s_dt), e_dt)):
+            req = svc.createRequest("IntradayTickRequest")
+            req.set("security", ticker); req.getElement("eventTypes").appendValue("TRADE")
+            ua, ub = a - off, b - off                                        # local -> UTC for the request
+            req.set("startDateTime", blpapi.datetime.Datetime(ua.year, ua.month, ua.day, ua.hour, ua.minute, ua.second))
+            req.set("endDateTime", blpapi.datetime.Datetime(ub.year, ub.month, ub.day, ub.hour, ub.minute, ub.second))
+            sess.sendRequest(req)
+            while True:
+                ev = sess.nextEvent(5000)
+                for msg in ev:
+                    if msg.hasElement("tickData"):
+                        for tk in msg.getElement("tickData").getElement("tickData").values():
+                            t = tk.getElementAsDatetime("time")
+                            lt = _utc_to_local(datetime(t.year, t.month, t.day, t.hour, t.minute, t.second), code)
+                            ticks.append(lt.strftime("%H:%M:%S"))
+                if ev.eventType() == blpapi.Event.RESPONSE:
+                    break
+        return _snap_edges(ticks, start_hms, end_hms)
+    finally:
+        sess.stop()
+
+
+# ---- 3. TWAP: configured field first, then known candidates; the winner is remembered ----
+BBG_TWAP_CANDIDATES = [
+    ("TWAP", {"start": "TWAP_START_TIME", "end": "TWAP_END_TIME", "date": "TWAP_DT", "interval": "TWAP_INTERVAL"}),
+    ("TWAP", {"start": "VWAP_START_TIME", "end": "VWAP_END_TIME", "date": "VWAP_DT", "interval": ""}),
+    ("TIME_WEIGHTED_AVG_PX", {"start": "VWAP_START_TIME", "end": "VWAP_END_TIME", "date": "VWAP_DT", "interval": ""}),
+    ("EQY_TWAP", {"start": "VWAP_START_TIME", "end": "VWAP_END_TIME", "date": "VWAP_DT", "interval": ""}),
+]
+_BBG_TWAP_WINNER = {}
+
+
 def bbg_twap_field(ticker, day, start, end):
+    """Bloomberg-computed TWAP: the configured field/overrides first, then the
+    candidate list; the first combination that returns a number is cached.
+    Bloomberg's own error text is kept when nothing returns a value."""
+    combos = [(BBG_TWAP_FIELD, dict(BBG_TWAP_OV))]
+    combos += [c for c in BBG_TWAP_CANDIDATES if (c[0], c[1].get("start")) != (BBG_TWAP_FIELD, BBG_TWAP_OV.get("start"))]
+    if _BBG_TWAP_WINNER:
+        combos.insert(0, (_BBG_TWAP_WINNER["field"], _BBG_TWAP_WINNER["ov"]))
+    last_status, tried = "no value returned", []
+    for field, names in combos:
+        ov = {names["start"]: _hms(start), names["end"]: _hms(end), names["date"]: day.replace("-", "")}
+        if names.get("interval") and BBG_TWAP_INTERVAL:
+            ov[names["interval"]] = BBG_TWAP_INTERVAL
+        try:
+            r = _bbg_ref(ticker, [field], ov)
+        except Exception as exc:
+            raise
+        v = r.get("values", {}).get(field)
+        tried.append(field + "/" + names["start"])
+        if v is not None and v == v:
+            _BBG_TWAP_WINNER.update({"field": field, "ov": names})
+            return {"twap": v, "status": "ok", "field": field, "overrides": ov}
+        last_status = r.get("status") or "no value returned"
+    return {"twap": None, "status": last_status + " (tried " + ", ".join(tried) + " - run /api/twap/fields?q=TWAP to pin the names)",
+            "field": None, "overrides": {}}
+
+
+def _bbg_twap_field_legacy(ticker, day, start, end):
     """Bloomberg-computed TWAP (1-second benchmark by default) via a
     ReferenceDataRequest with start/end/date/interval overrides."""
     ov = {BBG_TWAP_OV["start"]: _hms(start), BBG_TWAP_OV["end"]: _hms(end),
@@ -2530,6 +2659,25 @@ async def api_twap(req: TwapReq):
         return {"ok": False, "ticker": tk, "error": "end must be after start"}
     tmo = float(os.environ.get("BBG_TIMEOUT_S", "25"))
     now = datetime.now().timestamp()
+    # 0) snap the typed window to actual trades, as the Bloomberg screen does (09:30 -> 09:30:06, 10:30 -> 10:29:47)
+    snap_note = ""
+    ekey = "E|%s|%s|%s|%s" % (tk, day, s_, e_)
+    eent = _BBG_CACHE.get(ekey)
+    try:
+        if eent and now - eent["ts"] < 60:
+            fe, le = eent["v"]
+        else:
+            fe, le = await asyncio.wait_for(run_in_threadpool(bbg_window_edges, tk, day, s_, e_), timeout=tmo)
+            _BBG_CACHE[ekey] = {"ts": now, "v": (fe, le)}
+        if fe is None:
+            return {"ok": False, "ticker": tk, "error": "no trades between %s and %s" % (s_[:5], e_[:5])}
+        if (fe, le) != (s_, e_):
+            snap_note = "window snapped to trades %s-%s" % (fe, le)
+        s_, e_ = fe, le
+    except asyncio.TimeoutError:
+        snap_note = "edge snap timed out - using typed times"
+    except Exception as exc:
+        snap_note = "edge snap n/a (%s) - using typed times" % str(exc)[:60]
     # 1) Bloomberg-computed VWAP (the number of record)
     key = "V|%s|%s|%s|%s" % (tk, day, s_, e_)
     ent = _BBG_CACHE.get(key)
@@ -2537,7 +2685,7 @@ async def api_twap(req: TwapReq):
         if ent and now - ent["ts"] < 60:
             vw = ent["v"]
         else:
-            vw = await asyncio.wait_for(run_in_threadpool(bbg_vwap_field, tk, day, req.start, req.end), timeout=tmo)
+            vw = await asyncio.wait_for(run_in_threadpool(bbg_vwap_field, tk, day, s_, e_), timeout=tmo)
             _BBG_CACHE[key] = {"ts": now, "v": vw}
     except asyncio.TimeoutError:
         return {"ok": False, "ticker": tk, "error": "Bloomberg timed out"}
@@ -2545,7 +2693,7 @@ async def api_twap(req: TwapReq):
         return {"ok": False, "ticker": tk, "error": str(exc)[:200]}
     r = {"ok": vw.get("vwap") is not None, "ticker": tk, "day": day, "vwap": vw.get("vwap"),
          "volume": vw.get("volume"), "status": vw.get("status", ""), "vwap_src": "EQY_WEIGHTED_AVG_PX",
-         "twap": None, "bars": 0}
+         "twap": None, "bars": 0, "start_eff": s_, "end_eff": e_, "snap_note": snap_note}
     if not r["ok"]:
         r["error"] = vw.get("status") or "no value returned"
     # 2) TWAP: Bloomberg-computed (1-second benchmark by default), cached per window; never blocks the VWAP
@@ -2555,9 +2703,9 @@ async def api_twap(req: TwapReq):
         if tent and now - tent["ts"] < 60:
             tw = tent["v"]
         else:
-            tw = await asyncio.wait_for(run_in_threadpool(bbg_twap_field, tk, day, req.start, req.end), timeout=tmo)
+            tw = await asyncio.wait_for(run_in_threadpool(bbg_twap_field, tk, day, s_, e_), timeout=tmo)
             _BBG_CACHE[tkey] = {"ts": now, "v": tw}
-        r["twap"] = tw.get("twap"); r["twap_src"] = tw.get("field"); r["twap_interval"] = BBG_TWAP_INTERVAL
+        r["twap"] = tw.get("twap"); r["twap_src"] = tw.get("field"); r["twap_interval"] = (tw.get("overrides") or {}).get(BBG_TWAP_OV.get("interval", ""), "") or BBG_TWAP_INTERVAL
         if r["twap"] is None:
             r["twap_note"] = "twap: " + (tw.get("status") or "no value returned")
     except asyncio.TimeoutError:
@@ -3101,8 +3249,8 @@ input.bwv.bwred{background:#fde7e5 !important;border-color:#b3261e !important;co
 #tbl.hb-cbnuke .bfirst[data-band="cbnuke"]{font-size:0;padding:0;width:14px;min-width:14px;max-width:14px;background:#f3f2ef;border-left:1px solid #d8d4cc}
 #tbl.hb-cbnuke .bfirst[data-band="cbnuke"] input{display:none}
 .cn{background:#e3eef9;color:#1e3a6e}td[data-band="cbnuke"].cnc{background:#eef3fb;font-weight:600}td[data-band="cbnuke"].cnt{background:#f4f7fb;font-size:9.5px;color:#555;text-align:left}
-input.cnv{width:46px;text-align:center}td[data-c="cn_tk"].cn-err{color:#b91c1c}input.cnv.cn-bad{background:#fee2e2;color:#7f1d1d}
-input.hnv{width:60px;text-align:right}input.hnv.hn-live{color:#1e3a6e;font-style:italic}td[data-band="cbnuke"].hnc{background:#dcfce7;font-weight:700}
+input.cnv{width:62px;text-align:center}td[data-c="cn_tk"].cn-err{color:#b91c1c}input.cnv.cn-bad{background:#fee2e2;color:#7f1d1d}
+input.hnv{width:60px;text-align:right}input.hnv.hn-live{color:#1e3a6e;font-style:italic}input.hnv:not(.hn-live):not(:placeholder-shown){color:#111;font-style:normal}td[data-band="cbnuke"].hnc{background:#dcfce7;font-weight:700}
 #tbl.hb-idb th[data-band="idb"]:not(.bfirst),#tbl.hb-idb td[data-band="idb"]:not(.bfirst){display:none}
 #tbl.hb-idb .bfirst[data-band="idb"]{font-size:0;padding:0;width:14px;min-width:14px;max-width:14px;background:#f3f2ef;border-left:1px solid #d8d4cc}
 .ib{background:#dcd3f0;color:#3b2a6e}td[data-band="idb"].ibq{background:#f3effa}td[data-band="idb"].imy{background:#eef7f0;font-weight:600}td[data-band="idb"].ichk{background:#f6f6f6}
@@ -3211,7 +3359,7 @@ h2{font-size:10.5px;font-weight:700;color:var(--muted);margin:0;
 <body>
 <header>
   <h1>CB nuke station</h1>
-  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b31</b></span>
+  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b33</b></span>
   <span id="conn" class="conn warn" title="Connection">&#9679;</span>
   <span id="online" class="sub"></span>
   <div class="tabs">
@@ -4290,14 +4438,14 @@ function buildTable(idsOpt){
       `<td class="gc uinp" data-band="dcalc"><input class="gridcell dcv" data-dc="delta" data-id="${id}" data-row="${ri}" data-col="7" oninput="dcChg(this)" inputmode="decimal" autocomplete="off" placeholder="&#8212;" title="delta % (e.g. 56)"></td>` +
       `<td data-c="dc_shares" data-band="dcalc" class="rowclick" title="notional x (ovdUndFx/ovdCbFx) x delta% x PARITY% / ovdSpot"></td>` +
       `<td data-c="dc_usd" data-band="dcalc" class="rowclick" title="notional x delta% x PARITY% / ovdCbFx"></td>` +
-      `<td class="gc uinp grp bfirst" data-band="cbnuke"><input class="gridcell cnv" data-cn="start" data-id="${id}" placeholder="09:00" autocomplete="off" title="window start, exchange local HH:MM" onchange="cnChanged(this)"></td>` +
-      `<td class="gc uinp" data-band="cbnuke"><input class="gridcell cnv" data-cn="end" data-id="${id}" placeholder="10:00" autocomplete="off" title="window end (exclusive), exchange local HH:MM" onchange="cnChanged(this)"></td>` +
+      `<td class="gc uinp grp bfirst" data-band="cbnuke"><input class="sprd cnv" data-cn="start" data-id="${id}" placeholder="09:00" autocomplete="off" title="window start, exchange local HH:MM" onchange="cnChanged(this)"></td>` +
+      `<td class="gc uinp" data-band="cbnuke"><input class="sprd cnv" data-cn="end" data-id="${id}" placeholder="10:00" autocomplete="off" title="window end (exclusive), exchange local HH:MM" onchange="cnChanged(this)"></td>` +
       `<td data-c="cn_twap" data-band="cbnuke" class="rowclick cnc" title="mean of 1-min bar closes in [start,end)"></td>` +
       `<td data-c="cn_vwap" data-band="cbnuke" class="rowclick cnc" title="Bloomberg-computed VWAP: EQY_WEIGHTED_AVG_PX with VWAP_START_TIME / VWAP_END_TIME / VWAP_DT overrides"></td>` +
       `<td data-c="cn_vol" data-band="cbnuke" class="rowclick cnc" title="traded volume in the window"></td>` +
       `<td data-c="cn_tk" data-band="cbnuke" class="rowclick cnt" title="Bloomberg ticker derived from the RIC"></td>` +
       [["delta","trade delta % (e.g. 60)"],["astk","anchor stock price"],["afx","anchor fx (stock ccy per USD; 1 if same ccy)"],["abond","anchor bond price"],["cstk","current stock - follows live last until you type"],["cfx","current fx - follows live last until you type"]].map(([k,t])=>
-        `<td class="gc uinp" data-band="cbnuke"><input class="gridcell hnv" data-hn="${k}" data-id="${id}" autocomplete="off" inputmode="decimal" placeholder="&#8212;" title="${t}" onchange="hnChanged(this)"></td>`).join("") +
+        `<td class="gc uinp" data-band="cbnuke"><input class="sprd hnv" data-hn="${k}" data-id="${id}" autocomplete="off" inputmode="decimal" placeholder="&#8212;" title="${t}" onchange="hnChanged(this)"></td>`).join("") +
       `<td data-c="hn_dn" data-band="cbnuke" class="rowclick hnc" title="dollar-neutral bond price = A.Bond x [1 + delta x ((C.Stock/C.FX)/(A.Stock/A.FX) - 1)]"></td>` +
       ["idb_btime","idb_bref","idb_bid","idb_atime","idb_aref","idb_ask","idb_my_bid","idb_my_ask","idb_ref","idb_gap_b","idb_gap_a","idb_gap","idb_flag"].map((k,i)=>`<td data-c="${k}" data-band="idb" class="rowclick${i===0?" grp bfirst":""}${["idb_bid","idb_bref","idb_btime","idb_ask","idb_aref","idb_atime"].includes(k)?" ibq":(["idb_ref","idb_my_bid","idb_my_ask"].includes(k)?" imy":" ichk")}"></td>`).join("") +
       RES_COLS.slice(5,10).map((c,i)=>
@@ -4875,9 +5023,12 @@ async function cnChanged(el){
   let j; try{ j=await (await fetch(base+"/api/twap",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({sec_id:String(sid),ric,start:st,end:en})})).json(); }catch(e){ j={ok:false,error:String(e)}; }
   const tk=tr.querySelector('td[data-c="cn_tk"]'); if(tk && j.ticker){ tk.textContent=j.ticker; tk.classList.remove("cn-err"); }
   if(!j.ok){ set("cn_twap",""); set("cn_vwap",""); set("cn_vol",""); if(tk){ tk.textContent=(j.ticker?j.ticker+" \u00b7 ":"")+(j.error||j.status||"error"); tk.classList.add("cn-err"); } return; }
+  if(j.start_eff && j.end_eff){ const si=tr.querySelector('input[data-cn="start"]'), ei=tr.querySelector('input[data-cn="end"]');
+    if(si && document.activeElement!==si){ si.value=j.start_eff; si.defaultValue=j.start_eff; CN[sid].start=j.start_eff; }
+    if(ei && document.activeElement!==ei){ ei.value=j.end_eff; ei.defaultValue=j.end_eff; CN[sid].end=j.end_eff; } }
   set("cn_twap", j.twap==null?"":Number(j.twap).toFixed(4)); set("cn_vwap", j.vwap==null?"":Number(j.vwap).toFixed(4));
   set("cn_vol", j.volume==null?"":Number(j.volume).toLocaleString("en-US",{maximumFractionDigits:0}));
-  if(tk){ tk.textContent=j.ticker+" \u00b7 VWAP: BBG"+(j.twap!=null?" \u00b7 TWAP: BBG "+(j.twap_interval||""):(j.twap_note?" \u00b7 "+j.twap_note:""))+(j.status&&j.status!=="ok"?" \u00b7 "+j.status:""); }
+  if(tk){ tk.textContent=j.ticker+" \u00b7 VWAP: BBG"+(j.twap!=null?" \u00b7 TWAP: "+(j.twap_src||"BBG")+(j.twap_interval?" "+j.twap_interval:""):(j.twap_note?" \u00b7 "+j.twap_note:""))+(j.snap_note?" \u00b7 "+j.snap_note:"")+(j.status&&j.status!=="ok"?" \u00b7 "+j.status:""); tk.title=tk.textContent; }
 }
 (function(){ const tbl=document.getElementById("tbl"); if(!tbl) return;
   const inputsOf=tr=>tr.querySelectorAll("input[data-cn]");
@@ -4888,13 +5039,13 @@ async function cnChanged(el){
       if(e.key==="Enter"||e.key==="ArrowDown"||e.key==="ArrowUp"){ e.preventDefault(); if(e.key!=="ArrowUp") el.dispatchEvent(new Event("change")); const nr=rowOf(tr,e.key==="ArrowUp"?-1:1); const nx=nr&&nr.querySelector('input[data-hn="'+k+'"]'); if(nx){ nx.focus(); nx.select(); } return; }
       if(e.key==="Tab"){ e.preventDefault(); el.dispatchEvent(new Event("change")); let nx=null; if(!e.shiftKey){ nx=idx<HN_ORDER.length-1?tr.querySelector('input[data-hn="'+HN_ORDER[idx+1]+'"]'):(rowOf(tr,1)&&rowOf(tr,1).querySelector('input[data-hn="delta"]')); } else { nx=idx>0?tr.querySelector('input[data-hn="'+HN_ORDER[idx-1]+'"]'):(rowOf(tr,-1)&&rowOf(tr,-1).querySelector('input[data-hn="cfx"]')); } if(nx){ nx.focus(); nx.select(); } return; }
       if(e.key==="Escape"){ el.value=el.defaultValue||""; el.classList.remove("cn-bad"); el.blur(); return; }
+      if((e.key==="Delete") && (k==="cstk"||k==="cfx") && el.value!=="" && !el.classList.contains("hn-live")){ e.preventDefault(); el.value=""; el.dispatchEvent(new Event("change")); el.select(); return; }   // typed leg -> back to live
       return; }
     const which=el.dataset.cn;
     if(e.key==="Enter"||e.key==="ArrowDown"||e.key==="ArrowUp"){ e.preventDefault(); if(e.key!=="ArrowUp") el.dispatchEvent(new Event("change")); const nr=rowOf(tr,e.key==="ArrowUp"?-1:1); const nx=nr&&nr.querySelector('input[data-cn="'+which+'"]'); if(nx){ nx.focus(); nx.select(); } return; }
     if(e.key==="Tab"){ e.preventDefault(); el.dispatchEvent(new Event("change")); let nx; if(!e.shiftKey){ nx=which==="start"?tr.querySelector('input[data-cn="end"]'):(rowOf(tr,1)||{}).querySelector&&rowOf(tr,1).querySelector('input[data-cn="start"]'); } else { nx=which==="end"?tr.querySelector('input[data-cn="start"]'):(rowOf(tr,-1)&&rowOf(tr,-1).querySelector('input[data-cn="end"]')); } if(nx){ nx.focus(); nx.select(); } return; }
     if(e.key==="Escape"){ el.value=el.defaultValue||""; el.classList.remove("cn-bad"); el.blur(); return; }
   }, true);
-  tbl.addEventListener("focusin", e=>{ const el=e.target; if(el&&el.dataset&&(el.dataset.cn||el.dataset.hn)) setTimeout(()=>el.select(),0); }, true);   // typing replaces
   tbl.addEventListener("paste", e=>{ const el=e.target; if(!(el&&el.dataset&&el.dataset.cn)) return; const txt=(e.clipboardData||window.clipboardData).getData("text")||""; const parts=txt.split(/[\t,;]| - |-/).map(x=>x.trim()).filter(Boolean); if(parts.length<2) return; e.preventDefault();
     const tr=el.closest("tr"); const a=tr.querySelector('input[data-cn="start"]'), b=tr.querySelector('input[data-cn="end"]'); if(a&&b){ a.value=parts[0]; b.value=parts[1]; a.dispatchEvent(new Event("change")); b.dispatchEvent(new Event("change")); } }, true);
 })();
@@ -4916,8 +5067,8 @@ function hnDollarNeutral(delta, astk, afx, abond, cstk, cfx){
 function hnPaintRow(tr){
   const sid=Number(tr.dataset.id); const v=HN[sid]||{};
   const get=k=>{ const i=tr.querySelector('input[data-hn="'+k+'"]'); if(!i) return NaN;
-    if((k==="cstk"||k==="cfx") && (v[k]===undefined||v[k]==="")){ const lv=hnLive(tr,k); if(document.activeElement!==i){ i.value=isFinite(lv)?(k==="cfx"?lv.toFixed(4):String(lv)):""; i.classList.add("hn-live"); } return lv; }
-    if(document.activeElement!==i) i.value=(v[k]===undefined?"":v[k]); i.classList.remove("hn-live"); return hnNum(v[k]); };
+    if((k==="cstk"||k==="cfx") && (v[k]===undefined||v[k]==="")){ const lv=hnLive(tr,k); if(document.activeElement!==i && !i.classList.contains("cn-bad")){ i.value=isFinite(lv)?(k==="cfx"?lv.toFixed(4):String(lv)):""; i.defaultValue=i.value; i.classList.add("hn-live"); i.title=(k==="cstk"?"current stock":"current fx")+" - following live (type to override; clear or Delete to follow live again)"; } return lv; }
+    if(document.activeElement!==i) i.value=(v[k]===undefined?"":v[k]); i.classList.remove("hn-live"); if(k==="cstk"||k==="cfx") i.title=(k==="cstk"?"current stock":"current fx")+" - typed override (clear or Delete to follow live again)"; return hnNum(v[k]); };
   const out=hnDollarNeutral(get("delta"),get("astk"),get("afx"),get("abond"),get("cstk"),get("cfx"));
   const td=tr.querySelector('td[data-c="hn_dn"]'); if(td) td.textContent=isFinite(out)?out.toFixed(3):"";
 }
@@ -4929,6 +5080,7 @@ function hnChanged(el){
   if(raw===""){ delete HN[sid][el.dataset.hn]; } else { HN[sid][el.dataset.hn]=String(n); el.value=String(n); }
   el.defaultValue=el.value;
   hnPaintRow(tr);
+  if(raw==="" && (el.dataset.hn==="cstk"||el.dataset.hn==="cfx")){ const lv=hnLive(tr,el.dataset.hn); el.value=isFinite(lv)?(el.dataset.hn==="cfx"?lv.toFixed(4):String(lv)):""; el.defaultValue=el.value; el.classList.add("hn-live"); }   // cleared -> show live at once, even while focused
 }
 function hnPaintAll(){ document.querySelectorAll("#tbl tbody tr[data-id]").forEach(hnPaintRow); }
 function cnPaintAll(){ document.querySelectorAll("#tbl tbody tr[data-id]").forEach(tr=>{ cnPaintTicker(tr); const sid=Number(tr.dataset.id); const v=CN[sid]||{}; tr.querySelectorAll("input[data-cn]").forEach(i=>{ if(document.activeElement!==i) i.value=v[i.dataset.cn]||""; }); }); hnPaintAll(); }
@@ -6168,7 +6320,7 @@ if __name__ == "__main__":
     # NOTE: reload must stay OFF (single process) so the in-memory
     # WebSocket hub works, and so the browser only opens once.
     print("=" * 62)
-    print("  NUKE STATION  BUILD borrow.b31  \u00b7  %s"
+    print("  NUKE STATION  BUILD borrow.b33  \u00b7  %s"
           % os.path.abspath(__file__))
     print("  port %s \u00b7 if this banner is missing, an OLD file is\n  running \u2014 kill that process first." % PORT)
     print("=" * 62)
