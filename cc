@@ -3635,7 +3635,8 @@ input.bwv.bwred{background:#fde7e5 !important;border-color:#b3261e !important;co
 #tbl.hb-cbnuke .bfirst[data-band="cbnuke"] input{display:none}
 .cn{background:#e3eef9;color:#1e3a6e}td[data-band="cbnuke"].cnc{background:#eef3fb;font-weight:600}td[data-band="cbnuke"].cnt{background:#f4f7fb;font-size:9.5px;color:#555;text-align:left}
 input.cnv{width:62px;text-align:center}td[data-c="cn_tk"].cn-err{color:#b91c1c}input.cnv.cn-bad{background:#fee2e2;color:#7f1d1d}
-td.isincell{white-space:nowrap}td.isincell input.isinv{width:104px;text-align:left;background:#fff3cd;text-transform:uppercase}td[data-fl="f_trig"]{color:#6b21a8;font-weight:600}
+td.isincell{white-space:nowrap;min-width:110px}td.isincell input.isinv{text-align:left;text-transform:uppercase;color:#7a5a00}td.isincell input.isinv:not(:placeholder-shown){background:#fff3cd}
+td.isincell span.isin-db{display:inline-block;padding:2px 7px;color:var(--muted);font:11.5px var(--mono)}td[data-fl="f_trig"]{color:#6b21a8;font-weight:600}
 input.hnv{width:60px;text-align:right}input.hnv.hn-live{color:#1e3a6e;font-style:italic}input.hnv:not(.hn-live):not(:placeholder-shown){color:#111;font-style:normal}td[data-band="cbnuke"].hnc{background:#dcfce7;font-weight:700}
 #tbl.hb-idb th[data-band="idb"]:not(.bfirst),#tbl.hb-idb td[data-band="idb"]:not(.bfirst){display:none}
 #tbl.hb-idb .bfirst[data-band="idb"]{font-size:0;padding:0;width:14px;min-width:14px;max-width:14px;background:#f3f2ef;border-left:1px solid #d8d4cc}
@@ -3761,7 +3762,7 @@ h2{font-size:10.5px;font-weight:700;color:var(--muted);margin:0;
 <body>
 <header>
   <h1>CB nuke station</h1>
-  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b47</b></span>
+  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b48</b></span>
   <span id="conn" class="conn warn" title="Connection">&#9679;</span>
   <span id="online" class="sub"></span>
   <div class="tabs">
@@ -4814,8 +4815,8 @@ function buildTable(idsOpt){
          data-id="${id}" onchange="sprdChanged(this)" autocomplete="off"
          placeholder="&#8212;" style="width:64px"></td>` +
       `<td class="ref rowclick" data-r="ric"></td>` +
-      `<td class="ref isincell" data-r="isin"><span class="isin-db"></span>` +
-      `<input class="sprd isinv" data-u="isin_manual" data-id="${id}" placeholder="ISIN" maxlength="12" autocomplete="off" ` +
+      `<td class="gc uinp isincell" data-r="isin"><span class="isin-db" style="display:none"></span>` +
+      `<input class="sprd isinv" data-u="isin_manual" data-id="${id}" placeholder="ISIN" maxlength="12" autocomplete="off" spellcheck="false" ` +
       `onchange="isinChanged(this)" title="no ISIN in the database - type it here; saved for everyone and used for the Bloomberg dates until the database provides one"></td>` +
       `<td class="ref rowclick" data-r="sec_fx"></td>` +
       `<td class="gc uinp"><input class="gridcell" data-u="und_fx"
@@ -5699,7 +5700,7 @@ function paintRefRow(tr, ref){
     let v;
     if(td.dataset.r === "isin"){
       const sp=td.querySelector(".isin-db"), inp=td.querySelector("input.isinv"); const db=String(ref.isin||"").trim();
-      if(sp) sp.textContent = db;
+      if(sp){ sp.textContent = db; sp.style.display = db ? "" : "none"; }
       if(inp){ inp.style.display = db ? "none" : ""; if(!db){ const sid=Number(tr.dataset.id); const mv=((NS.rows||{})[sid]||{}).isin_manual; if(mv!==undefined && document.activeElement!==inp) inp.value=mv||""; } }
       td.title = db ? "ISIN from the database" : (inp&&inp.value ? "manual ISIN (database has none)" : "no ISIN in the database - type it here");
       return;
@@ -6887,7 +6888,7 @@ if __name__ == "__main__":
     # NOTE: reload must stay OFF (single process) so the in-memory
     # WebSocket hub works, and so the browser only opens once.
     print("=" * 62)
-    print("  NUKE STATION  BUILD borrow.b47  \u00b7  %s"
+    print("  NUKE STATION  BUILD borrow.b48  \u00b7  %s"
           % os.path.abspath(__file__))
     print("  port %s \u00b7 if this banner is missing, an OLD file is\n  running \u2014 kill that process first." % PORT)
     print("=" * 62)
