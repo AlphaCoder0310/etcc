@@ -326,6 +326,8 @@ def ensure_schema() -> None:
                 f"ADD COLUMN IF NOT EXISTS bond_type VARCHAR(32) NULL",
                 f"ALTER TABLE {APP_DB}.cb_state "
                 f"ADD COLUMN IF NOT EXISTS vol_flag VARCHAR(32) NULL",
+                f"ALTER TABLE {APP_DB}.cb_state "
+                f"ADD COLUMN IF NOT EXISTS isin_manual VARCHAR(16) NULL",
 
             ):
                 try:
@@ -729,7 +731,7 @@ def fetch_refinitiv(rics: List[str]) -> List[Dict[str, Any]]:
 # Shared state (single-process; run with exactly one worker)
 # ------------------------------------------------------------------
 OVD_FIELDS = ("ovdSpot", "ovdCbFx", "ovdUndFx")
-USER_FIELDS = ("short_name", "und_fx", "n_gamma",
+USER_FIELDS = ("short_name", "und_fx", "n_gamma", "isin_manual",
                "or_bid_sprd", "or_ask_sprd",
                "x_bid", "x_ask", "x_both", "vol_flag", "bond_type",
                "bw_dvb", "bw_dvs", "bw_brw", "bw_lo", "bw_hi",
@@ -771,7 +773,7 @@ REFDATA_WAKE: Optional[asyncio.Event] = None
 
 
 def _blank_row() -> Dict[str, Any]:
-    return {"short_name": "", "und_fx": "", "n_gamma": "",
+    return {"short_name": "", "und_fx": "", "n_gamma": "", "isin_manual": "",
             "or_bid_sprd": "", "or_ask_sprd": "",
             "x_bid": "", "x_ask": "", "x_both": "", "vol_flag": "",
             "bond_type": "",
@@ -907,7 +909,7 @@ def db_log(user: str, action: str, detail: Any = "") -> None:
         logger.warning("event log skipped: %s", exc)
 
 
-COLMAP = {"short_name": "short_name", "und_fx": "und_fx",
+COLMAP = {"short_name": "short_name", "und_fx": "und_fx", "isin_manual": "isin_manual",
           "n_gamma": "n_gamma", "or_bid_sprd": "or_bid_sprd",
           "or_ask_sprd": "or_ask_sprd", "x_bid": "x_bid", "x_ask": "x_ask",
           "x_both": "x_both", "vol_flag": "vol_flag",
@@ -1459,7 +1461,7 @@ def compute_snap8() -> int:
         nd = _fnum0(nk.get("nDelta"))
         recs.append((today, sid, (row.get("short_name") or "")[:64],
                      qb, qa, mid,
-                     (rf.get("isin") or "")[:12] or None,
+                     ((rf.get("isin") or row.get("isin_manual") or "")[:12]) or None,
                      qb, qa, indic, vs, fx, vs_usd,
                      None if nd is None else round(nd * 100.0, 1),
                      _fnum0(rf.get("quantity_live"))))
@@ -2798,7 +2800,27 @@ async def api_twap(req: TwapReq):
 # ---- Bond dates from Bloomberg (static reference data): NXT_CALL_DT / MATURITY / NXT_PUT_DT ----
 BOND_DATES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bond_dates_cache.json")
 _BD = {"data": {}, "pending": set(), "lock": threading.Lock(), "busy": False, "err": ""}
-BD_FIELDS = ["NXT_CALL_DT", "MATURITY", "NXT_PUT_DT", "CALLABLE", "PUTABLE"]
+BD_CALL_FIELDS = [f.strip() for f in os.environ.get("BBG_CALL_FIELDS", "NXT_CALL_DT,CV_NXT_CALL_DT,FIRST_CALL_DT").split(",") if f.strip()]
+BD_PUT_FIELDS = [f.strip() for f in os.environ.get("BBG_PUT_FIELDS", "NXT_PUT_DT,CV_NXT_PUT_DT").split(",") if f.strip()]
+BD_SOFT_FIELDS = [f.strip() for f in os.environ.get("BBG_SOFTCALL_FIELDS", "CV_SOFT_CALL_START_DT,CV_PROV_CALL_START_DT,PROVISIONAL_CALL_DT").split(",") if f.strip()]
+BD_FIELDS = BD_CALL_FIELDS + ["MATURITY"] + BD_PUT_FIELDS + BD_SOFT_FIELDS + ["CALLABLE", "PUTABLE", "SOFT_CALL_TRIGGER_PCT"]
+
+
+def _bd_first(row_get, fields):
+    """first non-empty date among candidate fields (unknown fields are simply empty)."""
+    for f in fields:
+        v = _bd_norm_date(row_get(f))
+        if v:
+            return v
+    return ""
+
+
+def _bd_sched_next(dates):
+    """first schedule date on/after today (the next call in a provisional/soft-call schedule)."""
+    today = date.today().isoformat()
+    ds = sorted(x for x in dates if x)
+    nxt = [x for x in ds if x >= today]
+    return (ds[0] if ds else ""), (nxt[0] if nxt else "")
 BD_BATCH = 50
 
 
@@ -2853,7 +2875,7 @@ def bbg_bond_dates(isins):
                     for sec, grp in sch.groupby(level=0):
                         ds = sorted(x for x in (_bd_norm_date(v) for v in grp[dcol]) if x)
                         if ds:
-                            starts[str(sec).replace("/isin/", "").split()[0].upper()] = ds[0]
+                            starts[str(sec).replace("/isin/", "").split()[0].upper()] = _bd_sched_next(ds)
         except Exception as exc:
             logger.info("CALL_SCHEDULE not available: %s", exc)
         df = blp.bdp(tickers=secs, flds=BD_FIELDS)
@@ -2862,8 +2884,14 @@ def bbg_bond_dates(isins):
             for sec, row in df.iterrows():
                 isin = str(sec).replace("/isin/", "").split()[0].upper()
                 g = lambda f: row[cols[f.lower()]] if f.lower() in cols else None
-                out[isin] = {"call": _bd_norm_date(g("NXT_CALL_DT")), "expiry": _bd_norm_date(g("MATURITY")),
-                             "put": _bd_norm_date(g("NXT_PUT_DT")), "call_start": starts.get(isin, ""),
+                cs, cn = starts.get(isin, ("", ""))
+                call = _bd_first(g, BD_CALL_FIELDS) or cn            # no hard-call field -> next date in the (soft) call schedule
+                soft = _bd_first(g, BD_SOFT_FIELDS) or cs            # soft-call start: scalar field if the Terminal has one, else the schedule start
+                trig = _fnum0(g("SOFT_CALL_TRIGGER_PCT"))
+                out[isin] = {"call": call, "expiry": _bd_norm_date(g("MATURITY")),
+                             "put": _bd_first(g, BD_PUT_FIELDS), "call_start": soft or cs, "soft_call": soft,
+                             "trigger": trig, "hard_call": _bd_first(g, BD_CALL_FIELDS),
+                             "call_src": ("field" if _bd_first(g, BD_CALL_FIELDS) else ("schedule" if cn else "")),
                              "callable": str(g("CALLABLE") or "").upper()[:1], "putable": str(g("PUTABLE") or "").upper()[:1]}
         return out
     except ImportError:
@@ -2892,7 +2920,7 @@ def bbg_bond_dates(isins):
                         continue
                     fd = sd.getElement("fieldData")
                     gv = lambda f: (fd.getElementAsString(f) if fd.hasElement(f) else None)
-                    cs = ""
+                    cs, cn = "", ""
                     try:
                         if fd.hasElement("CALL_SCHEDULE"):
                             ds = []
@@ -2901,12 +2929,16 @@ def bbg_bond_dates(isins):
                                     el = row.getElement(k)
                                     if "date" in str(el.name()).lower():
                                         ds.append(_bd_norm_date(el.getValueAsString()))
-                            ds = sorted(x for x in ds if x)
-                            cs = ds[0] if ds else ""
+                            cs, cn = _bd_sched_next(ds)
                     except Exception:
-                        cs = ""
-                    out[isin] = {"call": _bd_norm_date(gv("NXT_CALL_DT")), "expiry": _bd_norm_date(gv("MATURITY")),
-                                 "put": _bd_norm_date(gv("NXT_PUT_DT")), "call_start": cs,
+                        cs, cn = "", ""
+                    call = _bd_first(gv, BD_CALL_FIELDS) or cn
+                    soft = _bd_first(gv, BD_SOFT_FIELDS) or cs
+                    trig = _fnum0(gv("SOFT_CALL_TRIGGER_PCT"))
+                    out[isin] = {"call": call, "expiry": _bd_norm_date(gv("MATURITY")),
+                                 "put": _bd_first(gv, BD_PUT_FIELDS), "call_start": soft or cs, "soft_call": soft,
+                                 "trigger": trig, "hard_call": _bd_first(gv, BD_CALL_FIELDS),
+                                 "call_src": ("field" if _bd_first(gv, BD_CALL_FIELDS) else ("schedule" if cn else "")),
                                  "callable": str(gv("CALLABLE") or "").upper()[:1], "putable": str(gv("PUTABLE") or "").upper()[:1]}
             if ev.eventType() == blpapi.Event.RESPONSE:
                 break
@@ -2949,6 +2981,66 @@ def _bd_need(isin):
     if r.get("retry_at"):
         return time.time() >= r["retry_at"]
     return r.get("asof") != date.today().isoformat()        # a new day -> refresh once
+
+
+@app.get("/api/bond_dates/probe")
+def api_bond_dates_probe(isin: str = ""):
+    """Diagnostic for one ISIN: every candidate call/put/maturity field with the value the
+    Terminal returns (field exceptions verbatim) plus the CALL_SCHEDULE / PUT_SCHEDULE rows."""
+    isin = isin.strip().upper()
+    if not isin:
+        return {"ok": False, "error": "isin required"}
+    try:
+        import blpapi
+    except ImportError:
+        return {"ok": False, "error": "blpapi not installed on this PC"}
+    flds = ["NXT_CALL_DT", "NXT_CALL_PX", "CALLABLE", "CALL_SCHEDULE", "CV_NXT_CALL_DT", "FIRST_CALL_DT",
+            "NXT_PUT_DT", "NXT_PUT_PX", "PUTABLE", "PUT_SCHEDULE", "CV_NXT_PUT_DT", "MATURITY", "FINAL_MATURITY",
+            "CV_CNVS_START_DT", "CV_CNVS_END_DT", "SOFT_CALL_TRIGGER_PCT"]
+    out = {"ok": True, "isin": isin, "values": {}, "errors": {}, "schedules": {}}
+    try:
+        sess = blpapi.Session()
+        if not sess.start() or not sess.openService("//blp/refdata"):
+            return {"ok": False, "error": "Bloomberg session could not start"}
+        try:
+            svc = sess.getService("//blp/refdata")
+            req = svc.createRequest("ReferenceDataRequest")
+            req.getElement("securities").appendValue("/isin/" + isin)
+            for f in flds:
+                req.getElement("fields").appendValue(f)
+            sess.sendRequest(req)
+            while True:
+                ev = sess.nextEvent(5000)
+                for msg in ev:
+                    if not msg.hasElement("securityData"):
+                        continue
+                    for sd in msg.getElement("securityData").values():
+                        if sd.hasElement("securityError"):
+                            out["errors"]["security"] = sd.getElement("securityError").getElementAsString("message")
+                            continue
+                        fd = sd.getElement("fieldData")
+                        for f in flds:
+                            if not fd.hasElement(f):
+                                continue
+                            el = fd.getElement(f)
+                            if el.isArray():
+                                rows = []
+                                for row in el.values():
+                                    rows.append({str(row.getElement(k).name()): row.getElement(k).getValueAsString() for k in range(row.numElements())})
+                                out["schedules"][f] = rows
+                            else:
+                                out["values"][f] = el.getValueAsString()
+                        if sd.hasElement("fieldExceptions"):
+                            for fe in sd.getElement("fieldExceptions").values():
+                                out["errors"][fe.getElementAsString("fieldId")] = fe.getElement("errorInfo").getElementAsString("message")
+                if ev.eventType() == blpapi.Event.RESPONSE:
+                    break
+        finally:
+            sess.stop()
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)[:300]}
+    out["configured"] = {"call_fields": BD_CALL_FIELDS, "put_fields": BD_PUT_FIELDS}
+    return out
 
 
 @app.get("/api/bond_dates")
@@ -3508,6 +3600,7 @@ input.bwv.bwred{background:#fde7e5 !important;border-color:#b3261e !important;co
 #tbl.hb-cbnuke .bfirst[data-band="cbnuke"] input{display:none}
 .cn{background:#e3eef9;color:#1e3a6e}td[data-band="cbnuke"].cnc{background:#eef3fb;font-weight:600}td[data-band="cbnuke"].cnt{background:#f4f7fb;font-size:9.5px;color:#555;text-align:left}
 input.cnv{width:62px;text-align:center}td[data-c="cn_tk"].cn-err{color:#b91c1c}input.cnv.cn-bad{background:#fee2e2;color:#7f1d1d}
+td.isincell{white-space:nowrap}td.isincell input.isinv{width:104px;text-align:left;background:#fff3cd;text-transform:uppercase}td[data-fl="f_trig"]{color:#6b21a8;font-weight:600}
 input.hnv{width:60px;text-align:right}input.hnv.hn-live{color:#1e3a6e;font-style:italic}input.hnv:not(.hn-live):not(:placeholder-shown){color:#111;font-style:normal}td[data-band="cbnuke"].hnc{background:#dcfce7;font-weight:700}
 #tbl.hb-idb th[data-band="idb"]:not(.bfirst),#tbl.hb-idb td[data-band="idb"]:not(.bfirst){display:none}
 #tbl.hb-idb .bfirst[data-band="idb"]{font-size:0;padding:0;width:14px;min-width:14px;max-width:14px;background:#f3f2ef;border-left:1px solid #d8d4cc}
@@ -3633,7 +3726,7 @@ h2{font-size:10.5px;font-weight:700;color:var(--muted);margin:0;
 <body>
 <header>
   <h1>CB nuke station</h1>
-  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b43</b></span>
+  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b46</b></span>
   <span id="conn" class="conn warn" title="Connection">&#9679;</span>
   <span id="online" class="sub"></span>
   <div class="tabs">
@@ -3901,7 +3994,7 @@ const COL_DEFS = [
   ["secId","secId","stick1"],["company","company","ref stick2"],
   ["short_name","short_name","ref stick3"],
   ["bond_type","BOND_TYPE",""],["ric","ric","ref"],
-  ["expiry","expiry","ref"],["isin","isin","ref"],["sec_fx","sec_fx","ref"],
+  ["isin","isin","ref"],["sec_fx","sec_fx","ref"],
   ["und_fx","und_fx","ref"],["quantity_live","qty_live","ref"],
   ["usd_qty_live","usd_qty_live","ref"],
   ["n_bid","nBid","grp"],["n_gamma","nGamma",""],
@@ -3921,7 +4014,7 @@ const COL_DEFS = [
   ["ovdSpot","ovdSpot",""],["ovdCbFx","ovdCbFx",""],["ovdUndFx","ovdUndFx",""],
   ["be_move","BE move%",""],["stk_move","Stk%",""],["fx_move","FXbps",""],
   ["d_vs","\u0394 vs live bid",""],["mid_drift","MID DRIFT",""],
-  ["f_call","CALL","grp"],["f_exp","EXP",""],["f_put","PUT",""],
+  ["f_call","CALL","grp"],["f_trig","TRIG%",""],["f_exp","EXP",""],["f_put","PUT",""],
   ["f_div","DIV",""],["f_move","MOVE",""],["f_nuke","NUKE",""],
   ["f_vol","VOL",""],
   ["v_iv","ImpVol","grp"],["v_10","V10",""],["v_30","V30",""],["v_90","V90",""],
@@ -3954,6 +4047,7 @@ const DEF_W = {secId:97, company:180, short_name:110, und_fx:92,
                dc_notl:96, dc_delta:64, dc_shares:92, dc_usd:96,
                cn_start:54, cn_end:54, cn_twap:72, cn_vwap:72, cn_vol:84, cn_tk:120,
                hn_delta:56, hn_astk:68, hn_afx:64, hn_abond:68, hn_cstk:68, hn_cfx:64, hn_dn:76,
+               f_trig:50,
                idb_bid:62, idb_bref:60, idb_btime:64, idb_ask:62, idb_aref:60, idb_atime:64,
                idb_ref:62, idb_my_bid:62, idb_my_ask:62, idb_gap_b:58, idb_gap_a:58, idb_gap:58, idb_flag:170};
 const SIDE_W_DEF = 172;   // left secid panel; LAYOUT._side overrides
@@ -4652,12 +4746,12 @@ function buildTable(idsOpt){
   const uniq = idsOpt || parseIds();
   const t = document.getElementById("tbl");
   let h = `<tr class="band"><td class="stick0"></td><td class="stick1"></td>` +
-    `<td class="stick2"></td><td class="uin stick3" colspan="2">yours</td><td colspan="3"></td>` +
+    `<td class="stick2"></td><td class="uin stick3" colspan="2">yours</td><td colspan="2"></td>` +
     `<td></td><td class="uin"></td><td colspan="2"></td>` +
     `<td colspan="9" class="gm grp bandhd" id="band-model" onclick="bandToggle('model')">model (last nuke) &#9662;</td>` +
     `<td colspan="12" class="bw grp bandhd" id="band-brw" onclick="bandToggle('brw')">borrow &#9662;</td>` +
     `<td colspan="17" class="go grp bandhd" id="band-res" onclick="bandToggle('res')">override result &#9662;</td>` +
-    `<td colspan="7" class="fb grp bandhd" id="band-flags" onclick="bandToggle('flags')">flags &#9662;</td>` +
+    `<td colspan="8" class="fb grp bandhd" id="band-flags" onclick="bandToggle('flags')">flags &#9662;</td>` +
     `<td colspan="6" class="vb grp bandhd" id="band-vol" onclick="bandToggle('vol')">vol &#9662;</td>` +
     `<td colspan="4" class="dc grp bandhd" id="band-dcalc" onclick="bandToggle('dcalc')">delta calc &#9662;</td>` +
     `<td colspan="13" class="cn grp bandhd" id="band-cbnuke" onclick="bandToggle('cbnuke')" title="VWAP/TWAP: Bloomberg-computed over [start,end) (exchange local, today); RIC -> BBG ticker (329180.KS -> 329180 KP Equity). Hedge: $-Neutral = A.Bond + Trade delta x (parity_c - parity_a), parity = CR x Stock/FX with CR = 100 x fixed FX / CP (refdata) - matches the OVCV hedge-tab dollar-neutral price; C.Stock / C.FX follow the live cells until you type over them">cb nuke &#9662;</td>` +
@@ -4685,8 +4779,9 @@ function buildTable(idsOpt){
          data-id="${id}" onchange="sprdChanged(this)" autocomplete="off"
          placeholder="&#8212;" style="width:64px"></td>` +
       `<td class="ref rowclick" data-r="ric"></td>` +
-      `<td class="ref rowclick" data-r="expiry_date"></td>` +
-      `<td class="ref rowclick" data-r="isin"></td>` +
+      `<td class="ref isincell" data-r="isin"><span class="isin-db"></span>` +
+      `<input class="sprd isinv" data-u="isin_manual" data-id="${id}" placeholder="ISIN" maxlength="12" autocomplete="off" ` +
+      `onchange="isinChanged(this)" style="display:none" title="no ISIN in the database - type it here; saved for everyone and used for the Bloomberg dates until the database provides one"></td>` +
       `<td class="ref rowclick" data-r="sec_fx"></td>` +
       `<td class="gc uinp"><input class="gridcell" data-u="und_fx"
          data-row="${ri}" data-col="1" autocomplete="off"
@@ -4753,7 +4848,7 @@ function buildTable(idsOpt){
       `<td data-c="dVsLive" data-band="res" class="rowclick gO"></td>` +
       `<td data-q="mid_drift" data-band="res" class="rowclick"
          title="(QuoteBid+QuoteAsk)/2 vs 8am snapshot mid"></td>` +
-      ["f_call","f_exp","f_put","f_div","f_move","f_nuke"].map((f,i)=>
+      ["f_call","f_trig","f_exp","f_put","f_div","f_move","f_nuke"].map((f,i)=>
         `<td data-fl="${f}" data-band="flags" class="rowclick${i===0?" grp bfirst":""}"></td>`).join("") +
       `<td data-band="flags" class="gc"><select class="volsel"
          data-u="vol_flag" data-id="${id}" onchange="volChanged(this)">
@@ -4820,7 +4915,7 @@ const BANDS = {
   model:{label:"model (last nuke)",span:9},
   brw:{label:"borrow",span:12},
   res:{label:"override result",span:17},
-  flags:{label:"flags",span:7},
+  flags:{label:"flags",span:8},
   vol:{label:"vol",span:6,vr:true},
   dcalc:{label:"delta calc",span:4},
   cbnuke:{label:"cb nuke",span:13},
@@ -4965,7 +5060,16 @@ function _numTxt(td){
 }
 /* Bond dates from Bloomberg (cached daily on the server): CALL / EXP / PUT cells show the dates */
 const BD = {dates:{}, ts:0, inflight:false};
-function bdIsinOf(tr){ const sid=Number(tr.dataset.id); return String(((refCache[sid]||{}).isin)||"").trim().toUpperCase(); }
+function bdIsinOf(tr){ const sid=Number(tr.dataset.id); const db=String(((refCache[sid]||{}).isin)||"").trim().toUpperCase(); if(db) return db;
+  const inp=tr.querySelector('input.isinv'); const mv=inp?inp.value:(((NS.rows||{})[sid]||{}).isin_manual||""); return String(mv||"").trim().toUpperCase(); }   // database first, then the manual entry
+function isinChanged(el){
+  const v=String(el.value||"").trim().toUpperCase().replace(/[^A-Z0-9]/g,""); el.value=v;
+  if(v && !/^[A-Z]{2}[A-Z0-9]{9}[0-9]$/.test(v)){ el.classList.add("cn-bad"); el.title="not a valid ISIN: "+v; return; }
+  el.classList.remove("cn-bad"); el.title=v?"manual ISIN (database has none)":"no ISIN in the database - type it here";
+  const sid=Number(el.dataset.id); NS.rows[sid]=Object.assign({}, NS.rows[sid]||{}, {isin_manual:v});
+  NS.send({type:"rows", list:[{secId:sid, isin_manual:v}]});      // shared + persisted like short_name
+  if(typeof bdRefresh==="function"){ BD.ts=0; bdRefresh(true); }
+}
 async function bdRefresh(force){
   if(BD.inflight) return; const now=Date.now(); if(!force && now-BD.ts < 60000) return;
   const isins=[...new Set([...document.querySelectorAll("#tbl tr[data-id]")].map(bdIsinOf).filter(Boolean))];
@@ -4991,11 +5095,15 @@ function bdPaintRow(tr){
   const sid=Number(tr.dataset.id); const ref=refCache[sid]||{}; const isin=bdIsinOf(tr); const r=isin?BD.dates[isin]:null;
   const g=k=>tr.querySelector('td[data-fl="'+k+'"]');
   let ye=NaN; if(ref.expiry_date){ const d=new Date(ref.expiry_date); if(!isNaN(d)) ye=(d-new Date())/(365.25*24*3600*1000); }
+  { const tg=g("f_trig"); if(tg){ const tv=(r&&!r.error&&r.trigger!=null&&isFinite(r.trigger))?Number(r.trigger):NaN; tg.textContent=isFinite(tv)?(tv.toFixed(tv%1?1:0)+"%"):""; tg.title=isFinite(tv)?"soft-call trigger: stock must trade at "+tv+"% of the conversion price":""; } }
   if(!r || r.error){ _yearsChip(g("f_call"), parseFloat(ref.years_to_call), (r&&r.error)?"Bloomberg: "+r.error:"call: waiting for Bloomberg dates");
     _yearsChip(g("f_exp"), ye, "no expiry_date"); _yearsChip(g("f_put"), parseFloat(ref.years_to_put), "put: waiting for Bloomberg dates");
     const why=(r&&r.error)?"Bloomberg: "+r.error+" - model years shown":"waiting for Bloomberg dates - model years shown"; ["f_call","f_exp","f_put"].forEach(k=>{ const c=g(k); if(c && c.textContent) c.title=why; }); return; }
-  _dateChip(g("f_call"), r.call, parseFloat(ref.years_to_call), "next issuer call", r.callable);
-  if(r.call_start){ const c=g("f_call"); if(c) c.title += " \u00b7 call period from "+r.call_start; }
+  if(r.hard_call){ _dateChip(g("f_call"), r.hard_call, parseFloat(ref.years_to_call), "next issuer (hard) call", r.callable);
+    { const c=g("f_call"); if(c && r.soft_call) c.title += " \u00b7 soft call from "+r.soft_call+(r.trigger!=null?" (trigger "+r.trigger+"%)":""); } }
+  else { _dateChip(g("f_call"), r.soft_call || r.call, parseFloat(ref.years_to_call), "soft call", r.callable);
+    { const c=g("f_call"); if(c && (r.soft_call||r.call)){ const d0=new Date((r.soft_call||r.call)+"T00:00:00"), tnow=new Date(new Date().toDateString());
+      c.title = (d0<=tnow ? "soft call period running since " : "soft call period starts ")+(r.soft_call||r.call)+(r.trigger!=null?" \u00b7 trigger "+r.trigger+"%":"")+(r.call&&r.call!==r.soft_call?" \u00b7 next schedule date "+r.call:"")+(isFinite(parseFloat(ref.years_to_call))?" \u00b7 model: "+parseFloat(ref.years_to_call).toFixed(2)+"y":""); c.textContent = "S "+c.textContent; } } }
   _dateChip(g("f_exp"), r.expiry, ye, "maturity", "");
   _dateChip(g("f_put"), r.put, parseFloat(ref.years_to_put), "next put", r.putable);
 }
@@ -5552,6 +5660,13 @@ function uVal(tr, u){
 function paintRefRow(tr, ref){
   tr.querySelectorAll("td[data-r]").forEach(td=>{
     let v;
+    if(td.dataset.r === "isin"){
+      const sp=td.querySelector(".isin-db"), inp=td.querySelector("input.isinv"); const db=String(ref.isin||"").trim();
+      if(sp) sp.textContent = db;
+      if(inp){ inp.style.display = db ? "none" : ""; if(!db){ const sid=Number(tr.dataset.id); const mv=((NS.rows||{})[sid]||{}).isin_manual; if(mv!==undefined && document.activeElement!==inp) inp.value=mv||""; } }
+      td.title = db ? "ISIN from the database" : (inp&&inp.value ? "manual ISIN (database has none)" : "no ISIN in the database - type it here");
+      return;
+    }
     if(td.dataset.r === "lp_delta"){
       const n = parseFloat(ref.lp_delta);
       td.textContent = isFinite(n) ? (n * 100).toFixed(1) + "%" : "\u2014";
@@ -5719,7 +5834,7 @@ function applyState(){ try{
   for(const [sid, row] of Object.entries(NS.rows)){
     const tr = document.querySelector(`#tbl tr[data-id="${sid}"]`);
     if(!tr) continue;
-    for(const f of ["short_name","und_fx","n_gamma","or_bid_sprd",
+    for(const f of ["short_name","und_fx","n_gamma","isin_manual","or_bid_sprd",
                     "or_ask_sprd","x_bid","x_ask","x_both","vol_flag","bond_type",
                     "bw_dvb","bw_dvs","bw_brw","bw_lo","bw_hi","bw_gap","bw_util","bw_d5","bw_htb","bw_evt","bw_src","bw_tnr"]){
       const i = tr.querySelector(`[data-u="${f}"]`);
@@ -5846,7 +5961,7 @@ const NS = {
         this.rows[it.secId] = Object.assign({}, this.rows[it.secId] || {}, it);   // merge: never drop a field
         const tr = document.querySelector(`#tbl tr[data-id="${it.secId}"]`);
         if(!tr) continue;
-        for(const f of ["short_name","und_fx","n_gamma","or_bid_sprd","or_ask_sprd","x_bid","x_ask","x_both","vol_flag","bond_type",
+        for(const f of ["short_name","und_fx","n_gamma","isin_manual","or_bid_sprd","or_ask_sprd","x_bid","x_ask","x_both","vol_flag","bond_type",
                         "bw_dvb","bw_dvs","bw_brw","bw_lo","bw_hi","bw_gap","bw_util","bw_d5","bw_htb","bw_evt","bw_src","bw_tnr"]){
           if(!(f in it)) continue;                                   // only fields the message carries
           const i = tr.querySelector(`[data-u="${f}"]`);
@@ -6130,7 +6245,7 @@ function generateRuns(){
     const nsprd = parseFloat(tv('td[data-c="nSpread"]'));
     runsData.push({
       short_name: uVal(tr, "short_name") || (refCache[sid]||{}).company_name || String(sid),
-      isin: (refCache[sid]||{}).isin || tv('td[data-r="isin"]'),
+      isin: (refCache[sid]||{}).isin || ((tr.querySelector('input.isinv')||{}).value||"") || tv('td[data-r="isin"] .isin-db'),
       override_bid: bid,
       override_ask: ask,
       indic_ask: ask !== "" ? ask
@@ -6735,7 +6850,7 @@ if __name__ == "__main__":
     # NOTE: reload must stay OFF (single process) so the in-memory
     # WebSocket hub works, and so the browser only opens once.
     print("=" * 62)
-    print("  NUKE STATION  BUILD borrow.b43  \u00b7  %s"
+    print("  NUKE STATION  BUILD borrow.b46  \u00b7  %s"
           % os.path.abspath(__file__))
     print("  port %s \u00b7 if this banner is missing, an OLD file is\n  running \u2014 kill that process first." % PORT)
     print("=" * 62)
