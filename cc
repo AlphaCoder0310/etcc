@@ -94,6 +94,11 @@ borrow.b69:
     * exdiv cache: failed entries from a previous process are retried at the first poll after a
       restart (no hour-long blank DIV after upgrading from a Bloomberg-only build); a host with
       neither refinitiv-data nor blpapi says so in the DIV tooltip.
+borrow.b70:
+    * Bloomberg DIV: RIC -> ticker -> DVD_EX_DT / DVD_PAY_DT / DVD_SH_LAST / DVD_TYP_LAST +
+      BDVD_NEXT_EST_EX_DT / BDVD_PROJ_DIV_AMT. Upcoming = latest declared ex-date if today or later,
+      else the BDVD projection (shown in italics with a leading ~), else "-" with the last ex-date in
+      the tooltip. Field exceptions and the ticker appear in the tooltip and /api/exdiv/probe.
 """
 
 import asyncio
@@ -4837,7 +4842,25 @@ def api_bond_dates_probe(isin: str = ""):
 # ---- Next ex-dividend date per stock (Bloomberg DVD_EX_DT on the equity ticker derived from the RIC) ----
 EXDIV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "exdiv_cache.json")
 _DV = {"data": {}, "pending": set(), "lock": threading.Lock(), "busy": False, "err": ""}
-DV_FIELDS = ["DVD_EX_DT", "DVD_SH_LAST"]
+DV_FIELDS = ["DVD_EX_DT", "DVD_PAY_DT", "DVD_SH_LAST", "DVD_TYP_LAST", "BDVD_NEXT_EST_EX_DT", "BDVD_PROJ_DIV_AMT"]   # declared (latest) + Bloomberg's projected next
+
+
+def _bbg_dv_entry(getv, sec, field_err=None):
+    """Bloomberg fields -> one DIV entry. 'Upcoming' = the latest DECLARED ex-date when it is today or later,
+    else the BDVD projected next ex-date (marked est), else none (the last ex-date goes in the tooltip)."""
+    today = date.today().isoformat()
+    last_ex = _bd_norm_date(getv("DVD_EX_DT"))
+    est_ex = _bd_norm_date(getv("BDVD_NEXT_EST_EX_DT"))
+    e = {"ticker": sec, "src": "bbg", "last": last_ex, "pay": _bd_norm_date(getv("DVD_PAY_DT")), "type": str(getv("DVD_TYP_LAST") or "").strip() or ""}
+    if last_ex and last_ex >= today:
+        e.update({"exdiv": last_ex, "amount": _fnum0(getv("DVD_SH_LAST")), "est": False})
+    elif est_ex and est_ex >= today:
+        e.update({"exdiv": est_ex, "amount": _fnum0(getv("BDVD_PROJ_DIV_AMT")), "est": True, "pay": ""})
+    else:
+        e.update({"exdiv": "", "amount": _fnum0(getv("DVD_SH_LAST")), "est": False})
+    if field_err:
+        e["field_err"] = field_err
+    return e
 
 
 def _dv_load():
@@ -4870,8 +4893,8 @@ def _dv_save():
 
 
 def bbg_exdiv(rics):
-    """ReferenceDataRequest DVD_EX_DT / DVD_SH_LAST for a batch of RICs -> {ric: {exdiv, amount, ticker}}.
-    RICs without a Bloomberg code map to an error entry. xbbg first, raw blpapi second."""
+    """RIC -> Bloomberg equity ticker (bbg_ticker) -> ReferenceDataRequest with DV_FIELDS -> {ric: entry}
+    (see _bbg_dv_entry). RICs without a Bloomberg code map to an error entry. xbbg first, raw blpapi second."""
     tk = {}
     for r in rics:
         t = bbg_ticker(r)
@@ -4891,9 +4914,10 @@ def bbg_exdiv(rics):
                 if not ric:
                     continue
                 g = lambda f: row[cols[f.lower()]] if f.lower() in cols else None
-                out[ric] = {"exdiv": _bd_norm_date(g("DVD_EX_DT")), "amount": _fnum0(g("DVD_SH_LAST")), "ticker": str(sec)}
+                missing = [f for f in DV_FIELDS if f.lower() not in cols]
+                out[ric] = _bbg_dv_entry(g, str(sec), ("no column for " + ", ".join(missing)) if missing else None)
         for sec, ric in tk.items():
-            out.setdefault(ric, {"exdiv": "", "amount": None, "ticker": sec})
+            out.setdefault(ric, {"exdiv": "", "amount": None, "ticker": sec, "src": "bbg", "error": "no row from Bloomberg"})
         return out
     except ImportError:
         pass
@@ -4923,11 +4947,18 @@ def bbg_exdiv(rics):
                         continue
                     fd = sd.getElement("fieldData")
                     gv = lambda f: (fd.getElementAsString(f) if fd.hasElement(f) else None)
-                    out[ric] = {"exdiv": _bd_norm_date(gv("DVD_EX_DT")), "amount": _fnum0(gv("DVD_SH_LAST")), "ticker": sec}
+                    ferr = None
+                    if sd.hasElement("fieldExceptions"):
+                        try:
+                            ferr = "; ".join("%s: %s" % (fe.getElementAsString("fieldId"), fe.getElement("errorInfo").getElementAsString("message"))
+                                             for fe in sd.getElement("fieldExceptions").values())[:300] or None
+                        except Exception:
+                            ferr = "field exceptions"
+                    out[ric] = _bbg_dv_entry(gv, sec, ferr)
             if ev.eventType() == blpapi.Event.RESPONSE:
                 break
         for sec, ric in tk.items():
-            out.setdefault(ric, {"exdiv": "", "amount": None, "ticker": sec})
+            out.setdefault(ric, {"exdiv": "", "amount": None, "ticker": sec, "src": "bbg", "error": "no row from Bloomberg"})
         return out
     finally:
         sess.stop()
@@ -5063,7 +5094,7 @@ def _dv_worker(rics):
             errs.append("no dividend source on this host: install refinitiv-data (Workspace) or blpapi (Terminal)")
             srcs = []
         for src in srcs:
-            todo = [r for r in rics if r not in done or done[r].get("error") or (not done[r].get("exdiv") and done[r].get("src") == "bbg")]
+            todo = [r for r in rics if r not in done or done[r].get("error") or (not done[r].get("exdiv") and done[r].get("src") == "bbg")]   # Bloomberg silent -> Refinitiv has a go
             if not todo:
                 break
             try:
@@ -6609,7 +6640,7 @@ td[data-c="dc_shares"]{background:#f6f3ea;font-weight:600;text-align:right}td[da
 #tbl.hb-vol .bfirst[data-band="vol"]{font-size:0;padding:0;width:14px;min-width:14px;max-width:14px;background:#f3f2ef;border-left:1px solid #d8d4cc}
 #tbl.hb-vol .bfirst[data-band="vol"] input,#tbl.hb-vol .bfirst[data-band="vol"] .rz{display:none}
 .fb{background:#f0e9f7}
-td[data-fl]{text-align:center;font-size:10.5px}
+td[data-fl]{text-align:center;font-size:10.5px}td[data-fl].fl-est{font-style:italic}
 td[data-fl^="f_"].fl-red{color:#c62828;font-weight:700}
 td[data-fl^="f_"].fl-amb{color:#b26a00;font-weight:600}
 td[data-fl^="f_"].fl-dim{color:#b6b1a8}
@@ -6676,7 +6707,7 @@ h2{font-size:10.5px;font-weight:700;color:var(--muted);margin:0;
 <body>
 <header>
   <h1>CB nuke station</h1>
-  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b69</b></span>
+  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b70</b></span>
   <span id="conn" class="conn warn" title="Connection">&#9679;</span>
   <span id="online" class="sub"></span>
   <div class="tabs">
@@ -8074,11 +8105,11 @@ function dvPaint(tr, dv, ref, today){
   const srcName = r ? (r.src==="rfx" ? "Refinitiv" : "Bloomberg") : "";
   const fmt = iso => new Date(iso+"T00:00:00").toLocaleDateString("en-GB",{day:"2-digit",month:"short",year:"2-digit"});
   if(r && !r.error){
-    if(!r.exdiv){ dv.textContent="\u2014"; dv.classList.add("fl-dim"); dv.title=srcName+": no declared ex-dividend date ahead for "+(r.ticker||ric)+(r.last?" \u00b7 last ex-div "+r.last:"")+(model?" \u00b7 model: "+model:""); return; }
+    if(!r.exdiv){ dv.textContent="\u2014"; dv.classList.add("fl-dim"); dv.title=srcName+": no declared or projected ex-dividend date ahead for "+(r.ticker||ric)+(r.last?" \u00b7 last ex-div "+r.last:"")+(r.field_err?" \u00b7 field issue: "+r.field_err:"")+(model?" \u00b7 model: "+model:""); return; }
     const d=new Date(r.exdiv+"T00:00:00"); const days=Math.round((d-today)/86400000);
     if(days<0){ dv.textContent="\u2014"; dv.classList.add("fl-dim"); dv.title="last ex-div "+r.exdiv+" (passed "+(-days)+"d ago) - no future ex-date on "+srcName+(model?" \u00b7 model: "+model:""); return; }
-    dv.textContent=fmt(r.exdiv); dv.classList.add(days<=FLAG_TH.divRed?"fl-red":days<=FLAG_TH.divAmb?"fl-amb":"fl-dim");
-    dv.title="next ex-dividend date "+r.exdiv+" (in "+days+"d)"+(r.amount!=null?" \u00b7 dividend "+r.amount:"")+(r.pay?" \u00b7 pay "+r.pay:"")+(r.type?" \u00b7 "+r.type:"")+" \u00b7 "+srcName+" "+(r.ticker||"")+(model&&model!==r.exdiv?" \u00b7 model: "+model:""); return; }
+    dv.textContent=(r.est?"\u2248":"")+fmt(r.exdiv); dv.classList.add(days<=FLAG_TH.divRed?"fl-red":days<=FLAG_TH.divAmb?"fl-amb":"fl-dim"); if(r.est) dv.classList.add("fl-est");
+    dv.title=(r.est?"projected next ex-dividend date (Bloomberg BDVD estimate, not declared) ":"next ex-dividend date ")+r.exdiv+" (in "+days+"d)"+(r.amount!=null?" \u00b7 dividend "+r.amount:"")+(r.pay?" \u00b7 pay "+r.pay:"")+(r.type?" \u00b7 "+r.type:"")+" \u00b7 "+srcName+" "+(r.ticker||"")+(r.last&&r.last!==r.exdiv?" \u00b7 last ex-div "+r.last:"")+(r.field_err?" \u00b7 field issue: "+r.field_err:"")+(model&&model!==r.exdiv?" \u00b7 model: "+model:""); return; }
   // fallback: model date while the source has not answered (or failed)
   if(model){ const dd=new Date(model); const days=(dd-today)/86400000;
     if(isFinite(days) && days>=0){ dv.textContent=fmt(model); dv.classList.add(days<=FLAG_TH.divRed?"fl-red":days<=FLAG_TH.divAmb?"fl-amb":"fl-dim"); dv.title="model next ex-div "+model+(r&&r.error?" \u00b7 "+srcName+": "+r.error:" \u00b7 waiting for the dividend source"); }
@@ -10005,7 +10036,7 @@ if __name__ == "__main__":
     # NOTE: reload must stay OFF (single process) so the in-memory
     # WebSocket hub works, and so the browser only opens once.
     print("=" * 62)
-    print("  NUKE STATION  BUILD borrow.b69  \u00b7  %s"
+    print("  NUKE STATION  BUILD borrow.b70  \u00b7  %s"
           % os.path.abspath(__file__))
     print("  port %s \u00b7 if this banner is missing, an OLD file is\n  running \u2014 kill that process first." % PORT)
     print("=" * 62)
