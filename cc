@@ -70,6 +70,12 @@ borrow.b63:
       report date is an error shown in the band (not a silent "holiday"). Header: "fetching MM-DD..."
       while the worker runs, "MM-DD no trading" for a holiday, diary in the tooltip, a refresh glyph
       (POST /api/twq/fetch) to fetch now. File drop defaults to <app dir>/twq_drop.
+borrow.b64:
+    * Work-PC compatible fetch: requests (NUKE_TWQ_PROXY / HTTPS_PROXY / the Windows system proxy incl.
+      PAC via WinHTTP), then PowerShell Invoke-WebRequest (the browser's own proxy + Windows login) and
+      curl.exe (--proxy-anyauth as the logged-in user); the transport that works is remembered.
+      Evening timing: first attempt NUKE_TWQ_PUBLISH=20:00 TW, late from NUKE_TWQ_DUE=21:30 (one clock
+      for both); redirect wording no longer blames the exchange. /api/twq shows via + proxy.
 """
 
 import asyncio
@@ -4976,7 +4982,8 @@ TWQ_CEIL_PCT = float(os.environ.get("NUKE_TWQ_CEIL_PCT", "25"))   # 融券+借�
 TWQ_SBL_PCT = float(os.environ.get("NUKE_TWQ_SBL_PCT", "10"))     # 借券賣出餘額 sub-cap, % of listed shares
 TWQ_CEIL_MODE = os.environ.get("NUKE_TWQ_CEIL_MODE", "flat").lower()   # flat: 融券限額 = ceil% x issued; net: it already nets the balances
 TWQ_FX_DEFAULT = float(os.environ.get("NUKE_TWQ_FX", "30.5"))     # TWD per USD when TWD= is not live
-TWQ_PUBLISH = os.environ.get("NUKE_TWQ_PUBLISH", "16:00")        # Taiwan time: first try for today's report
+TWQ_PUBLISH = os.environ.get("NUKE_TWQ_PUBLISH", "20:00")        # Taiwan time: first attempt for today's report (TWSE posts it in the evening, ~20:30)
+TWQ_DUE = os.environ.get("NUKE_TWQ_DUE", "21:30")                # Taiwan time: from here today's report counts as late (header 'waiting')
 TWQ_TIMEOUT = float(os.environ.get("NUKE_TWQ_TIMEOUT", "20"))
 TWQ_UA = os.environ.get("NUKE_TWQ_UA", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 _TWQ = {"sessions": {}, "nodata": {}, "failed": {}, "lock": threading.Lock(), "busy": False, "err": "", "layout": "",
@@ -5002,26 +5009,35 @@ def _twq_prev_weekday(d):
     return d
 
 
-def _twq_publish_minutes():
+def _twq_hhmm(txt, default_min):
     try:
-        hh, mm = TWQ_PUBLISH.split(":")
+        hh, mm = str(txt).split(":")
         return int(hh) * 60 + int(mm)
     except Exception:
-        return 16 * 60
+        return default_min
+
+
+def _twq_publish_minutes():
+    return _twq_hhmm(TWQ_PUBLISH, 20 * 60)
+
+
+def _twq_due_minutes():
+    return max(_twq_hhmm(TWQ_DUE, 21 * 60 + 30), _twq_publish_minutes())
 
 
 def _twq_expected_session(now_tw=None):
-    """The session whose report should be out by now: today once it is a weekday past 18:00 Taiwan time,
-    otherwise the previous weekday. Holidays show as 'waiting' until the next report arrives."""
+    """The session whose report should be out by now: today once it is a weekday past NUKE_TWQ_DUE (Taiwan
+    time), otherwise the previous weekday. Until then the band simply shows the latest session it has."""
     now_tw = now_tw or _twq_tw_now()
     d = now_tw.date()
-    if d.weekday() >= 5 or now_tw.hour < 18:
+    if d.weekday() >= 5 or (now_tw.hour * 60 + now_tw.minute) < _twq_due_minutes():
         d = _twq_prev_weekday(d)
     return d
 
 
 def _twq_candidates(now_tw=None):
-    """ISO dates worth holding, most recent first: the expected session and the weekdays before it."""
+    """ISO dates worth holding, most recent first: today from NUKE_TWQ_PUBLISH (first attempt) on weekdays,
+    then the weekdays before it."""
     now_tw = now_tw or _twq_tw_now()
     d = now_tw.date()
     if d.weekday() >= 5 or (now_tw.hour * 60 + now_tw.minute) < _twq_publish_minutes():
@@ -5122,42 +5138,243 @@ def _twq_parse_csv(text, src):
     return _twq_parse_table(rdr[hdr], data, src)
 
 
-_TWQ_HTTP = {"sess": None, "warm": 0.0, "last": ""}
+_TWQ_HTTP = {"sess": None, "warm": 0.0, "last": "", "via": "", "winproxy": None}
+TWQ_PROXY = os.environ.get("NUKE_TWQ_PROXY", "")              # explicit proxy, e.g. http://proxy:8080 (else: env, then the Windows system proxy)
+TWQ_VIA = os.environ.get("NUKE_TWQ_VIA", "auto").lower()      # auto | requests | powershell | curl : force one transport
+
+
+def _twq_proxy_pick(s):
+    """WinHTTP / IE proxy strings -> one URL: 'proxy:8080', 'http=a:1;https=b:2', 'PROXY a:1; DIRECT'."""
+    s = str(s or "").strip()
+    if not s:
+        return ""
+    for part in s.replace(",", ";").split(";"):
+        part = part.strip()
+        if not part or part.upper() == "DIRECT":
+            continue
+        if part.upper().startswith("PROXY "):
+            part = part[6:].strip()
+        if "=" in part:
+            k, v = part.split("=", 1)
+            if k.strip().lower() not in ("https", "http"):
+                continue
+            part = v.strip()
+        if part:
+            return part if "://" in part else "http://" + part
+    return ""
+
+
+def _twq_win_proxy(url):
+    """Windows: the proxy the browser would use for this URL (manual, PAC or WPAD) through WinHTTP. '' when none."""
+    if os.name != "nt":
+        return ""
+    try:
+        import ctypes
+        from ctypes import wintypes as wt
+        wh = ctypes.windll.winhttp
+
+        class IECFG(ctypes.Structure):
+            _fields_ = [("fAutoDetect", wt.BOOL), ("lpszAutoConfigUrl", wt.LPWSTR), ("lpszProxy", wt.LPWSTR), ("lpszProxyBypass", wt.LPWSTR)]
+
+        class AOPT(ctypes.Structure):
+            _fields_ = [("dwFlags", wt.DWORD), ("dwAutoDetectFlags", wt.DWORD), ("lpszAutoConfigUrl", wt.LPCWSTR),
+                        ("lpvReserved", ctypes.c_void_p), ("dwReserved", wt.DWORD), ("fAutoLogonIfChallenged", wt.BOOL)]
+
+        class PINFO(ctypes.Structure):
+            _fields_ = [("dwAccessType", wt.DWORD), ("lpszProxy", wt.LPWSTR), ("lpszProxyBypass", wt.LPWSTR)]
+
+        wh.WinHttpOpen.restype = ctypes.c_void_p
+        wh.WinHttpOpen.argtypes = [wt.LPCWSTR, wt.DWORD, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD]
+        wh.WinHttpGetProxyForUrl.argtypes = [ctypes.c_void_p, wt.LPCWSTR, ctypes.POINTER(AOPT), ctypes.POINTER(PINFO)]
+        wh.WinHttpCloseHandle.argtypes = [ctypes.c_void_p]
+        cfg = IECFG()
+        if not wh.WinHttpGetIEProxyConfigForCurrentUser(ctypes.byref(cfg)):
+            return ""
+        proxy = ""
+        if cfg.fAutoDetect or cfg.lpszAutoConfigUrl:
+            h = wh.WinHttpOpen("NukeStation", 1, None, None, 0)        # WINHTTP_ACCESS_TYPE_NO_PROXY
+            if h:
+                opt = AOPT()
+                opt.fAutoLogonIfChallenged = True
+                if cfg.lpszAutoConfigUrl:
+                    opt.dwFlags = 2                                     # WINHTTP_AUTOPROXY_CONFIG_URL
+                    opt.lpszAutoConfigUrl = cfg.lpszAutoConfigUrl
+                else:
+                    opt.dwFlags = 1                                     # WINHTTP_AUTOPROXY_AUTO_DETECT
+                    opt.dwAutoDetectFlags = 3                           # DHCP | DNS_A
+                info = PINFO()
+                if wh.WinHttpGetProxyForUrl(h, url, ctypes.byref(opt), ctypes.byref(info)) and info.lpszProxy:
+                    proxy = _twq_proxy_pick(info.lpszProxy)
+                wh.WinHttpCloseHandle(h)
+        if not proxy and cfg.lpszProxy:
+            proxy = _twq_proxy_pick(cfg.lpszProxy)
+        return proxy
+    except Exception as exc:
+        logger.info("twq: windows proxy lookup failed: %s", exc)
+        return ""
+
+
+def _twq_headers():
+    return {"User-Agent": TWQ_UA, "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8", "Referer": "https://www.twse.com.tw/zh/trading/margin/twt93u.html"}
 
 
 def _twq_session():
-    """One requests.Session shared by the worker: browser-like headers and the site's cookies (picked up from the
-    report page like a browser would, refreshed every 30 min). Proxy settings come from the environment."""
+    """One requests.Session for the worker: browser-like headers; the proxy is decided per request."""
     s = _TWQ_HTTP["sess"]
     if s is None:
         s = requests.Session()
-        s.headers.update({"User-Agent": TWQ_UA, "Accept": "application/json, text/plain, */*",
-                          "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8", "Referer": "https://www.twse.com.tw/zh/trading/margin/twt93u.html"})
+        s.headers.update(_twq_headers())
         _TWQ_HTTP["sess"] = s
-    if time.time() - _TWQ_HTTP["warm"] > 1800:
-        _TWQ_HTTP["warm"] = time.time()
-        try:
-            s.get("https://www.twse.com.tw/zh/trading/margin/twt93u.html", timeout=TWQ_TIMEOUT)
-        except Exception:
-            pass
     return s
 
 
-def _twq_http_json(url, params):
-    """One GET -> parsed JSON. A redirect (TWSE's security filter answers automated bursts with HTTP 307
-    'FOR SECURITY REASONS'), a non-200 or a non-JSON body are errors - never silently 'no data'. Mocked in tests."""
-    r = _twq_session().get(url, params=params, timeout=TWQ_TIMEOUT, allow_redirects=False)
-    head = (r.text or "")[:160].replace("\n", " ").replace("\r", " ")
-    _TWQ_HTTP["last"] = "HTTP %d %s | %s" % (r.status_code, r.headers.get("Content-Type", ""), head)
-    if 300 <= r.status_code < 400:
-        raise ValueError("HTTP %d redirect to %s - the exchange's security filter blocked the request (automated / too frequent); retry later or use the file drop"
-                         % (r.status_code, (r.headers.get("Location") or "?")[:100]))
-    if r.status_code != 200:
-        raise ValueError("HTTP %d: %s" % (r.status_code, head[:80]))
+def _twq_proxy_for(full_url):
+    """Proxy for one URL: NUKE_TWQ_PROXY, else the environment (requests reads HTTPS_PROXY itself), else the
+    Windows system proxy (manual / PAC / WPAD) resolved per host and remembered."""
+    if TWQ_PROXY:
+        return TWQ_PROXY
+    if os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy"):
+        return ""                                              # requests applies the environment proxy itself
+    host = full_url.split("/")[2] if "//" in full_url else full_url
+    by = _TWQ_HTTP.setdefault("winproxy_by_host", {})
+    if host not in by:
+        by[host] = _twq_win_proxy(full_url)
+        if by[host]:
+            logger.info("twq: Windows system proxy for %s: %s", host, by[host])
+        _TWQ_HTTP["winproxy"] = by[host] or _TWQ_HTTP.get("winproxy")
+    return by[host]
+
+
+def _twq_run(cmd, timeout):
+    """Run a helper process without a console window (Windows) -> (returncode, stdout bytes, stderr text)."""
+    kw = {"capture_output": True, "timeout": timeout}
+    if os.name == "nt":
+        kw["creationflags"] = 0x08000000                          # CREATE_NO_WINDOW
+    p = subprocess.run(cmd, **kw)
+    return p.returncode, p.stdout or b"", (p.stderr or b"").decode("utf-8", "replace")
+
+
+def _twq_via_requests(full_url):
+    p = _twq_proxy_for(full_url)
+    r = _twq_session().get(full_url, timeout=TWQ_TIMEOUT, allow_redirects=False, proxies=({"http": p, "https": p} if p else None))
+    return r.status_code, r.content, r.headers.get("Location") or ""
+
+
+def _twq_via_powershell(full_url):
+    """What the browser does: WinINET system proxy (PAC/WPAD) + the logged-in user's credentials (NTLM/Kerberos).
+    The body goes through a temp file so Chinese text survives the console."""
+    import tempfile
+    fd, path = tempfile.mkstemp(prefix="twq_", suffix=".json")
+    os.close(fd)
+    hdr = "; ".join("'%s'='%s'" % (k, v) for k, v in _twq_headers().items() if k in ("Accept", "Accept-Language"))
+    script = (
+        "$ProgressPreference='SilentlyContinue'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; "
+        + ("[Net.WebRequest]::DefaultWebProxy=New-Object Net.WebProxy('%s'); " % TWQ_PROXY.replace("'", "") if TWQ_PROXY else "")
+        + "$px=[Net.WebRequest]::DefaultWebProxy; if($px){ $px.Credentials=[Net.CredentialCache]::DefaultNetworkCredentials }; "
+        + "try { $r=Invoke-WebRequest -Uri '%s' -UseBasicParsing -MaximumRedirection 0 -TimeoutSec %d -UserAgent '%s' -Headers @{%s} -ErrorAction Stop; "
+          "[IO.File]::WriteAllBytes('%s', $r.RawContentStream.ToArray()); Write-Output ('STATUS ' + [int]$r.StatusCode) } "
+          "catch { $resp=$_.Exception.Response; if($resp){ Write-Output ('STATUS ' + [int]$resp.StatusCode); Write-Output ('LOCATION ' + $resp.Headers['Location']) } else { Write-Output 'STATUS 0' }; "
+          "Write-Output ('ERROR ' + $_.Exception.Message) }"
+        % (full_url, int(TWQ_TIMEOUT), TWQ_UA.replace("'", ""), hdr, path.replace("'", "''")))
     try:
-        return r.json()
+        rc, out, err = _twq_run(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script], TWQ_TIMEOUT + 15)
+        text = out.decode("utf-8", "replace")
+        status, loc, msg = 0, "", ""
+        for line in text.splitlines():
+            if line.startswith("STATUS "):
+                try:
+                    status = int(line[7:].strip())
+                except ValueError:
+                    status = 0
+            elif line.startswith("LOCATION "):
+                loc = line[9:].strip()
+            elif line.startswith("ERROR "):
+                msg = line[6:].strip()
+        body = b""
+        if os.path.exists(path) and os.path.getsize(path):
+            with open(path, "rb") as fh:
+                body = fh.read()
+        if status == 0:
+            raise ValueError(msg or err.strip()[:160] or ("exit %d" % rc))
+        return status, body, loc
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _twq_via_curl(full_url):
+    """curl.exe (ships with Windows 10+): the system proxy from WinHTTP, authenticated as the logged-in user."""
+    proxy = TWQ_PROXY or os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or _twq_proxy_for(full_url)
+    cmd = ["curl", "-sS", "--max-time", str(int(TWQ_TIMEOUT)), "-o", "-", "-w", "\n__STATUS__%{http_code}__%{redirect_url}", "-A", TWQ_UA]
+    for k, v in _twq_headers().items():
+        if k != "User-Agent":
+            cmd += ["-H", "%s: %s" % (k, v)]
+    if proxy:
+        cmd += ["--proxy", proxy, "--proxy-anyauth", "--proxy-user", ":"]
+    cmd.append(full_url)
+    rc, out, err = _twq_run(cmd, TWQ_TIMEOUT + 10)
+    marker = out.rfind(b"\n__STATUS__")
+    if marker < 0:
+        raise ValueError(err.strip()[:160] or ("exit %d" % rc))
+    body, tail = out[:marker], out[marker + 11:].decode("ascii", "replace")
+    code, _, loc = tail.partition("__")
+    try:
+        status = int(code)
     except ValueError:
-        raise ValueError("non-JSON reply (%s...)" % head[:80])
+        status = 0
+    if status == 0:
+        raise ValueError(err.strip()[:160] or ("exit %d" % rc))
+    return status, body, loc.strip()
+
+
+def _twq_transports():
+    forced = TWQ_VIA if TWQ_VIA in ("requests", "powershell", "curl") else ""
+    if forced:
+        return [forced]
+    order = ["requests"] + (["powershell", "curl"] if os.name == "nt" else [])
+    via = _TWQ_HTTP.get("via")
+    if via in order:
+        order.remove(via)
+        order.insert(0, via)                                   # the transport that worked last time goes first
+    return order
+
+
+def _twq_http_json(url, params):
+    """GET -> parsed JSON through the first transport that reaches the exchange: requests (explicit / env /
+    Windows system proxy), then - on Windows - PowerShell's Invoke-WebRequest (the browser's own proxy and
+    login) and curl.exe. A redirect, a non-200 or a non-JSON body are errors, never a silent 'no data'.
+    Mocked in tests."""
+    from urllib.parse import urlencode
+    full = url + ("&" if "?" in url else "?") + urlencode(params)
+    errors = []
+    for via in _twq_transports():
+        try:
+            fn = {"requests": _twq_via_requests, "powershell": _twq_via_powershell, "curl": _twq_via_curl}[via]
+            status, body, loc = fn(full)
+            head = body[:160].decode("utf-8", "replace").replace("\n", " ").replace("\r", " ")
+            _TWQ_HTTP["last"] = "%s: HTTP %d | %s" % (via, status, head)
+            if 300 <= status < 400:
+                raise ValueError("HTTP %d redirect to %s - a proxy or security filter answered instead of the exchange" % (status, (loc or "?")[:100]))
+            if status == 407:
+                raise ValueError("HTTP 407 proxy authentication required")
+            if status != 200:
+                raise ValueError("HTTP %d: %s" % (status, head[:80]))
+            try:
+                j = json.loads(body.decode("utf-8-sig", "replace"))
+            except ValueError:
+                raise ValueError("non-JSON reply (%s...)" % head[:80])
+            if via != _TWQ_HTTP.get("via"):
+                _TWQ_HTTP["via"] = via
+                _twq_log("exchange reached via %s%s" % (via, (" (proxy " + (TWQ_PROXY or _TWQ_HTTP.get("winproxy") or os.environ.get("HTTPS_PROXY") or "") + ")") if via != "powershell" and (TWQ_PROXY or _TWQ_HTTP.get("winproxy") or os.environ.get("HTTPS_PROXY")) else ""))
+            return j
+        except Exception as exc:
+            errors.append("%s: %s" % (via, str(exc)[:140]))
+            if _TWQ_HTTP.get("via") == via:
+                _TWQ_HTTP["via"] = ""
+    raise ValueError(" | ".join(errors)[:400])
 
 
 def _twq_read_drop(iso, stem, src):
@@ -5377,7 +5594,7 @@ async def twq_poller():
     await asyncio.sleep(int(os.environ.get("NUKE_TWQ_DELAY", "15")))
     logger.info("twq poller started (TWSE TWT93U%s, %d sessions, publish %s TW)",
                 " + TPEx" if TWQ_TPEX_URL else "", TWQ_HISTORY, TWQ_PUBLISH)
-    _twq_log("poller started - %d sessions cached on disk" % len(_TWQ["sessions"]))
+    _twq_log("poller started - %d sessions cached on disk; transports: %s" % (len(_TWQ["sessions"]), ", ".join(_twq_transports())))
     while True:
         try:
             _twq_kick()
@@ -5535,6 +5752,7 @@ def api_twq(sids: str = ""):
             "busy": _TWQ["busy"], "err": _TWQ["err"], "layout": _TWQ["layout"], "last_try": _TWQ["last_try"], "hint": hint,
             "log": list(_TWQ["log"]), "plan": _twq_plan(now_tw), "retry_in": max(0, int(_TWQ["retry_at"] - time.time())),
             "cur": _TWQ["cur"], "exp_state": exp_state, "drop_dir": TWQ_DIR, "http_last": _TWQ_HTTP["last"],
+            "via": _TWQ_HTTP.get("via") or "", "proxy": TWQ_PROXY or os.environ.get("HTTPS_PROXY") or _TWQ_HTTP.get("winproxy") or "",
             "mode": TWQ_CEIL_MODE, "ceil_pct": TWQ_CEIL_PCT, "sbl_pct": TWQ_SBL_PCT,
             "stamp": "%s|%s|%s|%s|%s|%s" % (latest, _TWQ["fetched_at"], STATE.get("rfxTs") or "", _TWQ["err"] or _TWQ["layout"] or "", expected, hint[:8])}
 
@@ -6258,7 +6476,7 @@ h2{font-size:10.5px;font-weight:700;color:var(--muted);margin:0;
 <body>
 <header>
   <h1>CB nuke station</h1>
-  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b63</b></span>
+  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b64</b></span>
   <span id="conn" class="conn warn" title="Connection">&#9679;</span>
   <span id="online" class="sub"></span>
   <div class="tabs">
@@ -9577,7 +9795,7 @@ if __name__ == "__main__":
     # NOTE: reload must stay OFF (single process) so the in-memory
     # WebSocket hub works, and so the browser only opens once.
     print("=" * 62)
-    print("  NUKE STATION  BUILD borrow.b63  \u00b7  %s"
+    print("  NUKE STATION  BUILD borrow.b64  \u00b7  %s"
           % os.path.abspath(__file__))
     print("  port %s \u00b7 if this banner is missing, an OLD file is\n  running \u2014 kill that process first." % PORT)
     print("=" * 62)
