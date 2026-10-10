@@ -84,6 +84,12 @@ borrow.b66:
       process) when Bloomberg's API is not on the host (NUKE_EXDIV_SRC=auto|bbg|rfx); shown like the
       other date chips (03 Nov 26) with dividend / pay date / source in the tooltip.
     * flags band +1: USED% - the TW quota band's SBL usage cell (same heat bar) mirrored into flags.
+borrow.b67:
+    * USED% cells restyled: slim rounded meter (track + tier-coloured fill) with the value beside it,
+      flat cell, red chip for >=95%; same tiers and the same --tqu width property.
+borrow.b68:
+    * /api/exdiv/probe?ric=2330.TW - which dividend sources this host has, one live Refinitiv child run
+      with its log, the Bloomberg answer where its API exists, and the cached entry.
 """
 
 import asyncio
@@ -4994,12 +5000,18 @@ def rfx_exdiv(rics):
         if line.startswith("XDIVJSON:"):
             out = json.loads(line[len("XDIVJSON:"):])
             break
+    _XDIV_LAST["stderr"] = (p.stderr or "").strip()[-1500:]
+    _XDIV_LAST["at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    _XDIV_LAST["n"] = (len(out) if out is not None else -1, len(rics))
     if p.stderr and (out is None or len(out) < len(rics)):
         for ln in p.stderr.strip().splitlines()[-8:]:
             logger.info("exdiv child | %s", ln.strip()[:220])
     if out is None:
         raise RuntimeError("Refinitiv ex-div child gave no result")
     return out
+
+
+_XDIV_LAST = {"stderr": "", "at": "", "n": (0, 0)}
 
 
 def _has_module(name):
@@ -5079,6 +5091,28 @@ def _dv_need(ric):
     if r.get("retry_at"):
         return time.time() >= r["retry_at"]
     return r.get("asof") != date.today().isoformat()
+
+
+@app.get("/api/exdiv/probe")
+def api_exdiv_probe(ric: str = ""):
+    """Diagnostic for the DIV flag: which sources this host can use, and one live Refinitiv child run for the
+    given RIC(s) with the child's own log (field errors show up here verbatim)."""
+    rics = [r.strip().upper() for r in ric.split(",") if r.strip()]
+    out = {"ok": True, "sources": _exdiv_sources(), "has_blpapi": _has_module("blpapi"), "has_xbbg": _has_module("xbbg"),
+           "has_refinitiv": _has_module("refinitiv"), "cache_entries": len(_DV["data"]), "worker_err": _DV["err"],
+           "cached": {r: _DV["data"].get(r) for r in rics}}
+    if rics:
+        try:
+            out["refinitiv"] = rfx_exdiv(rics)
+        except Exception as exc:
+            out["refinitiv_error"] = str(exc)[:300]
+        out["child_log"] = _XDIV_LAST["stderr"]
+        if "bbg" in out["sources"]:
+            try:
+                out["bloomberg"] = bbg_exdiv(rics)
+            except Exception as exc:
+                out["bloomberg_error"] = str(exc)[:300]
+    return out
 
 
 @app.get("/api/exdiv")
@@ -6469,11 +6503,15 @@ td[data-c="twq_lim"].tqc{background:#fff7ed;font-weight:700}td[data-c="twq_sess"
 td[data-band="twq"].tqc.tqw{background:#fffbeb}
 .tqp{display:inline-block;padding:0 5px;border-radius:3px;font:700 9px 'Segoe UI',system-ui,sans-serif;line-height:14px;letter-spacing:.3px}
 .tqp.sc{background:#b91c1c;color:#fff}.tqp.th{background:#dbeafe;color:#1e3a8a}.tqp.rs{background:#e5e7eb;color:#374151}.tqp.ck{background:#fde68a;color:#78350f}
-td[data-band].tqused{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
-td[data-band].tqused.u1{color:#14532d;background:linear-gradient(90deg,#86efac var(--tqu,0%),#f0fdf4 var(--tqu,0%))}
-td[data-band].tqused.u2{color:#78350f;background:linear-gradient(90deg,#fcd34d var(--tqu,0%),#fffbeb var(--tqu,0%))}
-td[data-band].tqused.u3{color:#7c2d12;font-weight:700;background:linear-gradient(90deg,#fb923c var(--tqu,0%),#fff7ed var(--tqu,0%))}
-td[data-band].tqused.u4{background:#b91c1c !important;color:#fff;font-weight:700}
+td[data-band].tqused{white-space:nowrap;padding-left:5px;padding-right:5px;vertical-align:middle}
+.tqmeter{display:inline-flex;align-items:center;gap:5px;width:100%;vertical-align:middle}
+.tqm{flex:1 1 auto;min-width:14px;height:5px;border-radius:3px;background:#e5e7eb;overflow:hidden}
+.tqm b{display:block;height:100%;width:var(--tqu,0%);border-radius:3px;background:#9ca3af;transition:width .25s ease}
+.tqv{flex:0 0 auto;min-width:36px;text-align:right;font-variant-numeric:tabular-nums;font-weight:600;color:#374151;line-height:14px;letter-spacing:.1px}
+td[data-band].tqused.u1 .tqm b{background:#13786C}td[data-band].tqused.u1 .tqv{color:#0f5f55}
+td[data-band].tqused.u2 .tqm b{background:#d97706}td[data-band].tqused.u2 .tqv{color:#92400e}
+td[data-band].tqused.u3 .tqm b{background:#ea580c}td[data-band].tqused.u3 .tqv{color:#9a3412;font-weight:700}
+td[data-band].tqused.u4 .tqm b{background:#dc2626}td[data-band].tqused.u4 .tqv{background:#dc2626;color:#fff;border-radius:3px;padding:0 4px;font-weight:700}
 .tqt{display:inline-block;font-style:normal;font-size:8px;font-weight:700;padding:0 3px;border-radius:2px;margin-left:3px;vertical-align:middle;line-height:11px}.tqt.tS{background:#dcfce7;color:#14532d}.tqt.tD{background:#fef3c7;color:#92400e}
 .tqb{display:inline-block;width:4px;height:2px;margin-right:1px;background:#8b5cf6;vertical-align:bottom}.tqb.tq0{background:#e5e7eb}
 .tqa{font-weight:700}.tqa.up{color:#c2410c}.tqa.down{color:#15803d}.tqa.flat{color:#6b7280}
@@ -6621,7 +6659,7 @@ h2{font-size:10.5px;font-weight:700;color:var(--muted);margin:0;
 <body>
 <header>
   <h1>CB nuke station</h1>
-  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b66</b></span>
+  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b68</b></span>
   <span id="conn" class="conn warn" title="Connection">&#9679;</span>
   <span id="online" class="sub"></span>
   <div class="tabs">
@@ -8463,7 +8501,9 @@ function twqPaintRow(tr){
   set("twq_bal", "", "借券賣出當日餘額 "+tqN(x.bal)+" sh · 融券今日餘額 "+tqN(x.mb)+" sh · combined "+tqPct(x.comb)+" of the "+(m.ceil_pct||25)+"% ceiling", x.bal==null ? "" : tqM(x.bal)+S);
   set("twq_room", tqN(x.room), "sub-cap "+tqN(x.sub)+" - balance "+tqN(x.bal)+" = "+tqN(x.room)+" sh that may still be outstanding");
   const usedTitle = "SBL balance ÷ sub-cap"+(x.used!=null ? (x.used>=95?" - cap effectively full":x.used>=75?" - tight":x.used>=50?" - half used":" - ample") : "")+" · bar = usage; green <50, amber 50-75, orange 75-95, red ≥95";
-  const usedPaint = td => { if(!td) return; reset(td); td.textContent=tqPct(x.used); td.title=usedTitle; if(x.used!=null){ td.classList.add(x.used>=95?"u4":x.used>=75?"u3":x.used>=50?"u2":"u1"); td.style.setProperty("--tqu", Math.max(0, Math.min(100, x.used)).toFixed(1)+"%"); } };
+  const usedPaint = td => { if(!td) return; reset(td); td.title=usedTitle; if(x.used==null){ td.textContent=""; return; }
+    td.innerHTML='<span class="tqmeter"><i class="tqm"><b></b></i><span class="tqv">'+tqPct(x.used)+'</span></span>';   // slim meter + value, tier by colour
+    td.classList.add(x.used>=95?"u4":x.used>=75?"u3":x.used>=50?"u2":"u1"); td.style.setProperty("--tqu", Math.max(0, Math.min(100, x.used)).toFixed(1)+"%"); };
   usedPaint(g("twq_used")); if(g("twq_used") && x.watch) g("twq_used").classList.add("tqw");
   usedPaint(fu);                                             // the same cell mirrored into the flags band
   const tr_=tqTrend(x); set("twq_trend", "", tr_.title, tr_.html);
@@ -9948,7 +9988,7 @@ if __name__ == "__main__":
     # NOTE: reload must stay OFF (single process) so the in-memory
     # WebSocket hub works, and so the browser only opens once.
     print("=" * 62)
-    print("  NUKE STATION  BUILD borrow.b66  \u00b7  %s"
+    print("  NUKE STATION  BUILD borrow.b68  \u00b7  %s"
           % os.path.abspath(__file__))
     print("  port %s \u00b7 if this banner is missing, an OLD file is\n  running \u2014 kill that process first." % PORT)
     print("=" * 62)
