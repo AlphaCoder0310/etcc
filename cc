@@ -59,6 +59,11 @@ borrow.b61:
       Env: NUKE_TWQ_URL(_ALT), NUKE_TWQ_TPEX_URL, NUKE_TWQ_DIR (file drop), NUKE_TWQ_HISTORY,
       NUKE_TWQ_CEIL_PCT, NUKE_TWQ_SBL_PCT, NUKE_TWQ_CEIL_MODE, NUKE_TWQ_FX, NUKE_TWQ_PUBLISH,
       NUKE_TWQ_FETCH=0 to disable. Diagnostic: /api/twq/probe?date=YYYY-MM-DD&src=twse|tpex&code=2330
+borrow.b62:
+    * TW quota worker keeps going past a failed date (older sessions still load, the band shows
+      the latest session it could read), per-date 10-min retry, back-off only after two
+      consecutive failures; /api/twq carries the worker diary (log), plan and retry_in; header
+      shows "no session yet" with the reason; page re-polls every 5 s until the first session lands.
 """
 
 import asyncio
@@ -4967,8 +4972,13 @@ TWQ_FX_DEFAULT = float(os.environ.get("NUKE_TWQ_FX", "30.5"))     # TWD per USD 
 TWQ_PUBLISH = os.environ.get("NUKE_TWQ_PUBLISH", "16:00")        # Taiwan time: first try for today's report
 TWQ_TIMEOUT = float(os.environ.get("NUKE_TWQ_TIMEOUT", "20"))
 TWQ_UA = os.environ.get("NUKE_TWQ_UA", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
-_TWQ = {"sessions": {}, "nodata": {}, "lock": threading.Lock(), "busy": False, "err": "", "layout": "",
-        "fetched_at": "", "retry_at": 0.0, "loaded": False, "last_try": ""}
+_TWQ = {"sessions": {}, "nodata": {}, "failed": {}, "lock": threading.Lock(), "busy": False, "err": "", "layout": "",
+        "fetched_at": "", "retry_at": 0.0, "loaded": False, "last_try": "", "log": deque(maxlen=24)}
+
+
+def _twq_log(msg):
+    """Short worker diary, served by /api/twq so 'why is the band empty' is answered without the log file."""
+    _TWQ["log"].append("%s %s" % (datetime.now().strftime("%H:%M:%S"), msg))
 # per-ticker record: [name, margin_bal(6), margin_limit(7), sbl_bal(12), sbl_next(13), note(14), source]
 TQ_N, TQ_MB, TQ_CE, TQ_SB, TQ_NX, TQ_NOTE, TQ_SRC = range(7)
 
@@ -5234,37 +5244,52 @@ def _twq_save():
 
 
 def _twq_worker(dates):
-    """Daemon thread: fetch + parse the missing sessions (most recent first), swap in under the lock."""
+    """Daemon thread: fetch + parse the missing sessions (most recent first), swap in under the lock.
+    A date that fails is skipped (retried in 10 min) and the older dates are still fetched, so the band
+    always shows the latest session that could be read; two consecutive failures = the exchange is
+    unreachable -> stop and back off 10 min."""
     try:
         today = _twq_tw_now().date().isoformat()
-        got_any = False
+        got_any, fails, problems = False, 0, []
         for iso in dates:
+            _TWQ["last_try"] = datetime.now().strftime("%H:%M:%S")
             rows, srcs, errs = _twq_fetch_date(iso)
             now = time.time()
             if rows:
                 with _TWQ["lock"]:
                     _TWQ["sessions"][iso] = {"rows": rows, "src": "+".join(srcs), "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
                     _TWQ["nodata"].pop(iso, None)
+                    _TWQ["failed"].pop(iso, None)
                     _TWQ["fetched_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                got_any = True
+                fails = 0
+                _twq_log("%s: %d codes (%s)%s" % (iso, len(rows), "+".join(srcs), (" - partial: " + "; ".join(errs)[:120]) if errs else ""))
                 logger.info("twq %s: %d codes (%s)%s", iso, len(rows), "+".join(srcs), (" partial: " + "; ".join(errs)) if errs else "")
-            if errs:
-                _TWQ["err"] = ("partial: " if rows else "") + "; ".join(errs)[:300]
-            if errs and not rows:
-                _TWQ["retry_at"] = now + 600                # network / upstream trouble: back off 10 min
-                logger.warning("twq %s failed: %s", iso, _TWQ["err"])
-                break
-            if not rows and not errs:
+                if errs:
+                    problems.append("partial: " + "; ".join(errs))
+                if not got_any:
+                    got_any = True
+                    _twq_save()                            # the first session lands on disk at once
+            elif errs:
+                fails += 1
+                _TWQ["failed"][iso] = now + 600            # this date again in 10 min
+                problems.append("; ".join(errs))
+                _twq_log("%s FAILED: %s" % (iso, "; ".join(errs)[:160]))
+                logger.warning("twq %s failed: %s", iso, "; ".join(errs))
+                if fails >= 2:
+                    _TWQ["retry_at"] = now + 600            # exchange unreachable: back off 10 min
+                    _twq_log("2 consecutive failures - backing off 10 min")
+                    break
+            else:
                 _TWQ["nodata"][iso] = (now + 1800) if iso >= today else 0.0   # today: retry 30 min; past: holiday
+                _twq_log("%s: no report (holiday or not published yet)" % iso)
                 logger.info("twq %s: no report (holiday or not published yet)", iso)
-            if not errs:
-                _TWQ["err"] = ""
-            _TWQ["last_try"] = datetime.now().strftime("%H:%M:%S")
             time.sleep(0.5)
+        _TWQ["err"] = "; ".join(problems)[:300]              # newest problems stay visible next to the data that did load
         if got_any:
             _twq_save()
     except Exception as exc:
         _TWQ["err"] = str(exc)[:300]
+        _twq_log("worker crashed: %s" % str(exc)[:160])
         logger.warning("twq worker: %s", exc)
     finally:
         _TWQ["busy"] = False
@@ -5283,6 +5308,8 @@ def _twq_plan(now_tw=None):
         for iso in _twq_candidates(now_tw):
             if iso in _TWQ["sessions"]:
                 continue
+            if _TWQ["failed"].get(iso, 0) > now:
+                continue                                   # this date failed a moment ago: wait for its retry window
             nd = _TWQ["nodata"].get(iso)
             if nd is not None:
                 if iso < today or late or now < nd:
@@ -5311,6 +5338,7 @@ async def twq_poller():
     await asyncio.sleep(int(os.environ.get("NUKE_TWQ_DELAY", "15")))
     logger.info("twq poller started (TWSE TWT93U%s, %d sessions, publish %s TW)",
                 " + TPEx" if TWQ_TPEX_URL else "", TWQ_HISTORY, TWQ_PUBLISH)
+    _twq_log("poller started - %d sessions cached on disk" % len(_TWQ["sessions"]))
     while True:
         try:
             _twq_kick()
@@ -5461,6 +5489,7 @@ def api_twq(sids: str = ""):
     return {"ok": True, "rows": rows, "tdates": dates, "session": latest, "expected": expected,
             "pending": bool(latest < expected), "nodata": nodata[-5:], "fetched_at": _TWQ["fetched_at"],
             "busy": _TWQ["busy"], "err": _TWQ["err"], "layout": _TWQ["layout"], "last_try": _TWQ["last_try"], "hint": hint,
+            "log": list(_TWQ["log"]), "plan": _twq_plan(now_tw), "retry_in": max(0, int(_TWQ["retry_at"] - time.time())),
             "mode": TWQ_CEIL_MODE, "ceil_pct": TWQ_CEIL_PCT, "sbl_pct": TWQ_SBL_PCT,
             "stamp": "%s|%s|%s|%s|%s|%s" % (latest, _TWQ["fetched_at"], STATE.get("rfxTs") or "", _TWQ["err"] or _TWQ["layout"] or "", expected, hint[:8])}
 
@@ -6165,7 +6194,7 @@ h2{font-size:10.5px;font-weight:700;color:var(--muted);margin:0;
 <body>
 <header>
   <h1>CB nuke station</h1>
-  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b61</b></span>
+  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b62</b></span>
   <span id="conn" class="conn warn" title="Connection">&#9679;</span>
   <span id="online" class="sub"></span>
   <div class="tabs">
@@ -8013,6 +8042,7 @@ function twqPaintRow(tr){
 function twqPaintAll(){ document.querySelectorAll("#tbl tbody tr[data-id]").forEach(twqPaintRow); }
 function twqHdr(){
   const m=TQ.meta||{}; let h="";
+  if(!m.session && TQ.stamp) h+=' <span class="tqhd pend" title="'+tqEsc(m.busy ? "fetching the last sessions from TWSE / TPEx now - a few seconds per session" : (m.layout||m.err||TQ.err ? "nothing could be fetched yet: "+(m.layout||m.err||TQ.err) : "nothing fetched yet - the poller starts 15 s after launch; see /api/twq for its diary"))+'">no session yet</span>';
   if(m.session) h+=' <span class="tqhd" title="latest session in the mirror: '+m.session+(m.fetched_at?" (fetched "+m.fetched_at+")":"")+(m.tdates?" · "+m.tdates.length+" sessions of history":"")+'">'+String(m.session).slice(5)+'</span>';
   if(m.pending && m.expected) h+=' <span class="tqhd pend" title="the '+m.expected+' report is not out yet - the exchange publishes after the close; on a holiday the band stays on the previous session">waiting '+String(m.expected).slice(5)+'</span>';
   const e=m.layout||m.err||TQ.err; if(e) h+=' <span class="tqhd bad" title="'+tqEsc(e)+'">!</span>';
@@ -8029,7 +8059,7 @@ async function twqRefresh(force){
     TQ.meta=j; TQ.err=j.layout||j.err||"";
     if(j.stamp && j.stamp===TQ.stamp) return;               // same sessions, same prices, same errors: nothing to repaint
     TQ.rows=j.rows||{}; TQ.stamp=j.stamp||""; twqPaintAll(); twqHdrPaint();
-    if(j.busy && !j.session) setTimeout(()=>{ TQ.ts=0; twqRefresh(true); }, 5000);   // first backfill running: poll until the first session lands
+    if(!j.session && (TQ.boot=(TQ.boot||0)+1) <= 36) setTimeout(()=>{ TQ.ts=0; twqRefresh(true); }, 5000);   // nothing cached yet: re-poll every 5 s (3 min) so the first session shows at once
   }catch(e){ TQ.err=String(e); } finally{ TQ.inflight=false; }
 }
 setTimeout(()=>twqRefresh(true), 3500);
@@ -9474,7 +9504,7 @@ if __name__ == "__main__":
     # NOTE: reload must stay OFF (single process) so the in-memory
     # WebSocket hub works, and so the browser only opens once.
     print("=" * 62)
-    print("  NUKE STATION  BUILD borrow.b61  \u00b7  %s"
+    print("  NUKE STATION  BUILD borrow.b62  \u00b7  %s"
           % os.path.abspath(__file__))
     print("  port %s \u00b7 if this banner is missing, an OLD file is\n  running \u2014 kill that process first." % PORT)
     print("=" * 62)
