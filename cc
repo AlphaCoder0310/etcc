@@ -90,6 +90,10 @@ borrow.b67:
 borrow.b68:
     * /api/exdiv/probe?ric=2330.TW - which dividend sources this host has, one live Refinitiv child run
       with its log, the Bloomberg answer where its API exists, and the cached entry.
+borrow.b69:
+    * exdiv cache: failed entries from a previous process are retried at the first poll after a
+      restart (no hour-long blank DIV after upgrading from a Bloomberg-only build); a host with
+      neither refinitiv-data nor blpapi says so in the DIV tooltip.
 """
 
 import asyncio
@@ -4837,11 +4841,20 @@ DV_FIELDS = ["DVD_EX_DT", "DVD_SH_LAST"]
 
 
 def _dv_load():
+    """Disk cache of ex-dividend answers. Error entries lose their back-off on load: a failure recorded by the
+    previous process (e.g. a Bloomberg-only build on a host without the Terminal) must not keep the DIV
+    column blank for another hour after an upgrade or restart."""
     try:
         with open(EXDIV_FILE, "r", encoding="utf-8") as fh:
             d = json.load(fh)
         if isinstance(d, dict):
+            n = 0
+            for e in d.values():
+                if isinstance(e, dict) and e.get("error") and e.pop("retry_at", None) is not None:
+                    n += 1
             _DV["data"] = d
+            if n:
+                logger.info("exdiv cache: %d failed entries will be retried at the first poll (sources now: %s)", n, ", ".join(_exdiv_sources()))
     except Exception:
         pass
 
@@ -5045,7 +5058,11 @@ def _dv_worker(rics):
     try:
         done = {}
         errs = []
-        for src in _exdiv_sources():
+        srcs = _exdiv_sources()
+        if not (_has_module("refinitiv") or _has_module("blpapi") or _has_module("xbbg")):
+            errs.append("no dividend source on this host: install refinitiv-data (Workspace) or blpapi (Terminal)")
+            srcs = []
+        for src in srcs:
             todo = [r for r in rics if r not in done or done[r].get("error") or (not done[r].get("exdiv") and done[r].get("src") == "bbg")]
             if not todo:
                 break
@@ -5088,8 +5105,8 @@ def _dv_need(ric):
     r = _DV["data"].get(ric)
     if not r:
         return True
-    if r.get("retry_at"):
-        return time.time() >= r["retry_at"]
+    if r.get("error"):                                     # a failure is only 'fresh' while its back-off runs
+        return not r.get("retry_at") or time.time() >= r["retry_at"]
     return r.get("asof") != date.today().isoformat()
 
 
@@ -6659,7 +6676,7 @@ h2{font-size:10.5px;font-weight:700;color:var(--muted);margin:0;
 <body>
 <header>
   <h1>CB nuke station</h1>
-  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b68</b></span>
+  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b69</b></span>
   <span id="conn" class="conn warn" title="Connection">&#9679;</span>
   <span id="online" class="sub"></span>
   <div class="tabs">
@@ -9988,7 +10005,7 @@ if __name__ == "__main__":
     # NOTE: reload must stay OFF (single process) so the in-memory
     # WebSocket hub works, and so the browser only opens once.
     print("=" * 62)
-    print("  NUKE STATION  BUILD borrow.b68  \u00b7  %s"
+    print("  NUKE STATION  BUILD borrow.b69  \u00b7  %s"
           % os.path.abspath(__file__))
     print("  port %s \u00b7 if this banner is missing, an OLD file is\n  running \u2014 kill that process first." % PORT)
     print("=" * 62)
