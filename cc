@@ -99,6 +99,10 @@ borrow.b70:
       BDVD_NEXT_EST_EX_DT / BDVD_PROJ_DIV_AMT. Upcoming = latest declared ex-date if today or later,
       else the BDVD projection (shown in italics with a leading ~), else "-" with the last ex-date in
       the tooltip. Field exceptions and the ticker appear in the tooltip and /api/exdiv/probe.
+borrow.b71:
+    * NaN-proof DIV pipeline: _fnum0 returns None for NaN/inf, the exdiv cache is written strict
+      (allow_nan=False) and cleaned on load, /api/exdiv sanitises per entry - a Bloomberg 'no amount'
+      on one name can no longer turn the batched response into HTTP 500 for every row.
 """
 
 import asyncio
@@ -1474,11 +1478,25 @@ def server_rows_for_save() -> List[Dict[str, Any]]:
 
 
 def _fnum0(v):
+    """Text/number -> float, or None. NaN and inf (what Bloomberg / pandas hand back for 'no value') are None:
+    they are not numbers to the page and they are not valid JSON - one of them in a batched response is an
+    HTTP 500 for every row."""
     try:
         n = float(str(v).replace(",", ""))
-        return n
+        return n if math.isfinite(n) else None
     except (TypeError, ValueError):
         return None
+
+
+def _json_safe(o):
+    """Recursively replace non-finite floats with None so a response can never fail to serialise."""
+    if isinstance(o, float):
+        return o if math.isfinite(o) else None
+    if isinstance(o, dict):
+        return {k: _json_safe(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_json_safe(v) for v in o]
+    return o
 
 
 def ensure_snap8():
@@ -4851,7 +4869,8 @@ def _bbg_dv_entry(getv, sec, field_err=None):
     today = date.today().isoformat()
     last_ex = _bd_norm_date(getv("DVD_EX_DT"))
     est_ex = _bd_norm_date(getv("BDVD_NEXT_EST_EX_DT"))
-    e = {"ticker": sec, "src": "bbg", "last": last_ex, "pay": _bd_norm_date(getv("DVD_PAY_DT")), "type": str(getv("DVD_TYP_LAST") or "").strip() or ""}
+    typ = str(getv("DVD_TYP_LAST") or "").strip()
+    e = {"ticker": sec, "src": "bbg", "last": last_ex, "pay": _bd_norm_date(getv("DVD_PAY_DT")), "type": "" if typ.lower() in ("nan", "none", "nat") else typ}
     if last_ex and last_ex >= today:
         e.update({"exdiv": last_ex, "amount": _fnum0(getv("DVD_SH_LAST")), "est": False})
     elif est_ex and est_ex >= today:
@@ -4875,7 +4894,7 @@ def _dv_load():
             for e in d.values():
                 if isinstance(e, dict) and e.get("error") and e.pop("retry_at", None) is not None:
                     n += 1
-            _DV["data"] = d
+            _DV["data"] = _json_safe(d)                    # a file written by an older build may hold bare NaN
             if n:
                 logger.info("exdiv cache: %d failed entries will be retried at the first poll (sources now: %s)", n, ", ".join(_exdiv_sources()))
     except Exception:
@@ -4884,9 +4903,11 @@ def _dv_load():
 
 def _dv_save():
     try:
+        with _DV["lock"]:
+            body = _json_safe(_DV["data"])
         tmp = EXDIV_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(_DV["data"], fh)
+            json.dump(body, fh, allow_nan=False)            # strict: a NaN here is a bug, not a cache entry
         os.replace(tmp, EXDIV_FILE)
     except Exception as exc:
         logger.warning("exdiv cache save failed: %s", exc)
@@ -5185,7 +5206,7 @@ def api_exdiv(rics: str = ""):
             threading.Thread(target=_dv_worker, args=(need,), name="exdiv", daemon=True).start()
         elif need:
             _DV["pending"].difference_update(need)
-    return {"ok": True, "exdiv": out, "pending": len(_DV["pending"]), "busy": _DV["busy"], "err": _DV["err"]}
+    return {"ok": True, "exdiv": _json_safe(out), "pending": len(_DV["pending"]), "busy": _DV["busy"], "err": _DV["err"]}
 
 
 # ---- TW SHORT QUOTA: TWSE TWT93U (信用額度總量管制餘額表) + TPEx margin/sbl, one fetch per session, cached ----
@@ -5970,7 +5991,7 @@ def api_twq(sids: str = ""):
     if n_check >= 3 and n_check * 10 >= n_calc * 3:
         hint = ("%d of %d names show a quota above the derived cap room: the margin limit column may already net the "
                 "balances - try NUKE_TWQ_CEIL_MODE=net (currently %s)" % (n_check, n_calc, TWQ_CEIL_MODE))
-    return {"ok": True, "rows": rows, "tdates": dates, "session": latest, "expected": expected,
+    return {"ok": True, "rows": rows, "tdates": dates, "session": latest, "expected": expected,   # prices/fx pass _fnum0 (finite or None): no NaN can reach here
             "pending": bool(latest < expected), "nodata": nodata[-5:], "fetched_at": _TWQ["fetched_at"],
             "busy": _TWQ["busy"], "err": _TWQ["err"], "layout": _TWQ["layout"], "last_try": _TWQ["last_try"], "hint": hint,
             "log": list(_TWQ["log"]), "plan": _twq_plan(now_tw), "retry_in": max(0, int(_TWQ["retry_at"] - time.time())),
@@ -6707,7 +6728,7 @@ h2{font-size:10.5px;font-weight:700;color:var(--muted);margin:0;
 <body>
 <header>
   <h1>CB nuke station</h1>
-  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b70</b></span>
+  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b71</b></span>
   <span id="conn" class="conn warn" title="Connection">&#9679;</span>
   <span id="online" class="sub"></span>
   <div class="tabs">
@@ -10036,7 +10057,7 @@ if __name__ == "__main__":
     # NOTE: reload must stay OFF (single process) so the in-memory
     # WebSocket hub works, and so the browser only opens once.
     print("=" * 62)
-    print("  NUKE STATION  BUILD borrow.b70  \u00b7  %s"
+    print("  NUKE STATION  BUILD borrow.b71  \u00b7  %s"
           % os.path.abspath(__file__))
     print("  port %s \u00b7 if this banner is missing, an OLD file is\n  running \u2014 kill that process first." % PORT)
     print("=" * 62)
