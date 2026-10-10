@@ -64,6 +64,12 @@ borrow.b62:
       the latest session it could read), per-date 10-min retry, back-off only after two
       consecutive failures; /api/twq carries the worker diary (log), plan and retry_in; header
       shows "no session yet" with the reason; page re-polls every 5 s until the first session lands.
+borrow.b63:
+    * Exchange requests go through one browser-like session (cookies from the report page), 3 s apart
+      (NUKE_TWQ_PAUSE); an HTTP 307 security redirect, a non-200 or an empty answer carrying another
+      report date is an error shown in the band (not a silent "holiday"). Header: "fetching MM-DD..."
+      while the worker runs, "MM-DD no trading" for a holiday, diary in the tooltip, a refresh glyph
+      (POST /api/twq/fetch) to fetch now. File drop defaults to <app dir>/twq_drop.
 """
 
 import asyncio
@@ -4963,7 +4969,8 @@ TWQ_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "twq_cache.j
 TWQ_URLS = [u for u in (os.environ.get("NUKE_TWQ_URL", "https://www.twse.com.tw/rwd/zh/marginTrading/TWT93U"),
                         os.environ.get("NUKE_TWQ_URL_ALT", "https://www.twse.com.tw/exchangeReport/TWT93U")) if u]
 TWQ_TPEX_URL = os.environ.get("NUKE_TWQ_TPEX_URL", "https://www.tpex.org.tw/www/zh-tw/margin/sbl")
-TWQ_DIR = os.environ.get("NUKE_TWQ_DIR", "")               # optional file drop: TWT93U_YYYYMMDD.json|.csv, TPEX_SBL_YYYYMMDD.json|.csv
+TWQ_DIR = os.environ.get("NUKE_TWQ_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "twq_drop"))   # file drop: TWT93U_YYYYMMDD.json|.csv, TPEX_SBL_YYYYMMDD.json|.csv
+TWQ_PAUSE = float(os.environ.get("NUKE_TWQ_PAUSE", "3"))       # seconds between exchange requests - TWSE's security filter blocks bursts
 TWQ_HISTORY = max(2, int(os.environ.get("NUKE_TWQ_HISTORY", "10")))
 TWQ_CEIL_PCT = float(os.environ.get("NUKE_TWQ_CEIL_PCT", "25"))   # 融券+借券賣出 combined ceiling, % of listed shares
 TWQ_SBL_PCT = float(os.environ.get("NUKE_TWQ_SBL_PCT", "10"))     # 借券賣出餘額 sub-cap, % of listed shares
@@ -4973,7 +4980,7 @@ TWQ_PUBLISH = os.environ.get("NUKE_TWQ_PUBLISH", "16:00")        # Taiwan time: 
 TWQ_TIMEOUT = float(os.environ.get("NUKE_TWQ_TIMEOUT", "20"))
 TWQ_UA = os.environ.get("NUKE_TWQ_UA", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 _TWQ = {"sessions": {}, "nodata": {}, "failed": {}, "lock": threading.Lock(), "busy": False, "err": "", "layout": "",
-        "fetched_at": "", "retry_at": 0.0, "loaded": False, "last_try": "", "log": deque(maxlen=24)}
+        "fetched_at": "", "retry_at": 0.0, "loaded": False, "last_try": "", "log": deque(maxlen=24), "stat": "", "cur": ""}
 
 
 def _twq_log(msg):
@@ -5073,25 +5080,29 @@ def _twq_parse_table(fields, data, src):
     return rows
 
 
-def _twq_parse_json(j, src):
+def _twq_parse_json(j, src, want=None):
     """TWSE: {stat,date,fields,data}; TPEx: {date,tables:[{fields,data}]}. -> (rows|None, report_date|None).
-    None rows = the exchange says there is no report for that date (holiday / not yet published)."""
+    None rows = the exchange says there is no report for that date (holiday / not yet published); the reason
+    is kept in _TWQ["stat"] for the diary. An empty answer carrying a DIFFERENT report date than the one asked
+    (want) is a redirected / filtered request, raised as an error so it never passes as a holiday."""
     if not isinstance(j, dict):
         raise ValueError("response is not a JSON object")
     tbl = j
     if isinstance(j.get("tables"), list):
         tbl = next((t for t in j["tables"] if isinstance(t, dict) and t.get("data")), j["tables"][0] if j["tables"] else {})
     data = tbl.get("data") if isinstance(tbl, dict) else None
-    if not data:
-        stat = str(j.get("stat") or tbl.get("stat") or "").strip()
-        if stat and stat.upper() != "OK":
-            logger.info("twq %s: %s", src, stat[:80])
-        return None, None
-    rows = _twq_parse_table(tbl.get("fields"), data, src)
-    rd = str(j.get("date") or tbl.get("date") or "").replace("/", "").replace("-", "").strip()
+    rd = str(j.get("date") or (tbl.get("date") if isinstance(tbl, dict) else "") or "").replace("/", "").replace("-", "").strip()
     rdate = None
     if len(rd) == 8 and rd.isdigit():
         rdate = "%s-%s-%s" % (rd[:4], rd[4:6], rd[6:])
+    if not data:
+        stat = str(j.get("stat") or (tbl.get("stat") if isinstance(tbl, dict) else "") or "").strip()
+        note = "%s: stat=%s date=%s keys=%s" % (src, stat[:60] or "-", rd or "-", ",".join(list(j.keys())[:6]))
+        _TWQ["stat"] = ((_TWQ["stat"] + " | ") if _TWQ["stat"] else "") + note      # both exchanges' answers for the diary
+        if want and rdate and rdate != want and (not stat or stat.upper() == "OK"):
+            raise ValueError("answered for %s instead of %s with no rows - request redirected or filtered (%s)" % (rdate, want, _TWQ["stat"][:80]))
+        return None, None
+    rows = _twq_parse_table(tbl.get("fields"), data, src)
     return rows, rdate
 
 
@@ -5111,17 +5122,42 @@ def _twq_parse_csv(text, src):
     return _twq_parse_table(rdr[hdr], data, src)
 
 
+_TWQ_HTTP = {"sess": None, "warm": 0.0, "last": ""}
+
+
+def _twq_session():
+    """One requests.Session shared by the worker: browser-like headers and the site's cookies (picked up from the
+    report page like a browser would, refreshed every 30 min). Proxy settings come from the environment."""
+    s = _TWQ_HTTP["sess"]
+    if s is None:
+        s = requests.Session()
+        s.headers.update({"User-Agent": TWQ_UA, "Accept": "application/json, text/plain, */*",
+                          "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8", "Referer": "https://www.twse.com.tw/zh/trading/margin/twt93u.html"})
+        _TWQ_HTTP["sess"] = s
+    if time.time() - _TWQ_HTTP["warm"] > 1800:
+        _TWQ_HTTP["warm"] = time.time()
+        try:
+            s.get("https://www.twse.com.tw/zh/trading/margin/twt93u.html", timeout=TWQ_TIMEOUT)
+        except Exception:
+            pass
+    return s
+
+
 def _twq_http_json(url, params):
-    """One GET with a browser-like UA (TWSE serves a maintenance page to bare clients). Mocked in tests."""
-    r = requests.get(url, params=params, timeout=TWQ_TIMEOUT,
-                     headers={"User-Agent": TWQ_UA, "Accept": "application/json, text/plain, */*",
-                              "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
-                              "Referer": "https://www.twse.com.tw/zh/trading/margin/twt93u.html"})
-    r.raise_for_status()
+    """One GET -> parsed JSON. A redirect (TWSE's security filter answers automated bursts with HTTP 307
+    'FOR SECURITY REASONS'), a non-200 or a non-JSON body are errors - never silently 'no data'. Mocked in tests."""
+    r = _twq_session().get(url, params=params, timeout=TWQ_TIMEOUT, allow_redirects=False)
+    head = (r.text or "")[:160].replace("\n", " ").replace("\r", " ")
+    _TWQ_HTTP["last"] = "HTTP %d %s | %s" % (r.status_code, r.headers.get("Content-Type", ""), head)
+    if 300 <= r.status_code < 400:
+        raise ValueError("HTTP %d redirect to %s - the exchange's security filter blocked the request (automated / too frequent); retry later or use the file drop"
+                         % (r.status_code, (r.headers.get("Location") or "?")[:100]))
+    if r.status_code != 200:
+        raise ValueError("HTTP %d: %s" % (r.status_code, head[:80]))
     try:
         return r.json()
     except ValueError:
-        raise ValueError("non-JSON reply (%s...)" % (r.text or "")[:60].replace("\n", " "))
+        raise ValueError("non-JSON reply (%s...)" % head[:80])
 
 
 def _twq_read_drop(iso, stem, src):
@@ -5158,7 +5194,7 @@ def _twq_fetch_date(iso):
             last = None
             for u in TWQ_URLS:
                 try:
-                    got, rdate = _twq_parse_json(_twq_http_json(u, {"date": ymd, "response": "json"}), "TWSE")
+                    got, rdate = _twq_parse_json(_twq_http_json(u, {"date": ymd, "response": "json"}), "TWSE", want=iso)
                     if got and rdate and rdate != iso:
                         logger.info("twq TWSE %s answered with the %s table - treated as no report", iso, rdate)
                         got = None
@@ -5170,7 +5206,7 @@ def _twq_fetch_date(iso):
                     last = exc
                 except Exception as exc:
                     last = exc
-                time.sleep(1.0)
+                time.sleep(TWQ_PAUSE)
             if last is not None:
                 raise last
         if got:
@@ -5184,8 +5220,8 @@ def _twq_fetch_date(iso):
         try:
             got = _twq_read_drop(iso, "TPEX_SBL", "TPEX")
             if got is None and TWQ_TPEX_URL:
-                time.sleep(1.0)
-                got, rdate = _twq_parse_json(_twq_http_json(TWQ_TPEX_URL, {"date": "%s/%s/%s" % (ymd[:4], ymd[4:6], ymd[6:]), "response": "json"}), "TPEX")
+                time.sleep(TWQ_PAUSE)
+                got, rdate = _twq_parse_json(_twq_http_json(TWQ_TPEX_URL, {"date": "%s/%s/%s" % (ymd[:4], ymd[4:6], ymd[6:]), "response": "json"}), "TPEX", want=iso)
                 if got and rdate and rdate != iso:
                     logger.info("twq TPEx %s answered with the %s table - treated as no report", iso, rdate)
                     got = None
@@ -5253,6 +5289,8 @@ def _twq_worker(dates):
         got_any, fails, problems = False, 0, []
         for iso in dates:
             _TWQ["last_try"] = datetime.now().strftime("%H:%M:%S")
+            _TWQ["cur"] = iso
+            _TWQ["stat"] = ""
             rows, srcs, errs = _twq_fetch_date(iso)
             now = time.time()
             if rows:
@@ -5281,7 +5319,7 @@ def _twq_worker(dates):
                     break
             else:
                 _TWQ["nodata"][iso] = (now + 1800) if iso >= today else 0.0   # today: retry 30 min; past: holiday
-                _twq_log("%s: no report (holiday or not published yet)" % iso)
+                _twq_log("%s: no report (holiday or not published yet)%s" % (iso, (" - " + _TWQ["stat"][:220]) if _TWQ["stat"] else ""))
                 logger.info("twq %s: no report (holiday or not published yet)", iso)
             time.sleep(0.5)
         _TWQ["err"] = "; ".join(problems)[:300]              # newest problems stay visible next to the data that did load
@@ -5293,6 +5331,7 @@ def _twq_worker(dates):
         logger.warning("twq worker: %s", exc)
     finally:
         _TWQ["busy"] = False
+        _TWQ["cur"] = ""
 
 
 def _twq_plan(now_tw=None):
@@ -5480,6 +5519,11 @@ def api_twq(sids: str = ""):
         row["tdir"] = cached[2]
         row["watch"] = bool(row["bind"] == "sub-cap" or (row["used"] is not None and row["used"] >= 70 and chg is not None and chg >= 3))
         rows[str(sid)] = row
+    exp_state = "waiting"
+    if expected in _TWQ["sessions"]:
+        exp_state = "have"
+    elif _TWQ["nodata"].get(expected) == 0.0 or (expected in _TWQ["nodata"] and expected < now_tw.date().isoformat()):
+        exp_state = "holiday"                              # the exchange published nothing for that day
     n_calc = sum(1 for r in rows.values() if r.get("bind"))
     n_check = sum(1 for r in rows.values() if r.get("bind") == "check")
     hint = ""
@@ -5490,8 +5534,28 @@ def api_twq(sids: str = ""):
             "pending": bool(latest < expected), "nodata": nodata[-5:], "fetched_at": _TWQ["fetched_at"],
             "busy": _TWQ["busy"], "err": _TWQ["err"], "layout": _TWQ["layout"], "last_try": _TWQ["last_try"], "hint": hint,
             "log": list(_TWQ["log"]), "plan": _twq_plan(now_tw), "retry_in": max(0, int(_TWQ["retry_at"] - time.time())),
+            "cur": _TWQ["cur"], "exp_state": exp_state, "drop_dir": TWQ_DIR, "http_last": _TWQ_HTTP["last"],
             "mode": TWQ_CEIL_MODE, "ceil_pct": TWQ_CEIL_PCT, "sbl_pct": TWQ_SBL_PCT,
             "stamp": "%s|%s|%s|%s|%s|%s" % (latest, _TWQ["fetched_at"], STATE.get("rfxTs") or "", _TWQ["err"] or _TWQ["layout"] or "", expected, hint[:8])}
+
+
+@app.post("/api/twq/fetch")
+def api_twq_fetch(date: str = ""):
+    """Manual 'fetch now' (the band header's refresh glyph): forgets the back-offs - for one date or all - and
+    starts the worker at once. Returns the plan it will work through."""
+    with _TWQ["lock"]:
+        if date.strip():
+            _TWQ["nodata"].pop(date.strip(), None)
+            _TWQ["failed"].pop(date.strip(), None)
+        else:
+            _TWQ["failed"].clear()
+            today = _twq_tw_now().date().isoformat()
+            for k in [k for k, v in _TWQ["nodata"].items() if v or k >= today]:
+                _TWQ["nodata"].pop(k, None)
+    _TWQ["retry_at"] = 0.0
+    _twq_log("manual fetch requested%s" % ((" for " + date.strip()) if date.strip() else ""))
+    plan = _twq_kick()
+    return {"ok": True, "plan": plan, "busy": _TWQ["busy"], "log": list(_TWQ["log"])[-6:]}
 
 
 @app.get("/api/twq/probe")
@@ -5506,7 +5570,7 @@ def api_twq_probe(date: str = "", src: str = "twse", code: str = ""):
         else:
             j = _twq_http_json(TWQ_URLS[0], {"date": ymd, "response": "json"})
     except Exception as exc:
-        return {"ok": False, "date": iso, "src": src, "error": str(exc)[:300]}
+        return {"ok": False, "date": iso, "src": src, "error": str(exc)[:300], "http": _TWQ_HTTP["last"]}
     tbl = j
     if isinstance(j, dict) and isinstance(j.get("tables"), list) and j["tables"]:
         tbl = j["tables"][0]
@@ -6194,7 +6258,7 @@ h2{font-size:10.5px;font-weight:700;color:var(--muted);margin:0;
 <body>
 <header>
   <h1>CB nuke station</h1>
-  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b62</b></span>
+  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b63</b></span>
   <span id="conn" class="conn warn" title="Connection">&#9679;</span>
   <span id="online" class="sub"></span>
   <div class="tabs">
@@ -7456,7 +7520,7 @@ function bandPaint(k, hid){
     td.title = BANDS[k].label + " (collapsed - click to expand)";
   } else {
     const ws = (k==="cls") ? ' <a class="wslink" href="'+location.pathname.replace(/[/]+$/,"")+'/class" target="_blank" onclick="event.stopPropagation()" title="open the CLASS workspace (sections, carry inputs, what-if)">workspace &#8599;</a>' : "";
-    const tq = (k==="twq" && typeof twqHdr==="function") ? twqHdr() : "";
+    const tq = (k==="twq" && typeof twqHdr==="function") ? (twqHdr() + ' <span class="fxnow" title="fetch the missing sessions from the exchange now (forgets the back-off)" onclick="event.stopPropagation(); twqNow()">&#8635;</span>') : "";
     td.innerHTML = BANDS[k].label + ts + rf + vr + ws + tq + " &#9662;";
     td.title = (k==="cls") ? "CB Code v3.1 from the live grid: delta, parity, override mid, CSprd, ImpVol, Bloomberg dates, realised vols. Click to collapse." : "Click to collapse";
   }
@@ -8042,14 +8106,23 @@ function twqPaintRow(tr){
 function twqPaintAll(){ document.querySelectorAll("#tbl tbody tr[data-id]").forEach(twqPaintRow); }
 function twqHdr(){
   const m=TQ.meta||{}; let h="";
-  if(!m.session && TQ.stamp) h+=' <span class="tqhd pend" title="'+tqEsc(m.busy ? "fetching the last sessions from TWSE / TPEx now - a few seconds per session" : (m.layout||m.err||TQ.err ? "nothing could be fetched yet: "+(m.layout||m.err||TQ.err) : "nothing fetched yet - the poller starts 15 s after launch; see /api/twq for its diary"))+'">no session yet</span>';
+  const diary = (m.log&&m.log.length) ? "\\n\\nworker diary:\\n"+m.log.slice(-5).join("\\n") : "";
+  if(!m.session && TQ.stamp) h+=' <span class="tqhd pend" title="'+tqEsc((m.busy ? "fetching from TWSE / TPEx now"+(m.cur?" ("+m.cur+")":"")+" - a few seconds per session" : (m.layout||m.err||TQ.err ? "nothing could be fetched yet: "+(m.layout||m.err||TQ.err) : "nothing fetched yet - the poller starts 15 s after launch"))+(m.retry_in?" \u00b7 next automatic retry in "+Math.ceil(m.retry_in/60)+" min":"")+" \u00b7 click \u21bb to fetch now, or drop the exchange file into "+(m.drop_dir||"twq_drop")+diary)+'">'+(m.busy ? "fetching"+(m.cur?" "+String(m.cur).slice(5):"")+"\u2026" : "no session yet")+'</span>';
   if(m.session) h+=' <span class="tqhd" title="latest session in the mirror: '+m.session+(m.fetched_at?" (fetched "+m.fetched_at+")":"")+(m.tdates?" · "+m.tdates.length+" sessions of history":"")+'">'+String(m.session).slice(5)+'</span>';
-  if(m.pending && m.expected) h+=' <span class="tqhd pend" title="the '+m.expected+' report is not out yet - the exchange publishes after the close; on a holiday the band stays on the previous session">waiting '+String(m.expected).slice(5)+'</span>';
+  if(m.pending && m.expected && m.exp_state==="holiday") h+=' <span class="tqhd" title="the exchange published no report for '+m.expected+' (holiday / no trading) - showing the latest session">'+String(m.expected).slice(5)+' no trading</span>';
+  else if(m.pending && m.expected) h+=' <span class="tqhd pend" title="the '+m.expected+' report is not out yet - the exchange publishes after the close; on a holiday the band stays on the previous session'+tqEsc(diary)+'">waiting '+String(m.expected).slice(5)+'</span>';
   const e=m.layout||m.err||TQ.err; if(e) h+=' <span class="tqhd bad" title="'+tqEsc(e)+'">!</span>';
   if(m.hint) h+=' <span class="tqhd pend" title="'+tqEsc(m.hint)+'">basis?</span>';
   return h;
 }
 function twqHdrPaint(){ if(!document.getElementById("band-twq")) return; if(!bandHidden().twq) bandPaint("twq", false); }
+async function twqNow(){
+  try{ const base=location.pathname.replace(new RegExp("[/]+$"),"");
+    const r=await fetch(base+"/api/twq/fetch",{method:"POST"}); const j=await r.json();
+    TQ.meta=Object.assign({}, TQ.meta||{}, {busy:true, log:(j&&j.log)||[]}); twqHdrPaint();
+    let n=0; const tick=()=>{ TQ.ts=0; twqRefresh(true); if(++n<24) setTimeout(tick, 5000); }; setTimeout(tick, 3000);   // follow the fetch for 2 min
+  }catch(e){ TQ.err=String(e); twqHdrPaint(); }
+}
 async function twqRefresh(force){
   if(TQ.inflight) return; if(document.hidden && !force) return;
   const now=Date.now(); if(!force && now-TQ.ts<60000) return; TQ.ts=now; TQ.inflight=true;
@@ -9504,7 +9577,7 @@ if __name__ == "__main__":
     # NOTE: reload must stay OFF (single process) so the in-memory
     # WebSocket hub works, and so the browser only opens once.
     print("=" * 62)
-    print("  NUKE STATION  BUILD borrow.b62  \u00b7  %s"
+    print("  NUKE STATION  BUILD borrow.b63  \u00b7  %s"
           % os.path.abspath(__file__))
     print("  port %s \u00b7 if this banner is missing, an OLD file is\n  running \u2014 kill that process first." % PORT)
     print("=" * 62)
