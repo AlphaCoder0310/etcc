@@ -76,6 +76,14 @@ borrow.b64:
       curl.exe (--proxy-anyauth as the logged-in user); the transport that works is remembered.
       Evening timing: first attempt NUKE_TWQ_PUBLISH=20:00 TW, late from NUKE_TWQ_DUE=21:30 (one clock
       for both); redirect wording no longer blames the exchange. /api/twq shows via + proxy.
+borrow.b65:
+    * Used% cell is a heat scale: data bar (length = usage, colour = tier) on a tint of the same hue,
+      green <50 / amber 50-75 / orange 75-95 / solid red >=95 with white text; cleared on blank rows.
+borrow.b66:
+    * DIV flag: next declared ex-dividend date from Refinitiv (TR.DivExDate events ahead, separate
+      process) when Bloomberg's API is not on the host (NUKE_EXDIV_SRC=auto|bbg|rfx); shown like the
+      other date chips (03 Nov 26) with dividend / pay date / source in the tooltip.
+    * flags band +1: USED% - the TW quota band's SBL usage cell (same heat bar) mirrored into flags.
 """
 
 import asyncio
@@ -4906,24 +4914,157 @@ def bbg_exdiv(rics):
         sess.stop()
 
 
+_XDIV_CHILD = r"""
+import json, sys, os, datetime
+try:
+    import refinitiv.data as rd
+    rd.open_session()
+    rics = json.loads(sys.argv[1])
+    today = datetime.date.today()
+    sd, ed = today.isoformat(), (today + datetime.timedelta(days=400)).isoformat()
+    out = {}
+
+    def clean(v):
+        s = "" if v is None else str(v).strip()
+        return "" if s.lower() in ("", "nan", "nat", "<na>", "none") else s
+
+    def col(df, *words):
+        for c in df.columns:
+            k = (str(c[-1]) if isinstance(c, tuple) else str(c)).strip().lower().replace("_", " ")
+            if all(w in k for w in words):
+                return c
+        return None
+
+    try:   # declared dividend events ahead: earliest ex-date on/after today per instrument
+        df = rd.get_data(universe=rics, fields=["TR.DivExDate", "TR.DivPayDate", "TR.DivUnadjustedGross", "TR.DivType"],
+                         parameters={"SDate": sd, "EDate": ed})
+        print("events shape=%s cols=%s" % (getattr(df, "shape", "?"), [str(c) for c in df.columns][:6]), file=sys.stderr)
+        ci = col(df, "instrument") or df.columns[0]
+        cx = col(df, "ex", "date"); cp = col(df, "pay", "date"); ca = col(df, "gross") or col(df, "amount"); ct = col(df, "type")
+        if cx is not None:
+            for _, r in df.iterrows():
+                ric = clean(r[ci]); x = clean(r[cx])[:10]
+                if not ric or not x or x < sd:
+                    continue
+                cur = out.get(ric)
+                if cur is None or x < cur["exdiv"]:
+                    amt = None
+                    try:
+                        amt = float(clean(r[ca])) if ca is not None and clean(r[ca]) else None
+                    except ValueError:
+                        amt = None
+                    out[ric] = {"exdiv": x, "pay": clean(r[cp])[:10] if cp is not None else "", "amount": amt,
+                                "type": clean(r[ct]) if ct is not None else "", "src": "rfx"}
+    except Exception as exc:
+        print("events query failed: %s" % exc, file=sys.stderr)
+    missing = [r for r in rics if r not in out]
+    if missing:
+        try:   # instruments without a declared event ahead: confirm they answered (-> '--' rather than 'no data')
+            df = rd.get_data(universe=missing, fields=["TR.ExDividendDate"])
+            ci = col(df, "instrument") or df.columns[0]
+            cx = next((c for c in df.columns if c != ci), None)
+            for _, r in df.iterrows():
+                ric = clean(r[ci])
+                if not ric:
+                    continue
+                last = clean(r[cx])[:10] if cx is not None else ""
+                out[ric] = {"exdiv": last if last >= sd else "", "last": last, "pay": "", "amount": None, "type": "", "src": "rfx"}
+        except Exception as exc:
+            print("ex-date query failed: %s" % exc, file=sys.stderr)
+    print("XDIVJSON:" + json.dumps(out))
+except Exception as exc:
+    print("XDIVJSON:{}")
+    print("exdiv child error: %s" % exc, file=sys.stderr)
+"""
+
+
+def rfx_exdiv(rics):
+    """Next declared ex-dividend date per RIC from Refinitiv (TR.DivExDate events ahead), in a separate process
+    with its own Workspace session - the realtime feed is never touched; a hang is killed by the timeout."""
+    import subprocess as _sp, sys as _sys
+    rics = [r for r in rics if r]
+    if not rics:
+        return {}
+    if (time.time() - globals().get("_SESS_OPEN_TS", 0)) < 90:
+        raise RuntimeError("Refinitiv session reopened <90s ago - retrying later")
+    p = _sp.run([_sys.executable, "-c", _XDIV_CHILD, json.dumps(rics)], capture_output=True, text=True,
+                timeout=int(os.environ.get("NUKE_EXDIV_TIMEOUT", "150")), cwd=os.getcwd(), env=os.environ.copy())
+    out = None
+    for line in (p.stdout or "").splitlines():
+        if line.startswith("XDIVJSON:"):
+            out = json.loads(line[len("XDIVJSON:"):])
+            break
+    if p.stderr and (out is None or len(out) < len(rics)):
+        for ln in p.stderr.strip().splitlines()[-8:]:
+            logger.info("exdiv child | %s", ln.strip()[:220])
+    if out is None:
+        raise RuntimeError("Refinitiv ex-div child gave no result")
+    return out
+
+
+def _has_module(name):
+    if name in sys.modules:
+        return True
+    try:
+        import importlib.util as _iu
+        return _iu.find_spec(name) is not None
+    except Exception:
+        return False
+
+
+def _exdiv_sources():
+    """NUKE_EXDIV_SRC = auto | bbg | rfx. auto: Bloomberg when its API is installed on this host, Refinitiv otherwise
+    (the Nuke server runs the Workspace session but usually has no Terminal); the other one fills the gaps."""
+    want = os.environ.get("NUKE_EXDIV_SRC", "auto").lower()
+    has_bbg = _has_module("blpapi") or _has_module("xbbg")
+    has_rfx = _has_module("refinitiv")
+    if want == "bbg":
+        return ["bbg"]
+    if want == "rfx":
+        return ["rfx"]
+    order = (["bbg"] if has_bbg else []) + (["rfx"] if has_rfx else [])
+    return order or ["bbg"]
+
+
 def _dv_worker(rics):
+    """Next ex-dividend dates for the RICs that need a refresh: Bloomberg and/or Refinitiv per _exdiv_sources(),
+    each failure contained; results cached to disk, retried after an hour when a source fails."""
     today = date.today().isoformat()
     try:
-        for i in range(0, len(rics), BD_BATCH):
-            batch = rics[i:i + BD_BATCH]
+        done = {}
+        errs = []
+        for src in _exdiv_sources():
+            todo = [r for r in rics if r not in done or done[r].get("error") or (not done[r].get("exdiv") and done[r].get("src") == "bbg")]
+            if not todo:
+                break
             try:
-                res = bbg_exdiv(batch)
-                with _DV["lock"]:
-                    for r in batch:
-                        e = dict(res.get(r) or {"error": "no data"}); e["asof"] = today
-                        _DV["data"][r] = e
-                _DV["err"] = ""
+                if src == "bbg":
+                    res = {}
+                    for i in range(0, len(todo), BD_BATCH):
+                        res.update(bbg_exdiv(todo[i:i + BD_BATCH]))
+                    for r in todo:
+                        e = dict(res.get(r) or {"error": "no data"}); e.setdefault("src", "bbg")
+                        if not e.get("error") or r not in done:
+                            done[r] = e
+                else:
+                    res = rfx_exdiv(todo)
+                    for r in todo:
+                        if r in res:
+                            e = dict(res[r]); e.setdefault("src", "rfx")
+                            done[r] = e
+                        elif r not in done:
+                            done[r] = {"error": "no Refinitiv dividend data", "src": "rfx"}
             except Exception as exc:
-                _DV["err"] = str(exc)[:200]
-                logger.warning("exdiv fetch failed (%d rics): %s", len(batch), exc)
-                with _DV["lock"]:
-                    for r in batch:
-                        _DV["data"][r] = {"error": str(exc)[:120], "asof": today, "retry_at": time.time() + 3600}
+                errs.append("%s: %s" % (src, str(exc)[:160]))
+                logger.warning("exdiv %s fetch failed (%d rics): %s", src, len(todo), exc)
+        with _DV["lock"]:
+            for r in rics:
+                e = dict(done.get(r) or {"error": (errs[-1] if errs else "no data")})
+                e["asof"] = today
+                if e.get("error"):
+                    e["retry_at"] = time.time() + (120 if "reopened" in str(e.get("error")) else 3600)   # session just reopened: soon, not in an hour
+                _DV["data"][r] = e
+        _DV["err"] = "; ".join(errs)[:200]
         _dv_save()
     finally:
         with _DV["lock"]:
@@ -6328,7 +6469,11 @@ td[data-c="twq_lim"].tqc{background:#fff7ed;font-weight:700}td[data-c="twq_sess"
 td[data-band="twq"].tqc.tqw{background:#fffbeb}
 .tqp{display:inline-block;padding:0 5px;border-radius:3px;font:700 9px 'Segoe UI',system-ui,sans-serif;line-height:14px;letter-spacing:.3px}
 .tqp.sc{background:#b91c1c;color:#fff}.tqp.th{background:#dbeafe;color:#1e3a8a}.tqp.rs{background:#e5e7eb;color:#374151}.tqp.ck{background:#fde68a;color:#78350f}
-td[data-c="twq_used"].u1{color:#15803d}td[data-c="twq_used"].u2{color:#1d4ed8}td[data-c="twq_used"].u3{color:#c2410c;font-weight:700}td[data-c="twq_used"].u4{background:#b91c1c !important;color:#fff;font-weight:700}
+td[data-band].tqused{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+td[data-band].tqused.u1{color:#14532d;background:linear-gradient(90deg,#86efac var(--tqu,0%),#f0fdf4 var(--tqu,0%))}
+td[data-band].tqused.u2{color:#78350f;background:linear-gradient(90deg,#fcd34d var(--tqu,0%),#fffbeb var(--tqu,0%))}
+td[data-band].tqused.u3{color:#7c2d12;font-weight:700;background:linear-gradient(90deg,#fb923c var(--tqu,0%),#fff7ed var(--tqu,0%))}
+td[data-band].tqused.u4{background:#b91c1c !important;color:#fff;font-weight:700}
 .tqt{display:inline-block;font-style:normal;font-size:8px;font-weight:700;padding:0 3px;border-radius:2px;margin-left:3px;vertical-align:middle;line-height:11px}.tqt.tS{background:#dcfce7;color:#14532d}.tqt.tD{background:#fef3c7;color:#92400e}
 .tqb{display:inline-block;width:4px;height:2px;margin-right:1px;background:#8b5cf6;vertical-align:bottom}.tqb.tq0{background:#e5e7eb}
 .tqa{font-weight:700}.tqa.up{color:#c2410c}.tqa.down{color:#15803d}.tqa.flat{color:#6b7280}
@@ -6476,7 +6621,7 @@ h2{font-size:10.5px;font-weight:700;color:var(--muted);margin:0;
 <body>
 <header>
   <h1>CB nuke station</h1>
-  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b64</b></span>
+  <span class="sub">/GetNukedCBPrice &middot; wlb4 &middot; cbanalytics &middot; eqrms &middot; refinitiv &middot; cba_app &middot; <b style="color:#6b4b8a">borrow.b66</b></span>
   <span id="conn" class="conn warn" title="Connection">&#9679;</span>
   <span id="online" class="sub"></span>
   <div class="tabs">
@@ -6769,7 +6914,7 @@ const COL_DEFS = [
   ["d_vs","\u0394 vs live bid",""],["mid_drift","MID DRIFT",""],
   ["f_call","CALL","grp"],["f_trig","TRIG%",""],["f_exp","EXP",""],["f_put","PUT",""],
   ["f_div","DIV",""],["f_move","MOVE",""],["f_hedged","HEDGED",""],["f_nuke","NUKE",""],
-  ["f_vol","VOL",""],
+  ["f_vol","VOL",""],["f_used","USED%",""],
   ["v_iv","ImpVol","grp"],["v_10","V10",""],["v_30","V30",""],["v_90","V90",""],
   ["v_n",'VN <input id="volN" size="2" oninput="volNChanged(this)">',""],
   ["v_vega","Vega",""],
@@ -6805,7 +6950,7 @@ const DEF_W = {secId:97, company:180, short_name:110, und_fx:92,
                dc_notl:96, dc_delta:64, dc_shares:92, dc_usd:96,
                cn_start:54, cn_end:54, cn_twap:72, cn_vwap:72, cn_vol:84, cn_tk:120,
                hn_delta:56, hn_astk:68, hn_afx:64, hn_abond:68, hn_cstk:68, hn_cfx:64, hn_dn:76,
-               f_trig:50, f_hedged:52,
+               f_trig:50, f_hedged:52, f_used:62,
                idb_bid:62, idb_bref:60, idb_btime:64, idb_ask:62, idb_aref:60, idb_atime:64,
                idb_ref:62, idb_my_bid:62, idb_my_ask:62, idb_gap_b:58, idb_gap_a:58, idb_gap:58, idb_flag:170};
 const SIDE_W_DEF = 172;   // left secid panel; LAYOUT._side overrides
@@ -7511,7 +7656,7 @@ function buildTable(idsOpt){
     `<td colspan="9" class="gm grp bandhd" id="band-model" onclick="bandToggle('model')">model (last nuke) &#9662;</td>` +
     `<td colspan="13" class="tq grp bandhd" id="band-twq" onclick="bandToggle('twq')" title="read-only mirror of the exchange's daily 信用額度總量管制餘額表 (TWSE TWT93U, TPEx margin/sbl): next-session SBL quota, which limit binds, listed shares and the 10% SBL sub-cap, balance, room, usage trend, USD capacity and sessions to fill. Fetched once per session in the background; nothing here touches pricing.">tw short quota &#9662;</td>` +
     `<td colspan="18" class="go grp bandhd" id="band-res" onclick="bandToggle('res')">override result &#9662;</td>` +
-    `<td colspan="9" class="fb grp bandhd" id="band-flags" onclick="bandToggle('flags')">flags &#9662;</td>` +
+    `<td colspan="10" class="fb grp bandhd" id="band-flags" onclick="bandToggle('flags')">flags &#9662;</td>` +
     `<td colspan="6" class="vb grp bandhd" id="band-vol" onclick="bandToggle('vol')">vol &#9662;</td>` +
     `<td colspan="3" class="lr grp bandhd" id="band-lrisk" onclick="bandToggle('lrisk')" title="read-only mirror of Delta Scan (same numbers, mapped by RIC): Live delta = net_live, delta T1 = net_t1, Unbooked = unbooked_est, in USD; refreshed from the cached scan at most every 15s">live risk &#9662;</td>` +
     `<td colspan="9" class="cl grp bandhd" id="band-cls" onclick="bandToggle('cls')" title="CB Code v3.1 (classification): computed server-side from the live grid - delta, parity, override mid, CSprd, ImpVol, Bloomberg dates, realised vols. Click the workspace link for sections, carry inputs and the what-if.">class &#9662; <a href="${location.pathname.replace(/[/]+$/,'')}/class" target="_blank" onclick="event.stopPropagation()" style="color:#1e3a6e;text-decoration:underline;font-weight:600;margin-left:6px">workspace &#8599;</a></td>` +
@@ -7565,7 +7710,7 @@ function buildTable(idsOpt){
       `<td data-r="credit_spread_used" data-band="model" class="rowclick gM"
          title="credit_spread_used x 10000, bps (cbanalytics.lp_model_output)"></td>` +
       `<td data-c="twq_lim" data-band="twq" class="rowclick tqc grp bfirst" title="次一營業日可限額 - SBL short-sale quota for the next session (shares)"></td>` +
-      ["twq_bind","twq_iss","twq_sub","twq_bal","twq_room","twq_used","twq_trend","twq_thr","twq_cap","twq_roomusd","twq_sess","twq_dt"].map(k=>`<td data-c="${k}" data-band="twq" class="rowclick tqc"></td>`).join("") +
+      ["twq_bind","twq_iss","twq_sub","twq_bal","twq_room","twq_used","twq_trend","twq_thr","twq_cap","twq_roomusd","twq_sess","twq_dt"].map(k=>`<td data-c="${k}" data-band="twq" class="rowclick tqc${k==="twq_used"?" tqused":""}"></td>`).join("") +
       `<td class="gc inp gO grp rsel bfirst" data-band="res"><input class="sprd"
          data-u="x_bid" data-id="${id}" onchange="sprdChanged(this)"
          autocomplete="off" placeholder="&#8212;"></td>` +
@@ -7610,6 +7755,7 @@ function buildTable(idsOpt){
          data-u="vol_flag" data-id="${id}" onchange="volChanged(this)">
          <option value=""></option><option>Cheap</option>
          <option>Rich</option></select></td>` +
+      `<td data-fl="f_used" data-band="flags" class="rowclick tqused" title="SBL sub-cap usage from the TW short quota band (TWSE / TPEx names only)"></td>` +
       ["iv","10","30","90","n","vega"].map((n,i)=>
         `<td data-v="${n}" data-band="vol" class="rowclick${i===0?" grp bfirst":""}"
            title="realised vol, annualised (\u221a252), from daily closes"></td>`).join("") +
@@ -7675,7 +7821,7 @@ const BANDS = {
   model:{label:"model (last nuke)",span:9},
   twq:{label:"tw short quota",span:13},
   res:{label:"override result",span:18},
-  flags:{label:"flags",span:9},
+  flags:{label:"flags",span:10},
   vol:{label:"vol",span:6,vr:true},
   lrisk:{label:"live risk",span:3},
   cls:{label:"class",span:9},
@@ -7867,19 +8013,22 @@ async function dvRefresh(force){
 }
 function dvPaint(tr, dv, ref, today){
   dv.classList.remove("fl-red","fl-amb","fl-dim");
+  today = new Date(today.getFullYear(), today.getMonth(), today.getDate());   // whole days: 'in 10d' stays 10 all day long
   const ric=((tr.querySelector("td[data-r='ric']")||{}).textContent||"").trim().toUpperCase(); const r=ric?DV.byRic[ric]:null;
   const model=ref.next_div_date?String(ref.next_div_date).slice(0,10):"";
+  const srcName = r ? (r.src==="rfx" ? "Refinitiv" : "Bloomberg") : "";
+  const fmt = iso => new Date(iso+"T00:00:00").toLocaleDateString("en-GB",{day:"2-digit",month:"short",year:"2-digit"});
   if(r && !r.error){
-    if(!r.exdiv){ dv.textContent="\u2014"; dv.classList.add("fl-dim"); dv.title="Bloomberg: no ex-dividend date for "+(r.ticker||ric)+(model?" \u00b7 model: "+model:""); return; }
+    if(!r.exdiv){ dv.textContent="\u2014"; dv.classList.add("fl-dim"); dv.title=srcName+": no declared ex-dividend date ahead for "+(r.ticker||ric)+(r.last?" \u00b7 last ex-div "+r.last:"")+(model?" \u00b7 model: "+model:""); return; }
     const d=new Date(r.exdiv+"T00:00:00"); const days=Math.round((d-today)/86400000);
-    if(days<0){ dv.textContent="\u2014"; dv.classList.add("fl-dim"); dv.title="last ex-div "+r.exdiv+" (passed "+(-days)+"d ago) - no future ex-date on Bloomberg"+(model?" \u00b7 model: "+model:""); return; }
-    dv.textContent=r.exdiv.slice(5); dv.classList.add(days<=FLAG_TH.divRed?"fl-red":days<=FLAG_TH.divAmb?"fl-amb":"fl-dim");
-    dv.title="next ex-div "+r.exdiv+" (in "+days+"d) \u00b7 Bloomberg "+(r.ticker||"")+(r.amount!=null?" \u00b7 last dividend "+r.amount:"")+(model&&model!==r.exdiv?" \u00b7 model: "+model:""); return; }
-  // fallback: model date while Bloomberg has not answered (or failed)
+    if(days<0){ dv.textContent="\u2014"; dv.classList.add("fl-dim"); dv.title="last ex-div "+r.exdiv+" (passed "+(-days)+"d ago) - no future ex-date on "+srcName+(model?" \u00b7 model: "+model:""); return; }
+    dv.textContent=fmt(r.exdiv); dv.classList.add(days<=FLAG_TH.divRed?"fl-red":days<=FLAG_TH.divAmb?"fl-amb":"fl-dim");
+    dv.title="next ex-dividend date "+r.exdiv+" (in "+days+"d)"+(r.amount!=null?" \u00b7 dividend "+r.amount:"")+(r.pay?" \u00b7 pay "+r.pay:"")+(r.type?" \u00b7 "+r.type:"")+" \u00b7 "+srcName+" "+(r.ticker||"")+(model&&model!==r.exdiv?" \u00b7 model: "+model:""); return; }
+  // fallback: model date while the source has not answered (or failed)
   if(model){ const dd=new Date(model); const days=(dd-today)/86400000;
-    if(isFinite(days) && days>=0){ dv.textContent=model.slice(5); dv.classList.add(days<=FLAG_TH.divRed?"fl-red":days<=FLAG_TH.divAmb?"fl-amb":"fl-dim"); dv.title="model next ex-div "+model+(r&&r.error?" \u00b7 Bloomberg: "+r.error:" \u00b7 waiting for Bloomberg"); }
+    if(isFinite(days) && days>=0){ dv.textContent=fmt(model); dv.classList.add(days<=FLAG_TH.divRed?"fl-red":days<=FLAG_TH.divAmb?"fl-amb":"fl-dim"); dv.title="model next ex-div "+model+(r&&r.error?" \u00b7 "+srcName+": "+r.error:" \u00b7 waiting for the dividend source"); }
     else { dv.textContent=""; dv.title=""; } }
-  else { dv.textContent=""; dv.title=(r&&r.error)?"Bloomberg: "+r.error:"no dividend data yet"; }
+  else { dv.textContent=""; dv.title=(r&&r.error)?srcName+": "+r.error:"no dividend data yet"; }
 }
 function _dateChip(td, iso, yearsFallback, kind, flag){
   if(!td) return;
@@ -8290,9 +8439,11 @@ function twqPaintRow(tr){
   if(tr.dataset.twqSig === sig) return;                     // new payload, but this row's numbers did not move
   tr.dataset.twqSig = sig;
   const g = k => tr.querySelector('td[data-c="'+k+'"]');
-  const reset = td => td.classList.remove("u1","u2","u3","u4","tqw");
+  const reset = td => { td.classList.remove("u1","u2","u3","u4","tqw"); if(td.classList.contains("tqused")) td.style.removeProperty("--tqu"); };
+  const fu = tr.querySelector('td[data-fl="f_used"]');
   if(!x || x.na){
     TQ_COLS.forEach(k=>{ const td=g(k); if(!td) return; reset(td); td.textContent=""; td.title = x ? x.na : (TQ.stamp ? "not a TWSE / TPEx listing (RIC suffix .TW or .TWO)" : (TQ.err||"waiting for the quota mirror")); });
+    if(fu){ reset(fu); fu.textContent=""; fu.title = x ? x.na : "SBL sub-cap usage: TWSE / TPEx names only"; }
     if(x){ const l=g("twq_lim"); if(l) l.textContent="n/a"; }
     return;
   }
@@ -8311,8 +8462,10 @@ function twqPaintRow(tr){
   set("twq_sub", "", "SBL sub-cap "+(m.sbl_pct||10)+"% of listed shares = "+tqN(x.sub)+" sh", x.sub==null ? "" : tqM(x.sub)+D);
   set("twq_bal", "", "借券賣出當日餘額 "+tqN(x.bal)+" sh · 融券今日餘額 "+tqN(x.mb)+" sh · combined "+tqPct(x.comb)+" of the "+(m.ceil_pct||25)+"% ceiling", x.bal==null ? "" : tqM(x.bal)+S);
   set("twq_room", tqN(x.room), "sub-cap "+tqN(x.sub)+" - balance "+tqN(x.bal)+" = "+tqN(x.room)+" sh that may still be outstanding");
-  set("twq_used", tqPct(x.used), "SBL balance ÷ sub-cap"+(x.used!=null ? (x.used>=95?" - cap effectively full":x.used>=75?" - tight":x.used>=50?" - half used":" - ample") : ""));
-  const u=g("twq_used"); if(u && x.used!=null) u.classList.add(x.used>=95?"u4":x.used>=75?"u3":x.used>=50?"u2":"u1");
+  const usedTitle = "SBL balance ÷ sub-cap"+(x.used!=null ? (x.used>=95?" - cap effectively full":x.used>=75?" - tight":x.used>=50?" - half used":" - ample") : "")+" · bar = usage; green <50, amber 50-75, orange 75-95, red ≥95";
+  const usedPaint = td => { if(!td) return; reset(td); td.textContent=tqPct(x.used); td.title=usedTitle; if(x.used!=null){ td.classList.add(x.used>=95?"u4":x.used>=75?"u3":x.used>=50?"u2":"u1"); td.style.setProperty("--tqu", Math.max(0, Math.min(100, x.used)).toFixed(1)+"%"); } };
+  usedPaint(g("twq_used")); if(g("twq_used") && x.watch) g("twq_used").classList.add("tqw");
+  usedPaint(fu);                                             // the same cell mirrored into the flags band
   const tr_=tqTrend(x); set("twq_trend", "", tr_.title, tr_.html);
   set("twq_thr", x.bind==="throttle" ? tqN(x.lim) : (x.bind==="sub-cap" ? "≥ room" : ""), "30% x 30-session average volume: equals the published quota when it binds; only known to be ≥ the cap room when the sub-cap binds (the report carries no volume)");
   const pxt = (x.px!=null ? "price "+x.px+" ("+(x.px_src||"")+")" : "no price yet")+" · TWD/USD "+(x.fx!=null?Number(x.fx).toFixed(3):"")+" ("+(x.fx_src||"")+")";
@@ -9795,7 +9948,7 @@ if __name__ == "__main__":
     # NOTE: reload must stay OFF (single process) so the in-memory
     # WebSocket hub works, and so the browser only opens once.
     print("=" * 62)
-    print("  NUKE STATION  BUILD borrow.b64  \u00b7  %s"
+    print("  NUKE STATION  BUILD borrow.b66  \u00b7  %s"
           % os.path.abspath(__file__))
     print("  port %s \u00b7 if this banner is missing, an OLD file is\n  running \u2014 kill that process first." % PORT)
     print("=" * 62)
