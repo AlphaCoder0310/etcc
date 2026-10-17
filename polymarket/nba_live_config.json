@@ -1,0 +1,10 @@
+{
+  "score_source": "espn",
+  "score_fallback": true,
+  "nba_poll_s": 2.0,
+  "espn_poll_s": 2.0,
+  "score_order": "away_home",
+  "alert_pts": 0.05,
+  "push_min_ms": 100,
+  "record_1m": true
+}
